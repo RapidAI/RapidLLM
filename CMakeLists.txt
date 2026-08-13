@@ -37,9 +37,11 @@ set(RAPIDLLM_SOURCES
   src/kernels/ops_simd_avx2.cpp
   src/kernels/ops_simd_avx512.cpp
   src/kernels/ops_fused.cpp
+  src/kernels/ops_vision.cpp
   src/kernels/cuda/cuda_ref.cpp
   src/kernels/cuda/cuda_engine_stub.cpp
   src/api/rapidllm_c.cpp
+  src/server/http_serve.cpp
 )
 
 add_library(rapidllm_core STATIC ${RAPIDLLM_SOURCES})
@@ -73,6 +75,10 @@ endif()
 
 add_executable(rapidllm src/cli/main.cpp)
 target_link_libraries(rapidllm PRIVATE rapidllm_core)
+if(WIN32)
+  target_link_libraries(rapidllm PRIVATE ws2_32)
+  target_link_libraries(rapidllm_core PUBLIC ws2_32)
+endif()
 set_target_properties(rapidllm PROPERTIES OUTPUT_NAME rapidllm)
 
 add_executable(rapidllm_version src/cli/version_main.cpp)
@@ -112,6 +118,8 @@ rapidllm_test(test_simd_bench tests/test_simd_bench.cpp)
 rapidllm_test(test_nv tests/test_nv.cpp)
 rapidllm_test(test_spec tests/test_spec.cpp)
 rapidllm_test(test_cuda_decode tests/test_cuda_decode.cpp)
+rapidllm_test(test_batch tests/test_batch.cpp)
+rapidllm_test(test_protocol tests/test_protocol.cpp)
 
 enable_testing()
 add_test(NAME ir COMMAND test_ir)
@@ -120,4 +128,6 @@ add_test(NAME hybrid COMMAND test_hybrid)
 add_test(NAME simd_bench COMMAND test_simd_bench)
 add_test(NAME nv COMMAND test_nv)
 add_test(NAME spec COMMAND test_spec)
+add_test(NAME batch COMMAND test_batch)
 add_test(NAME cuda_decode COMMAND test_cuda_decode)
+add_test(NAME protocol COMMAND test_protocol)

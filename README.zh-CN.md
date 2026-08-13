@@ -186,7 +186,7 @@ docs/               架构设计（中英）
 
 ## v1 明确不做
 
-- 不做 OpenAI 兼容 HTTP
+- HTTP：`rapidllm serve` 提供 OpenAI `/v1/chat/completions`、`/v1/responses` 与 Anthropic `/v1/messages`
 - 不做视觉 / 视频编码器
 - 不做 MoE 专家路径
 - 不做 ARM / Apple Silicon

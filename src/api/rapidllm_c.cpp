@@ -73,7 +73,7 @@ RapidLLM* rapidllm_load(const RapidConfig* cfg, RapidError* err) {
         eng->kv_i8 = cfg->kv_i8 != 0;
         eng->fuse = cfg->fuse != 0;
         LoadOptions opt;
-        opt.language_only = cfg->language_only ? true : true;
+        opt.language_only = cfg->language_only != 0;
         opt.mmap = cfg->mmap != 0;
         opt.hugepage = cfg->hugepage != 0;
         opt.repack_int4 = cfg->repack_int4 != 0;
@@ -167,6 +167,25 @@ RapidSession* rapidllm_session_new(RapidLLM* e, const RapidSessionConfig* sc, Ra
     }
 }
 
+int rapidllm_session_set_draft(RapidSession* target, RapidSession* draft, RapidError* err) {
+    try {
+        if (!target || !target->sess) {
+            set_err(err, RAPID_ERR_RANGE, "null target session");
+            return RAPID_ERR_RANGE;
+        }
+        target->sess->set_draft(draft && draft->sess ? draft->sess.get() : nullptr);
+        return RAPID_OK;
+    } catch (const std::exception& e) {
+        set_err(err, RAPID_ERR_INTERNAL, e.what());
+        return RAPID_ERR_INTERNAL;
+    }
+}
+
+void rapidllm_session_set_max_new(RapidSession* s, int max_new_tokens) {
+    if (!s) return;
+    s->sc.max_new_tokens = max_new_tokens > 0 ? max_new_tokens : 16;
+}
+
 void rapidllm_session_free(RapidSession* s) { delete s; }
 
 int rapidllm_prefill(RapidSession* s, const int32_t* ids, int n, RapidError* err) {
@@ -213,6 +232,31 @@ int rapidllm_generate(RapidSession* s, const int32_t* ids, int n, const RapidSam
         cfg.spec = static_cast<SpecKind>(s->sc.spec);
         cfg.spec_n = s->sc.spec_n > 0 ? s->sc.spec_n : 3;
         const int got = s->sess->generate(ids, n, out, cap, cfg);
+        if (err) err->code = RAPID_OK;
+        return got;
+    } catch (const std::exception& e) {
+        set_err(err, RAPID_ERR_INTERNAL, e.what());
+        return -1;
+    }
+}
+
+int rapidllm_generate_batch(RapidSession* s, const int32_t* ids, int n, int n_seq, const RapidSampleParams* sp,
+                            int32_t* out, int cap_each, int* out_n, RapidError* err) {
+    try {
+        if (!s || !s->sess || !ids || n <= 0 || n_seq <= 0) {
+            set_err(err, RAPID_ERR_RANGE, "batch generate args");
+            return -1;
+        }
+        GenerateConfig cfg;
+        cfg.max_new_tokens = s->sc.max_new_tokens > 0 ? s->sc.max_new_tokens : 16;
+        cfg.greedy = !sp || sp->greedy || sp->temperature <= 0.f;
+        cfg.enable_thinking = s->sc.enable_thinking != 0;
+        cfg.ctx = s->eng->ctx;
+        cfg.spec = SpecKind::Off;
+        cfg.spec_n = 0;
+        std::vector<const int32_t*> ptrs(static_cast<size_t>(n_seq), ids);
+        std::vector<int> lens(static_cast<size_t>(n_seq), n);
+        const int got = s->sess->generate_batch(ptrs.data(), lens.data(), n_seq, out, out_n, cap_each, cfg);
         if (err) err->code = RAPID_OK;
         return got;
     } catch (const std::exception& e) {

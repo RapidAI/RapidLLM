@@ -53,4 +53,24 @@ std::string apply_chat_template(std::string_view user, bool enable_thinking) {
     return s;
 }
 
+std::string apply_chat_messages(const std::vector<ChatTurn>& turns, bool enable_thinking) {
+    std::string s;
+    bool has_assistant_tail = false;
+    for (const auto& t : turns) {
+        std::string role = t.role;
+        if (role == "human") role = "user";
+        if (role == "ai") role = "assistant";
+        if (role.empty()) role = "user";
+        s += "<|im_start|>";
+        s += role;
+        s += "\n";
+        s += t.content;
+        s += "<|im_end|>\n";
+        has_assistant_tail = role == "assistant";
+    }
+    if (!has_assistant_tail) s += "<|im_start|>assistant\n";
+    if (enable_thinking) s += "<think>\n";
+    return s;
+}
+
 } // namespace rapidllm

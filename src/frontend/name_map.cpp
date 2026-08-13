@@ -69,7 +69,51 @@ static std::string layer_ir(int i, const std::string& rest) {
     return "layers[" + std::to_string(i) + "]." + rest;
 }
 
+static std::string map_visual_name(std::string_view src) {
+    std::string s(src);
+    const char* prefs[] = {"model.visual.", "visual."};
+    for (const char* p : prefs) {
+        if (starts_with(s, p)) {
+            s = s.substr(std::char_traits<char>::length(p));
+            break;
+        }
+    }
+    auto strip_w = [](std::string x) {
+        if (x.size() > 7 && x.substr(x.size() - 7) == ".weight") x.resize(x.size() - 7);
+        return x;
+    };
+    s = strip_w(s);
+    if (s == "patch_embed.proj") return "visual.patch_embed";
+    if (s == "patch_embed.proj.bias") return "visual.patch_embed_bias";
+    if (s == "pos_embed" || s == "pos_embed.weight") return "visual.pos_embed";
+    if (s == "merger.linear_fc1") return "visual.merger.fc1";
+    if (s == "merger.linear_fc1.bias") return "visual.merger.fc1_bias";
+    if (s == "merger.linear_fc2") return "visual.merger.fc2";
+    if (s == "merger.linear_fc2.bias") return "visual.merger.fc2_bias";
+    if (s == "merger.norm") return "visual.merger.norm";
+    if (s == "merger.norm.bias") return "visual.merger.norm_bias";
+    std::smatch m;
+    static const std::regex re(R"(blocks\.(\d+)\.(.+))");
+    if (!std::regex_match(s, m, re)) return {};
+    const std::string p = "visual.blocks[" + m[1].str() + "].";
+    const std::string r = m[2].str();
+    if (r == "attn.qkv") return p + "attn.qkv";
+    if (r == "attn.qkv.bias") return p + "attn.qkv_bias";
+    if (r == "attn.proj") return p + "attn.proj";
+    if (r == "attn.proj.bias") return p + "attn.proj_bias";
+    if (r == "mlp.linear_fc1") return p + "mlp.fc1";
+    if (r == "mlp.linear_fc1.bias") return p + "mlp.fc1_bias";
+    if (r == "mlp.linear_fc2") return p + "mlp.fc2";
+    if (r == "mlp.linear_fc2.bias") return p + "mlp.fc2_bias";
+    if (r == "norm1") return p + "norm1";
+    if (r == "norm1.bias") return p + "norm1_bias";
+    if (r == "norm2") return p + "norm2";
+    if (r == "norm2.bias") return p + "norm2_bias";
+    return {};
+}
+
 std::string map_hf_name(std::string_view src) {
+    if (is_visual(src)) return map_visual_name(src);
     std::string s(src);
     const std::string pref1 = "model.language_model.";
     const std::string pref2 = "model.";

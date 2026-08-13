@@ -186,7 +186,11 @@ docs/               architecture (EN/ZH)
 
 ## Non-goals (v1)
 
-- No OpenAI-compatible HTTP server
+- HTTP serve: OpenAI `/v1/chat/completions` + `/v1/responses`, Anthropic `/v1/messages`
+
+```text
+rapidllm serve -m /path/to/Qwen3.6-27B-FP8 --host 127.0.0.1 --port 8080 --device cuda
+```
 - No vision / video encoder
 - No MoE expert path
 - No ARM / Apple Silicon

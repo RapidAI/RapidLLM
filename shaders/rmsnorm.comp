@@ -1,0 +1,23 @@
+#version 450
+// Offline SPIR-V: glslangValidator -V rmsnorm.comp -o rmsnorm.spv
+layout(local_size_x = 256) in;
+layout(std430, binding = 0) readonly buffer X { float x[]; };
+layout(std430, binding = 1) readonly buffer G { float gamma[]; };
+layout(std430, binding = 2) writeonly buffer Y { float y[]; };
+layout(push_constant) uniform P { int n; float eps; } p;
+
+shared float buf[256];
+
+void main() {
+    const uint tid = gl_LocalInvocationID.x;
+    float ss = 0.0;
+    for (uint i = tid; i < uint(p.n); i += 256u) ss += x[i] * x[i];
+    buf[tid] = ss;
+    barrier();
+    for (uint s = 128u; s > 0u; s >>= 1u) {
+        if (tid < s) buf[tid] += buf[tid + s];
+        barrier();
+    }
+    const float inv = inversesqrt(buf[0] / float(p.n) + p.eps);
+    for (uint i = tid; i < uint(p.n); i += 256u) y[i] = x[i] * inv * (1.0 + gamma[i]);
+}

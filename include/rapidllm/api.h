@@ -43,7 +43,7 @@ typedef struct RapidSessionConfig {
     int enable_thinking;
     int preserve_thinking;
     int max_new_tokens;
-    int spec;    /* 0=off 1=ngram 2=mtp 3=auto */
+    int spec;    /* 0=off 1=ngram 2=mtp 3=auto 4=draft-model */
     int spec_n;  /* draft tokens per step */
 } RapidSessionConfig;
 
@@ -77,7 +77,13 @@ int           rapidllm_encode(RapidLLM*, const char* utf8, int32_t* ids, int cap
 int           rapidllm_decode_ids(RapidLLM*, const int32_t*, int n, char* out, int cap, RapidError*);
 int           rapidllm_generate(RapidSession*, const int32_t* ids, int n,
                                 const RapidSampleParams*, int32_t* out, int cap, RapidError*);
+/* Continuous batch: n_seq copies of the same prompt, one shared weight pass per step. */
+int           rapidllm_generate_batch(RapidSession*, const int32_t* ids, int n, int n_seq,
+                                      const RapidSampleParams*, int32_t* out, int cap_each, int* out_n,
+                                      RapidError*);
 RapidSession* rapidllm_session_new(RapidLLM*, const RapidSessionConfig*, RapidError*);
+void          rapidllm_session_set_max_new(RapidSession*, int max_new_tokens);
+int           rapidllm_session_set_draft(RapidSession* target, RapidSession* draft, RapidError*);
 int           rapidllm_prefill(RapidSession*, const int32_t*, int n, RapidError*);
 int           rapidllm_decode(RapidSession*, int32_t token, RapidLogitsView*, RapidError*);
 int           rapidllm_sample(RapidSession*, const RapidSampleParams*, int32_t* token, RapidError*);

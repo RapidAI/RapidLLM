@@ -37,6 +37,9 @@ int main() {
         if (t.src_name.find("visual") != std::string::npos) saw_visual = true;
     }
     CHECK(!saw_visual);
+    CHECK(map_hf_name("model.visual.patch_embed.proj.weight") == "visual.patch_embed");
+    CHECK(map_hf_name("model.visual.blocks.0.attn.qkv.weight") == "visual.blocks[0].attn.qkv");
+    CHECK(map_hf_name("model.visual.merger.linear_fc2.bias") == "visual.merger.fc2_bias");
     CHECK(th.find("mtp.fc") != nullptr);
     CHECK(th.model.has_mtp);
     std::printf("HF loaded tensors=%zu layers=%d\n", th.tensors.size(), th.model.n_layers);

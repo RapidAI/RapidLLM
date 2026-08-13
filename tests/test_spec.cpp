@@ -92,6 +92,28 @@ int main() {
     std::printf("ngram_draft n=%d first=%d mtp_accept=%d/%d ngram_prop=%d\n", nn, ndr[0], stm.accepted,
                 stm.proposed, stn.proposed);
 
+    {
+        auto dev2 = create_device(DeviceKind::CPU);
+        WeightStore store2 = WeightStore::open(root / "tiny_hybrid", *dev2, LoadOptions{});
+        Session target(*dev2, store2, 64, false, true);
+        Session draft(*dev2, store2, 64, false, true);
+        target.set_draft(&draft);
+        GenerateConfig cfg;
+        cfg.max_new_tokens = n_new;
+        cfg.greedy = true;
+        cfg.spec = SpecKind::Draft;
+        cfg.spec_n = 3;
+        std::vector<int32_t> out(static_cast<size_t>(n_new));
+        const int got = target.generate(prompt.data(), static_cast<int>(prompt.size()), out.data(), n_new, cfg);
+        out.resize(static_cast<size_t>(got));
+        dump("draft ", out);
+        if (out != want) {
+            std::fprintf(stderr, "draft-model generate changed greedy tokens\n");
+            return 1;
+        }
+        std::printf("draft_model accept=%d/%d\n", target.spec_stats().accepted, target.spec_stats().proposed);
+    }
+
     std::printf("test_spec ok (greedy invariant + MTP draft match)\n");
     return 0;
 }

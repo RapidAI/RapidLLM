@@ -36,8 +36,12 @@ public:
 } // namespace
 
 std::unique_ptr<Device> create_device(DeviceKind k) {
-    if (k != DeviceKind::CPU) throw std::runtime_error("only CPU device is implemented in this increment");
-    return std::make_unique<CpuDevice>();
+    if (k == DeviceKind::CPU) return std::make_unique<CpuDevice>();
+    if (k == DeviceKind::Vulkan)
+        throw std::runtime_error("Vulkan device requires -DRAPIDLLM_WITH_VULKAN=ON and a Vulkan 1.2 GPU");
+    if (k == DeviceKind::CUDA)
+        throw std::runtime_error("CUDA uses --device cuda (cuda_gen engine), not DeviceKind::CUDA here");
+    throw std::runtime_error("unknown device");
 }
 
 } // namespace rapidllm

@@ -5,6 +5,10 @@
 #include <cstddef>
 #include <cstdint>
 
+namespace rapidllm {
+class TensorTable;
+}
+
 namespace rapidllm::ops {
 
 float silu(float x);
@@ -126,5 +130,14 @@ void attn_decode(const float* q, const float* k_cache, const float* v_cache, flo
                  int pos, int n_q, int n_kv, int head_dim);
 
 void swiglu(const float* gate, const float* up, float* y, int n);
+
+float gelu_tanh(float x);
+void layernorm(const float* x, const float* w, const float* b, float* y, int n, float eps);
+
+// Qwen3.6 ViT: patch-embed (T=2, P=16) + 27 LN-attn-MLP blocks + spatial-merge MLP.
+// pixels: RGB float [0,1], row-major H*W*3. out: [gh*gw, out_hidden], gh=H/(patch*merge).
+int vision_grid(int img_h, int img_w, int patch, int merge, int* gh, int* gw);
+void vision_encode(const float* rgb, int img_h, int img_w, const VisionDesc& V,
+                   const TensorTable& weights, float* out);
 
 } // namespace rapidllm::ops

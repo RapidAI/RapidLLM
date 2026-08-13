@@ -95,6 +95,24 @@ public:
         table.source = SourceKind::HfFp8Dir;
         fill_from_text_config(table.model, *tc);
         table.model.language_only = opt.language_only;
+        if (const Json* vc = root.get("vision_config"); vc && vc->is_obj()) {
+            VisionDesc& V = table.model.vision;
+            V.present = true;
+            if (const Json* v = vc->get("depth")) V.depth = v->as_int();
+            if (const Json* v = vc->get("hidden_size")) V.hidden = v->as_int();
+            if (const Json* v = vc->get("intermediate_size")) V.intermediate = v->as_int();
+            if (const Json* v = vc->get("num_heads")) V.n_heads = v->as_int();
+            if (const Json* v = vc->get("in_channels")) V.in_channels = v->as_int();
+            if (const Json* v = vc->get("patch_size")) V.patch = v->as_int();
+            if (const Json* v = vc->get("temporal_patch_size")) V.temporal_patch = v->as_int();
+            if (const Json* v = vc->get("spatial_merge_size")) V.spatial_merge = v->as_int();
+            if (const Json* v = vc->get("out_hidden_size")) V.out_hidden = v->as_int();
+            if (const Json* v = vc->get("num_position_embeddings")) V.n_pos = v->as_int();
+        }
+        if (const Json* v = root.get("image_token_id")) table.model.vision.image_token_id = v->as_int();
+        if (const Json* v = root.get("video_token_id")) table.model.vision.video_token_id = v->as_int();
+        if (const Json* v = root.get("vision_start_token_id")) table.model.vision.vision_start_id = v->as_int();
+        if (const Json* v = root.get("vision_end_token_id")) table.model.vision.vision_end_id = v->as_int();
         if (opt.max_layers > 0 && opt.max_layers < table.model.n_layers) {
             table.model.n_layers = opt.max_layers;
             table.model.layers.resize(static_cast<size_t>(opt.max_layers));
@@ -134,7 +152,7 @@ public:
         if (n_delta == 0) throw LoadError("HF hybrid missing DeltaNet layers");
 
         for (auto& [name, st] : all) {
-            if (is_visual(name)) continue;
+            if (is_visual(name) && opt.language_only) continue;
             std::string ir = map_hf_name(name);
             if (ir.empty()) {
                 if (name.find("weight_scale_inv") != std::string::npos) continue;
@@ -205,7 +223,14 @@ public:
             if (!table.find(ir)) throw LoadError("HF missing required tensor " + ir);
         };
         need("embed");
-        need("lm_head");
+        if (!table.find("lm_head")) {
+            if (!table.model.tie_embed)
+                throw LoadError("HF missing required tensor lm_head");
+            TensorDesc lh = *table.find("embed");
+            lh.ir_name = "lm_head";
+            lh.src_name = "tied:" + lh.src_name;
+            table.tensors.emplace("lm_head", std::move(lh));
+        }
         need("final_norm");
         table.model.has_mtp = table.find("mtp.fc") != nullptr && table.find("mtp.norm") != nullptr;
         for (int i = 0; i < table.model.n_layers; ++i) {

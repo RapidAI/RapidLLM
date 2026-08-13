@@ -13,7 +13,7 @@
 
 namespace rapidllm {
 
-enum class SpecKind { Off = 0, Ngram = 1, Mtp = 2, Auto = 3 };
+enum class SpecKind { Off = 0, Ngram = 1, Mtp = 2, Auto = 3, Draft = 4 };
 
 struct SpecStats {
     int proposed = 0;
@@ -38,6 +38,7 @@ public:
     void set_fuse(bool f) { fuse_ = f; }
     bool fuse() const { return fuse_; }
     bool uses_cuda() const { return static_cast<bool>(gpu_); }
+    int max_batch() const { return gpu_ ? gpu_->max_batch() : 1; }
     double last_prefill_sec() const { return last_prefill_sec_; }
     double last_decode_sec() const { return last_decode_sec_; }
     int last_decode_tokens() const { return last_decode_tokens_; }
@@ -45,6 +46,10 @@ public:
     void prefill(const int32_t* ids, int n);
     void decode_token(int32_t token, float* logits);
     int generate(const int32_t* ids, int n, int32_t* out, int cap, const GenerateConfig& cfg);
+    // Continuous batch: n_seq independent prompts, one weight-shared decode step per token.
+    // out is n_seq * cap; out_n[i] is tokens written for sequence i. Returns total tokens.
+    int generate_batch(const int32_t* const* prompts, const int* lens, int n_seq, int32_t* out, int* out_n,
+                       int cap, const GenerateConfig& cfg);
 
     const ModelDesc& model() const { return store_->model(); }
     const float* last_logits() const { return logits_.data(); }
@@ -54,6 +59,9 @@ public:
     SpecStats spec_stats() const { return spec_stats_; }
     int mtp_draft(int32_t first, int n, int32_t* out);
     int ngram_draft(const int32_t* ctx, int ctx_n, int32_t first, int n, int32_t* out) const;
+    // Smaller same-vocab model used as speculative draft. Not owned.
+    void set_draft(Session* draft);
+    Session* draft() const { return draft_; }
 
 private:
     void forward_hidden(const float* x_in, float* x_out, bool is_prefill, int seq, int token_pos);
@@ -65,8 +73,11 @@ private:
     const TensorDesc* find_w(std::string_view ir) const;
     SpecKind resolve_spec(SpecKind s) const;
 
+    int draft_tokens(int take, int32_t* out);
+
     Device* dev_ = nullptr;
     WeightStore* store_ = nullptr;
+    Session* draft_ = nullptr;
     std::unique_ptr<cuda_gen::Engine> gpu_;
     std::unique_ptr<DualCache> cache_;
     std::vector<float> hidden_;

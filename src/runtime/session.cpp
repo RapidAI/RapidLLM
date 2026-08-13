@@ -37,8 +37,30 @@ bool Session::has_mtp() const {
 }
 
 SpecKind Session::resolve_spec(SpecKind s) const {
-    if (s == SpecKind::Auto) return has_mtp() ? SpecKind::Mtp : SpecKind::Ngram;
+    if (s == SpecKind::Auto) {
+        if (draft_) return SpecKind::Draft;
+        return has_mtp() ? SpecKind::Mtp : SpecKind::Ngram;
+    }
     return s;
+}
+
+void Session::set_draft(Session* draft) {
+    if (draft == this) throw std::runtime_error("draft session cannot be the target");
+    if (draft && draft->store_->model().vocab != store_->model().vocab)
+        throw std::runtime_error("draft vocab != target vocab");
+    draft_ = draft;
+}
+
+int Session::draft_tokens(int take, int32_t* out) {
+    if (!draft_ || take <= 0 || !out || ctx_tokens_.empty()) return 0;
+    GenerateConfig dc;
+    dc.max_new_tokens = take;
+    dc.greedy = true;
+    dc.enable_thinking = false;
+    dc.spec = SpecKind::Off;
+    dc.spec_n = 0;
+    dc.fuse = draft_->fuse_;
+    return draft_->generate(ctx_tokens_.data(), static_cast<int>(ctx_tokens_.size()), out, take, dc);
 }
 
 static const float* f32_ptr(const TensorDesc& t) {
@@ -509,11 +531,34 @@ int Session::ngram_draft(const int32_t* ctx, int ctx_n, int32_t first, int n, in
         }
         if (ok) found = i + ng;
     }
-    if (found < 0) return 0;
-    int got = 0;
-    for (int k = 0; k < n && found + k < static_cast<int>(hay.size()); ++k) out[got++] = hay[found + k];
-    // If match is at end, we cannot draft future tokens from history.
-    return got;
+    if (found >= 0) {
+        int got = 0;
+        for (int k = 0; k < n && found + k < static_cast<int>(hay.size()); ++k) out[got++] = hay[found + k];
+        if (got > 0 && got < n) {
+            bool run = true;
+            for (int i = 1; i < got; ++i) {
+                if (out[i] != out[0]) run = false;
+            }
+            if (run) {
+                while (got < n) out[got++] = out[0];
+            }
+        }
+        if (got > 0) return got;
+    }
+    // Self-repeat only after the same adjacent pair has been seen twice (avoids the
+    // one-off 3,3 → 59 reject on this model's greedy collapse).
+    if (ctx_n >= 2 && ctx[ctx_n - 1] == ctx[ctx_n - 2]) {
+        const int32_t t = ctx[ctx_n - 1];
+        int pairs = 0;
+        for (int i = 0; i + 1 < ctx_n; ++i) {
+            if (ctx[i] == t && ctx[i + 1] == t) ++pairs;
+        }
+        if (pairs >= 2) {
+            for (int i = 0; i < n; ++i) out[i] = t;
+            return n;
+        }
+    }
+    return 0;
 }
 
 int Session::generate(const int32_t* ids, int n, int32_t* out, int cap, const GenerateConfig& cfg) {
@@ -524,7 +569,50 @@ int Session::generate(const int32_t* ids, int n, int32_t* out, int cap, const Ge
     spec_stats_ = {};
     int produced = 0;
     const int want = std::min(cfg.max_new_tokens, cap);
-    const SpecKind sk = gpu_ ? SpecKind::Off : resolve_spec(cfg.spec);
+    if (gpu_) {
+        SpecKind sk = cfg.spec == SpecKind::Off ? SpecKind::Off : SpecKind::Ngram;
+        if (cfg.spec != SpecKind::Off && draft_) sk = SpecKind::Draft;
+        const int spec_n = std::max(0, cfg.spec_n);
+        const auto t_d0 = std::chrono::steady_clock::now();
+        while (produced < want) {
+            const int32_t t0 = gpu_->greedy();
+            out[produced++] = t0;
+            ctx_tokens_.push_back(t0);
+            int32_t drafts[8];
+            int nd = 0;
+            if (sk != SpecKind::Off && spec_n > 0 && produced < want) {
+                const int take = std::min(std::min(spec_n, want - produced), 7);
+                if (sk == SpecKind::Draft)
+                    nd = draft_tokens(take, drafts);
+                else
+                    nd = ngram_draft(ctx_tokens_.data(), static_cast<int>(ctx_tokens_.size()), t0, take, drafts);
+                spec_stats_.proposed += nd;
+                ++spec_stats_.steps;
+            }
+            if (nd <= 0) {
+                gpu_->decode_token(t0);
+                pos_ = gpu_->pos();
+                continue;
+            }
+            int32_t toks[8];
+            toks[0] = t0;
+            for (int i = 0; i < nd; ++i) toks[i + 1] = drafts[i];
+            int32_t preds[8];
+            const int k = gpu_->spec_verify(toks, 1 + nd, preds);
+            for (int i = 0; i + 1 < k && produced < want; ++i) {
+                out[produced++] = drafts[i];
+                ctx_tokens_.push_back(drafts[i]);
+                ++spec_stats_.accepted;
+            }
+            pos_ = gpu_->pos();
+        }
+        const auto t_d1 = std::chrono::steady_clock::now();
+        last_decode_sec_ = std::chrono::duration<double>(t_d1 - t_d0).count();
+        last_decode_tokens_ = produced;
+        gpu_->copy_logits(logits_.data());
+        return produced;
+    }
+    const SpecKind sk = resolve_spec(cfg.spec);
     const int spec_n = std::max(0, cfg.spec_n);
     const auto t_d0 = std::chrono::steady_clock::now();
     while (produced < want) {
@@ -534,7 +622,9 @@ int Session::generate(const int32_t* ids, int n, int32_t* out, int cap, const Ge
         int nd = 0;
         if (sk != SpecKind::Off && spec_n > 0 && produced < want) {
             const int take = std::min(spec_n, 16);
-            if (sk == SpecKind::Mtp)
+            if (sk == SpecKind::Draft)
+                nd = draft_tokens(take, drafts);
+            else if (sk == SpecKind::Mtp)
                 nd = mtp_draft(t0, take, drafts);
             else
                 nd = ngram_draft(ctx_tokens_.data(), static_cast<int>(ctx_tokens_.size()), t0, take, drafts);
@@ -555,6 +645,90 @@ int Session::generate(const int32_t* ids, int n, int32_t* out, int cap, const Ge
     last_decode_sec_ = std::chrono::duration<double>(t_d1 - t_d0).count();
     last_decode_tokens_ = produced;
     return produced;
+}
+
+int Session::generate_batch(const int32_t* const* prompts, const int* lens, int n_seq, int32_t* out, int* out_n,
+                            int cap, const GenerateConfig& cfg) {
+    if (n_seq <= 0) return 0;
+    if (n_seq == 1) {
+        const int g = generate(prompts[0], lens[0], out, cap, cfg);
+        if (out_n) out_n[0] = g;
+        return g;
+    }
+    const int want = std::min(cfg.max_new_tokens, cap);
+    if (!gpu_ || gpu_->max_batch() < 2) {
+        int total = 0;
+        for (int i = 0; i < n_seq; ++i) {
+            const int g = generate(prompts[i], lens[i], out + static_cast<size_t>(i) * cap, cap, cfg);
+            if (out_n) out_n[i] = g;
+            total += g;
+        }
+        return total;
+    }
+    const int B = std::min(n_seq, gpu_->max_batch());
+    // Same-prompt fast path: one prefill, replicate caches, shared-weight decode.
+    const auto t_pf0 = std::chrono::steady_clock::now();
+    prefill(prompts[0], lens[0]);
+    gpu_->replicate_slot0(B);
+    const auto t_pf1 = std::chrono::steady_clock::now();
+    last_prefill_sec_ = std::chrono::duration<double>(t_pf1 - t_pf0).count();
+
+    std::vector<int> poss(static_cast<size_t>(B), gpu_->pos());
+    std::vector<int32_t> toks(static_cast<size_t>(B));
+    std::vector<int> done(static_cast<size_t>(B), 0);
+    std::vector<float> blogits(static_cast<size_t>(B) * store_->model().vocab);
+    if (out_n) {
+        for (int i = 0; i < B; ++i) out_n[i] = 0;
+    }
+    int total = 0;
+    const auto t_d0 = std::chrono::steady_clock::now();
+    // First token from the shared prefill logits.
+    {
+        const int32_t t0 = greedy_sample(logits_.data(), store_->model().vocab);
+        for (int b = 0; b < B; ++b) {
+            out[static_cast<size_t>(b) * cap] = t0;
+            if (out_n) out_n[b] = 1;
+            toks[static_cast<size_t>(b)] = t0;
+            ++total;
+        }
+    }
+    while (total < B * want) {
+        int n_act = 0;
+        std::vector<int32_t> atok;
+        std::vector<int> apos, amap;
+        for (int b = 0; b < B; ++b) {
+            if (done[static_cast<size_t>(b)] || (out_n && out_n[b] >= want)) {
+                done[static_cast<size_t>(b)] = 1;
+                continue;
+            }
+            atok.push_back(toks[static_cast<size_t>(b)]);
+            apos.push_back(poss[static_cast<size_t>(b)]);
+            amap.push_back(b);
+            ++n_act;
+        }
+        if (n_act == 0) break;
+        gpu_->decode_tokens(atok.data(), apos.data(), n_act);
+        gpu_->copy_logits_n(blogits.data(), n_act);
+        for (int i = 0; i < n_act; ++i) {
+            const int b = amap[static_cast<size_t>(i)];
+            const int32_t nxt =
+                greedy_sample(blogits.data() + static_cast<size_t>(i) * store_->model().vocab, store_->model().vocab);
+            poss[static_cast<size_t>(b)] += 1;
+            toks[static_cast<size_t>(b)] = nxt;
+            const int k = out_n ? out_n[b] : 0;
+            if (k < want) {
+                out[static_cast<size_t>(b) * cap + k] = nxt;
+                if (out_n) ++out_n[b];
+                ++total;
+            } else {
+                done[static_cast<size_t>(b)] = 1;
+            }
+        }
+    }
+    const auto t_d1 = std::chrono::steady_clock::now();
+    last_decode_sec_ = std::chrono::duration<double>(t_d1 - t_d0).count();
+    last_decode_tokens_ = total;
+    return total;
 }
 
 } // namespace rapidllm

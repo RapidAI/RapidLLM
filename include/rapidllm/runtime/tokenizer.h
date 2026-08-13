@@ -26,4 +26,10 @@ private:
 
 std::string apply_chat_template(std::string_view user, bool enable_thinking);
 
+struct ChatTurn {
+    std::string role;
+    std::string content;
+};
+std::string apply_chat_messages(const std::vector<ChatTurn>& turns, bool enable_thinking);
+
 } // namespace rapidllm

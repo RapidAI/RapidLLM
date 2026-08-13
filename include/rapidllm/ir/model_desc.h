@@ -94,6 +94,24 @@ struct LayerDesc {
     MlpDesc mlp;
 };
 
+struct VisionDesc {
+    bool present = false;
+    int depth = 27;
+    int hidden = 1152;
+    int intermediate = 4304;
+    int n_heads = 16;
+    int in_channels = 3;
+    int patch = 16;
+    int temporal_patch = 2;
+    int spatial_merge = 2;
+    int out_hidden = 5120;
+    int n_pos = 2304;
+    int image_token_id = 248056;
+    int video_token_id = 248057;
+    int vision_start_id = 248053;
+    int vision_end_id = 248054;
+};
+
 struct ModelDesc {
     ArchKind arch = ArchKind::Qwen35Hybrid;
     int vocab = 248320, hidden = 5120, n_layers = 64;
@@ -106,6 +124,7 @@ struct ModelDesc {
     EmbeddingDesc embed;
     LinearDesc lm_head;
     std::vector<LayerDesc> layers;
+    VisionDesc vision;
     int mtp_n_layers = 1;
     bool mtp_dedicated_embeddings = false;
     bool has_mtp = false;

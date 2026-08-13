@@ -33,6 +33,10 @@ int main() {
     CHECK(m.mixer_slot(1) == 1);
     CHECK(m.mixer_slot(3) == 0);
     CHECK(m.mixer_slot(7) == 1);
+    CHECK(m.vision.depth == 27);
+    CHECK(m.vision.hidden == 1152);
+    CHECK(m.vision.out_hidden == 5120);
+    CHECK(m.vision.image_token_id == 248056);
 
     bool threw = false;
     try {
