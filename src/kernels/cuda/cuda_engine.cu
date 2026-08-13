@@ -504,6 +504,73 @@ gemv_fp8_k(const uint8_t* W, const float* scale, const float* x, float* y, int m
     }
 }
 
+// Two adjacent rows per warp — extra ILP on the same x tile.
+__global__ void __launch_bounds__(512, 2)
+gemv_fp8_2row_k(const uint8_t* W, const float* scale, const float* x, float* y, int m, int n, int block,
+                int add) {
+    extern __shared__ float xs[];
+    const int warps = blockDim.x / 32;
+    const int pair = blockIdx.x * warps + (threadIdx.x / 32);
+    const int row0 = pair * 2;
+    const int row1 = row0 + 1;
+    const int lane = threadIdx.x & 31;
+    const int tile = n <= 5120 ? n : 4096;
+    const int nb_n = (n + block - 1) / block;
+    float acc0 = 0.f, acc1 = 0.f;
+    const uint8_t* r0 = row0 < m ? W + static_cast<size_t>(row0) * n : nullptr;
+    const uint8_t* r1 = row1 < m ? W + static_cast<size_t>(row1) * n : nullptr;
+    const float* sc0 = (r0 && scale) ? scale + (row0 / block) * nb_n : nullptr;
+    const float* sc1 = (r1 && scale) ? scale + (row1 / block) * nb_n : nullptr;
+    for (int t0 = 0; t0 < n; t0 += tile) {
+        const int tn = n - t0 < tile ? n - t0 : tile;
+        for (int i = threadIdx.x; i < tn; i += blockDim.x) xs[i] = x[t0 + i];
+        __syncthreads();
+        if (r0 && sc0) {
+            const int b0 = t0 / block;
+            const int nb = tn / block;
+            int b = 0;
+            for (; b + 3 < nb; b += 4) {
+                const int off = t0 + b * block + lane * 4;
+                const uint32_t p00 = __ldcs(reinterpret_cast<const uint32_t*>(r0 + off));
+                const uint32_t p01 = __ldcs(reinterpret_cast<const uint32_t*>(r0 + off + block));
+                const uint32_t p02 = __ldcs(reinterpret_cast<const uint32_t*>(r0 + off + 2 * block));
+                const uint32_t p03 = __ldcs(reinterpret_cast<const uint32_t*>(r0 + off + 3 * block));
+                acc0 += sc0[b0 + b] * fp8x4_dot(p00, xs + b * block + lane * 4);
+                acc0 += sc0[b0 + b + 1] * fp8x4_dot(p01, xs + (b + 1) * block + lane * 4);
+                acc0 += sc0[b0 + b + 2] * fp8x4_dot(p02, xs + (b + 2) * block + lane * 4);
+                acc0 += sc0[b0 + b + 3] * fp8x4_dot(p03, xs + (b + 3) * block + lane * 4);
+                if (r1 && sc1) {
+                    const uint32_t p10 = __ldcs(reinterpret_cast<const uint32_t*>(r1 + off));
+                    const uint32_t p11 = __ldcs(reinterpret_cast<const uint32_t*>(r1 + off + block));
+                    const uint32_t p12 = __ldcs(reinterpret_cast<const uint32_t*>(r1 + off + 2 * block));
+                    const uint32_t p13 = __ldcs(reinterpret_cast<const uint32_t*>(r1 + off + 3 * block));
+                    acc1 += sc1[b0 + b] * fp8x4_dot(p10, xs + b * block + lane * 4);
+                    acc1 += sc1[b0 + b + 1] * fp8x4_dot(p11, xs + (b + 1) * block + lane * 4);
+                    acc1 += sc1[b0 + b + 2] * fp8x4_dot(p12, xs + (b + 2) * block + lane * 4);
+                    acc1 += sc1[b0 + b + 3] * fp8x4_dot(p13, xs + (b + 3) * block + lane * 4);
+                }
+            }
+            for (; b < nb; ++b) {
+                const int off = t0 + b * block + lane * 4;
+                acc0 += sc0[b0 + b] * fp8x4_dot(__ldcs(reinterpret_cast<const uint32_t*>(r0 + off)),
+                                                xs + b * block + lane * 4);
+                if (r1 && sc1)
+                    acc1 += sc1[b0 + b] * fp8x4_dot(__ldcs(reinterpret_cast<const uint32_t*>(r1 + off)),
+                                                    xs + b * block + lane * 4);
+            }
+        }
+        __syncthreads();
+    }
+    if (row0 < m) {
+        acc0 = warp_sum(acc0);
+        if (lane == 0) write_y(y, row0, acc0, add);
+    }
+    if (row1 < m) {
+        acc1 = warp_sum(acc1);
+        if (lane == 0) write_y(y, row1, acc1, add);
+    }
+}
+
 // Two same-shape FP8 GEMVs sharing x (mlp.gate + mlp.up).
 // No launch_bounds: two weight streams need extra regs; let the compiler pick occupancy.
 __global__ void
@@ -652,6 +719,90 @@ __global__ void gemm_fp8_hw_k(const uint8_t* W, const float* scale, const float*
         if (T > 3) {
             float a3 = warp_sum(acc3);
             if (lane == 0) write_y(Y + 3 * m, row, a3, add);
+        }
+    }
+}
+
+__global__ void gemm_fp8_2row_k(const uint8_t* W, const float* scale, const float* X, float* Y, int m, int n,
+                                int T, int tile, int add) {
+    extern __shared__ float xs[];
+    const int warps = blockDim.x / 32;
+    const int pair = blockIdx.x * warps + (threadIdx.x / 32);
+    const int row0 = pair * 2;
+    const int row1 = row0 + 1;
+    const int lane = threadIdx.x & 31;
+    const int nb_n = (n + 127) / 128;
+    const int tstride = tile;
+    float a00 = 0.f, a01 = 0.f, a02 = 0.f, a03 = 0.f;
+    float a10 = 0.f, a11 = 0.f, a12 = 0.f, a13 = 0.f;
+    const uint8_t* r0 = row0 < m ? W + static_cast<size_t>(row0) * n : nullptr;
+    const uint8_t* r1 = row1 < m ? W + static_cast<size_t>(row1) * n : nullptr;
+    for (int t0 = 0; t0 < n; t0 += tile) {
+        const int tn = n - t0 < tile ? n - t0 : tile;
+        for (int i = threadIdx.x; i < T * tn; i += blockDim.x) {
+            const int t = i / tn;
+            const int j = i - t * tn;
+            xs[t * tstride + j] = X[static_cast<size_t>(t) * n + t0 + j];
+        }
+        __syncthreads();
+        const int b0 = t0 / 128;
+        const int nb = tn / 128;
+        if (r0) {
+            const int bi0 = row0 / 128;
+            for (int b = 0; b < nb; ++b) {
+                const float s = scale[bi0 * nb_n + b0 + b];
+                const uint32_t p = __ldcs(reinterpret_cast<const uint32_t*>(r0 + t0 + b * 128 + lane * 4));
+                const int o = b * 128 + lane * 4;
+                a00 += s * fp8x4_dot(p, xs + o);
+                if (T > 1) a01 += s * fp8x4_dot(p, xs + tstride + o);
+                if (T > 2) a02 += s * fp8x4_dot(p, xs + 2 * tstride + o);
+                if (T > 3) a03 += s * fp8x4_dot(p, xs + 3 * tstride + o);
+            }
+        }
+        if (r1) {
+            const int bi1 = row1 / 128;
+            for (int b = 0; b < nb; ++b) {
+                const float s = scale[bi1 * nb_n + b0 + b];
+                const uint32_t p = __ldcs(reinterpret_cast<const uint32_t*>(r1 + t0 + b * 128 + lane * 4));
+                const int o = b * 128 + lane * 4;
+                a10 += s * fp8x4_dot(p, xs + o);
+                if (T > 1) a11 += s * fp8x4_dot(p, xs + tstride + o);
+                if (T > 2) a12 += s * fp8x4_dot(p, xs + 2 * tstride + o);
+                if (T > 3) a13 += s * fp8x4_dot(p, xs + 3 * tstride + o);
+            }
+        }
+        __syncthreads();
+    }
+    if (row0 < m) {
+        float v0 = warp_sum(a00);
+        if (lane == 0) write_y(Y, row0, v0, add);
+        if (T > 1) {
+            float v1 = warp_sum(a01);
+            if (lane == 0) write_y(Y + m, row0, v1, add);
+        }
+        if (T > 2) {
+            float v2 = warp_sum(a02);
+            if (lane == 0) write_y(Y + 2 * m, row0, v2, add);
+        }
+        if (T > 3) {
+            float v3 = warp_sum(a03);
+            if (lane == 0) write_y(Y + 3 * m, row0, v3, add);
+        }
+    }
+    if (row1 < m) {
+        float v0 = warp_sum(a10);
+        if (lane == 0) write_y(Y, row1, v0, add);
+        if (T > 1) {
+            float v1 = warp_sum(a11);
+            if (lane == 0) write_y(Y + m, row1, v1, add);
+        }
+        if (T > 2) {
+            float v2 = warp_sum(a12);
+            if (lane == 0) write_y(Y + 2 * m, row1, v2, add);
+        }
+        if (T > 3) {
+            float v3 = warp_sum(a13);
+            if (lane == 0) write_y(Y + 3 * m, row1, v3, add);
         }
     }
 }
@@ -1347,7 +1498,15 @@ void launch_gemv(const GpuW& w, const float* x, float* y, int add = 0) {
             break;
         }
         const int tile = fp8_xs_tile(w.cols);
-        gemv_fp8_k<<<blocks, threads, sizeof(float) * tile>>>(w.data, w.scale, x, y, w.rows, w.cols, 128, add);
+        if (w.rows >= 4096) {
+            const int pairs = (w.rows + 1) / 2;
+            const int warps = threads / 32;
+            const int pblocks = (pairs + warps - 1) / warps;
+            gemv_fp8_2row_k<<<pblocks, threads, sizeof(float) * tile>>>(w.data, w.scale, x, y, w.rows, w.cols,
+                                                                        128, add);
+        } else {
+            gemv_fp8_k<<<blocks, threads, sizeof(float) * tile>>>(w.data, w.scale, x, y, w.rows, w.cols, 128, add);
+        }
         break;
     }
     default:
@@ -1385,11 +1544,19 @@ bool launch_cublas_f16(const GpuW& w, const float* X, float* Y, int T) {
 }
 
 void launch_gemm_fp8(const GpuW& w, const float* X, float* Y, int T, int add) {
-    int blocks = 0, threads = 0;
-    gemv_grid(w, blocks, threads);
     int tile = 2048;
     while (T > 0 && static_cast<size_t>(T) * tile * sizeof(float) > 24 * 1024 && tile > 256) tile /= 2;
     const size_t smem = static_cast<size_t>(T) * tile * sizeof(float);
+    if (w.rows >= 2048) {
+        const int warps = 8;
+        const int threads = warps * 32;
+        const int pairs = (w.rows + 1) / 2;
+        const int blocks = (pairs + warps - 1) / warps;
+        gemm_fp8_2row_k<<<blocks, threads, smem>>>(w.data, w.scale, X, Y, w.rows, w.cols, T, tile, add);
+        return;
+    }
+    int blocks = 0, threads = 0;
+    gemv_grid(w, blocks, threads);
     gemm_fp8_hw_k<<<blocks, threads, smem>>>(w.data, w.scale, X, Y, w.rows, w.cols, T, tile, add);
 }
 
@@ -1627,7 +1794,14 @@ public:
     }
 
     void copy_logits(float* host) const override {
-        CUDA_CHECK(cudaMemcpy(host, d_logits_, sizeof(float) * vocab_, cudaMemcpyDeviceToHost));
+        if (h_pin_) {
+            CUDA_CHECK(cudaMemcpyAsync(h_pin_, d_logits_, sizeof(float) * vocab_, cudaMemcpyDeviceToHost,
+                                       cudaStreamPerThread));
+            CUDA_CHECK(cudaStreamSynchronize(cudaStreamPerThread));
+            std::memcpy(host, h_pin_, sizeof(float) * vocab_);
+        } else {
+            CUDA_CHECK(cudaMemcpy(host, d_logits_, sizeof(float) * vocab_, cudaMemcpyDeviceToHost));
+        }
     }
 
     int32_t greedy() const override { return last_tok_; }
@@ -1873,7 +2047,8 @@ private:
                 launch_gemv(L.wo_a, d_o_, d_h_, 1);
             }
             launch_rms(d_h_, L.ffn_norm, d_xn_, hidden_, m.rms_eps);
-            launch_gemv_dual(L.wg, L.wu, d_xn_, d_gate_mlp_, d_up_);
+            launch_gemv(L.wg, d_xn_, d_gate_mlp_);
+            launch_gemv(L.wu, d_xn_, d_up_);
             swiglu_k<<<(L.inter + 255) / 256, 256>>>(d_gate_mlp_, d_up_, d_gate_mlp_, L.inter);
             launch_gemv(L.wd, d_gate_mlp_, d_h_, 1);
         }
@@ -2118,6 +2293,10 @@ private:
         g_xf16_n = xf16_n;
 
         h_logits_.assign(static_cast<size_t>(vocab_), 0.f);
+        h_pin_ = nullptr;
+        if (cudaMallocHost(reinterpret_cast<void**>(&h_pin_), sizeof(float) * static_cast<size_t>(vocab_)) !=
+            cudaSuccess)
+            h_pin_ = nullptr;
         CUDA_CHECK(cudaMemset(d_S_, 0, s_bytes_));
         CUDA_CHECK(cudaMemset(d_conv_, 0, conv_bytes_));
         CUDA_CHECK(cudaMemset(d_kcache_, 0, kv_bytes_));
@@ -2139,6 +2318,10 @@ private:
     }
 
     void release() {
+        if (h_pin_) {
+            cudaFreeHost(h_pin_);
+            h_pin_ = nullptr;
+        }
         if (graph_exec_) cudaGraphExecDestroy(graph_exec_);
         if (graph_) cudaGraphDestroy(graph_);
         for (int i = 0; i <= kPfGraphMax; ++i) {
@@ -2179,6 +2362,7 @@ private:
     __half* d_xf16_ = nullptr;
     size_t s_bytes_ = 0, conv_bytes_ = 0, kv_bytes_ = 0;
     std::vector<float> h_logits_;
+    mutable float* h_pin_ = nullptr;
     static constexpr int kPfGraphMax = 8;
     cudaGraph_t graph_ = nullptr;
     cudaGraphExec_t graph_exec_ = nullptr;
