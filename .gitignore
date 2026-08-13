@@ -1,0 +1,53 @@
+# Build trees and CMake artifacts
+/build/
+/out/
+/cmake-build-*/
+CMakeCache.txt
+CMakeFiles/
+cmake_install.cmake
+CTestTestfile.cmake
+CTestCustom.cmake
+Testing/
+compile_commands.json
+*.ninja
+.ninja_deps
+.ninja_log
+
+# Compiled objects and binaries
+*.o
+*.obj
+*.a
+*.lib
+*.exe
+*.dll
+*.so
+*.dylib
+*.pdb
+*.ilk
+*.exp
+
+# Source dumps / local archives
+*.tgz
+*.tar.gz
+*.zip
+
+# IDE / editor
+.vs/
+.vscode/
+.idea/
+*.user
+*.suo
+*.swp
+*~
+
+# OS
+Thumbs.db
+Desktop.ini
+.DS_Store
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+.env

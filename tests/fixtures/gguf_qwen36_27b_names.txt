@@ -1,0 +1,25 @@
+# Expected GGUF tensor name patterns for unsloth/Qwen3.6-27B-GGUF Q4_K_M (architecture=qwen35)
+# Role-level list; {i} is global layer 0..63
+token_embd.weight
+output.weight
+output_norm.weight
+blk.{i}.attn_norm.weight
+blk.{i}.ffn_norm.weight
+blk.{i}.attn_q.weight
+blk.{i}.attn_k.weight
+blk.{i}.attn_v.weight
+blk.{i}.attn_output.weight
+blk.{i}.attn_q_norm.weight
+blk.{i}.attn_k_norm.weight
+blk.{i}.ffn_gate.weight
+blk.{i}.ffn_up.weight
+blk.{i}.ffn_down.weight
+blk.{i}.ssm_in.weight
+blk.{i}.ssm_z.weight
+blk.{i}.ssm_out.weight
+blk.{i}.ssm_a.weight
+blk.{i}.ssm_beta.weight
+blk.{i}.ssm_a_log
+blk.{i}.ssm_dt
+blk.{i}.ssm_conv1d.weight
+blk.{i}.ssm_norm.weight
