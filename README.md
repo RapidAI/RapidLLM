@@ -132,7 +132,32 @@ Weight sources:
 - Community GGUF (32 GB path): [`unsloth/Qwen3.6-27B-GGUF`](https://huggingface.co/unsloth/Qwen3.6-27B-GGUF) Q4_K_M
 - Draft (recommended): [`Qwen/Qwen3.5-0.8B`](https://huggingface.co/Qwen/Qwen3.5-0.8B) — same `qwen3_5` family and vocab **248320**, 24-layer hybrid (18 DeltaNet + 6 Gated Attn), hidden 1024
 
-`--spec auto` picks a draft source in this order: attached `--draft` session → the target's own MTP head → n-gram continuation. CUDA without `--draft` uses n-gram only. `set_draft` requires matching vocab; architecture may differ.
+## Speculative decode
+
+`--spec auto` (the default) picks a draft source in this order:
+
+1. Attached `--draft` session
+2. The target's own MTP head (`mtp.fc` / `mtp.norm`)
+3. N-gram continuation from already generated tokens
+
+CUDA without `--draft` uses n-gram only. `set_draft` requires matching vocab; architecture may differ.
+
+Recommended draft for Qwen3.6-27B: [`Qwen/Qwen3.5-0.8B`](https://huggingface.co/Qwen/Qwen3.5-0.8B).
+
+| | Qwen3.6-27B (target) | Qwen3.5-0.8B (draft) |
+| --- | --- | --- |
+| Family | `qwen3_5` hybrid | same |
+| Vocab | 248320 | **248320** |
+| Layers | 64 (48 DeltaNet + 16 Attn) | 24 (18 DeltaNet + 6 Attn) |
+| Hidden | 5120 | 1024 |
+| DeltaNet V heads | 48 | 16 |
+
+```bash
+rapidllm -m /path/to/Qwen3.6-27B-FP8 \
+  --draft /path/to/Qwen3.5-0.8B \
+  --spec draft --spec-n 3 \
+  --prompt "Hello"
+```
 
 ## HTTP serve
 

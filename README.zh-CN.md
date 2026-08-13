@@ -132,7 +132,32 @@ rapidllm serve -m /path/to/Qwen3.6-27B-FP8 --host 127.0.0.1 --port 8080 --device
 - 社区 GGUF（32 GB 主路径）：[`unsloth/Qwen3.6-27B-GGUF`](https://huggingface.co/unsloth/Qwen3.6-27B-GGUF) Q4_K_M
 - 推荐草稿：[`Qwen/Qwen3.5-0.8B`](https://huggingface.co/Qwen/Qwen3.5-0.8B) — 同属 `qwen3_5`，词表同为 **248320**，24 层 hybrid（18 DeltaNet + 6 Gated Attn），hidden 1024
 
-`--spec auto` 按此顺序选草稿：已挂上的 `--draft` session → 目标模型自带 MTP 头 → n-gram 续写。CUDA 且未传 `--draft` 时只走 n-gram。`set_draft` 要求词表一致，架构可以不同。
+## 投机解码
+
+`--spec auto`（默认）按此顺序选草稿：
+
+1. 已挂上的 `--draft` session
+2. 目标模型自带 MTP 头（`mtp.fc` / `mtp.norm`）
+3. 从已生成上下文做 n-gram 续写
+
+CUDA 且未传 `--draft` 时只走 n-gram。`set_draft` 要求词表一致，架构可以不同。
+
+Qwen3.6-27B 的推荐草稿：[`Qwen/Qwen3.5-0.8B`](https://huggingface.co/Qwen/Qwen3.5-0.8B)。
+
+| | Qwen3.6-27B（目标） | Qwen3.5-0.8B（草稿） |
+| --- | --- | --- |
+| 架构族 | `qwen3_5` hybrid | 同族 |
+| 词表 | 248320 | **248320** |
+| 层数 | 64（48 DeltaNet + 16 Attn） | 24（18 DeltaNet + 6 Attn） |
+| hidden | 5120 | 1024 |
+| DeltaNet V 头 | 48 | 16 |
+
+```bash
+rapidllm -m /path/to/Qwen3.6-27B-FP8 \
+  --draft /path/to/Qwen3.5-0.8B \
+  --spec draft --spec-n 3 \
+  --prompt "你好"
+```
 
 ## HTTP 服务
 
