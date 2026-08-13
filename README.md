@@ -46,7 +46,7 @@ At 32K context, KV is about 2 GiB FP16 (1 GiB INT8). The 48 linear-attention lay
 - Dual cache: attention KV + DeltaNet recurrent + causal conv state
 - Memory planner: refuse or shrink context instead of letting the OS OOM-kill the process
 - Fused decode path (`--fuse=on|off`) for A/B against unfused ops
-- Speculative decode: `off` / `ngram` / `mtp` / `auto` / `draft` (smaller same-vocab model via `--draft`)
+- Speculative decode: `off` / `ngram` / `mtp` / `auto` / `draft`. Recommended draft: [`Qwen/Qwen3.5-0.8B`](https://huggingface.co/Qwen/Qwen3.5-0.8B)
 - Continuous batch: `--batch N` (same prompt, one shared weight pass per step; CUDA via `RAPIDLLM_MAX_BATCH`)
 - HTTP serve: OpenAI `/v1/chat/completions` + `/v1/responses`, Anthropic `/v1/messages`
 - Qwen3.6 ViT encoder (`vision_encode`); `--vision` / `--image` keep `visual.*` weights
@@ -107,7 +107,7 @@ Examples:
 ```bash
 rapidllm -m /path/to/Qwen3.6-27B-FP8 --device cpu --ctx 32768 --prompt "Hello"
 rapidllm -m model.gguf --device cpu --prompt "Hello"
-rapidllm -m target.gguf --draft draft.gguf --spec draft --spec-n 3 --prompt "Hello"
+rapidllm -m /path/to/Qwen3.6-27B-FP8 --draft /path/to/Qwen3.5-0.8B --spec draft --spec-n 3 --prompt "Hello"
 rapidllm bench -m model.gguf
 rapidllm bench -m model.gguf --device cuda --batch 4
 rapidllm bench --micro
@@ -121,15 +121,18 @@ rapidllm serve -m /path/to/Qwen3.6-27B-FP8 --host 127.0.0.1 --port 8080 --device
 | `--max-new` | `8` | generated tokens |
 | `--fuse` | `on` | fused DeltaNet / Attn / MLP decode |
 | `--spec` | `auto` | `draft` needs `--draft` |
-| `--draft` | — | smaller same-vocab draft model; implies `--spec draft` |
+| `--draft` | — | draft weights; implies `--spec draft`. Use [`Qwen3.5-0.8B`](https://huggingface.co/Qwen/Qwen3.5-0.8B) |
 | `--batch` | `1` | copies of the same prompt; sets `RAPIDLLM_MAX_BATCH` |
 | `--vision` / `--image` | off | load `visual.*` (encoder is CPU; generate does not yet consume the image) |
 | `--thinking` | on | `bench` and `serve` always turn it off |
 
 Weight sources:
 
-- Official: [`Qwen/Qwen3.6-27B-FP8`](https://huggingface.co/Qwen/Qwen3.6-27B-FP8)
+- Target: [`Qwen/Qwen3.6-27B-FP8`](https://huggingface.co/Qwen/Qwen3.6-27B-FP8)
 - Community GGUF (32 GB path): [`unsloth/Qwen3.6-27B-GGUF`](https://huggingface.co/unsloth/Qwen3.6-27B-GGUF) Q4_K_M
+- Draft (recommended): [`Qwen/Qwen3.5-0.8B`](https://huggingface.co/Qwen/Qwen3.5-0.8B) — same `qwen3_5` family and vocab **248320**, 24-layer hybrid (18 DeltaNet + 6 Gated Attn), hidden 1024
+
+`--spec auto` picks a draft source in this order: attached `--draft` session → the target's own MTP head → n-gram continuation. CUDA without `--draft` uses n-gram only. `set_draft` requires matching vocab; architecture may differ.
 
 ## HTTP serve
 

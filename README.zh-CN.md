@@ -46,7 +46,7 @@ RapidLLM 把官方 HuggingFace **block-FP8** 目录和社区 **GGUF** 文件加�
 - 双缓存：注意力 KV + DeltaNet 循环态 + 因果 conv 状态
 - MemoryPlanner：超预算时缩短 ctx 或拒载，避免被操作系统杀掉
 - 融合 decode（`--fuse=on|off`），便于与未融合算子对拍
-- 投机解码：`off` / `ngram` / `mtp` / `auto` / `draft`（`--draft` 加载同词表小模型）
+- 投机解码：`off` / `ngram` / `mtp` / `auto` / `draft`。推荐草稿：[`Qwen/Qwen3.5-0.8B`](https://huggingface.co/Qwen/Qwen3.5-0.8B)
 - 连续 batch：`--batch N`（同一 prompt 多副本，每步共享一次权重扫描；CUDA 用 `RAPIDLLM_MAX_BATCH`）
 - HTTP 服务：OpenAI `/v1/chat/completions`、`/v1/responses`，以及 Anthropic `/v1/messages`
 - Qwen3.6 ViT 编码器（`vision_encode`）；`--vision` / `--image` 会保留 `visual.*` 权重
@@ -107,7 +107,7 @@ rapidllm serve -m <path> [--host 127.0.0.1] [--port 8080] [--device cpu|cuda]
 ```bash
 rapidllm -m /path/to/Qwen3.6-27B-FP8 --device cpu --ctx 32768 --prompt "你好"
 rapidllm -m model.gguf --device cpu --prompt "你好"
-rapidllm -m target.gguf --draft draft.gguf --spec draft --spec-n 3 --prompt "你好"
+rapidllm -m /path/to/Qwen3.6-27B-FP8 --draft /path/to/Qwen3.5-0.8B --spec draft --spec-n 3 --prompt "你好"
 rapidllm bench -m model.gguf
 rapidllm bench -m model.gguf --device cuda --batch 4
 rapidllm bench --micro
@@ -121,15 +121,18 @@ rapidllm serve -m /path/to/Qwen3.6-27B-FP8 --host 127.0.0.1 --port 8080 --device
 | `--max-new` | `8` | 生成 token 数 |
 | `--fuse` | `on` | 融合 DeltaNet / Attn / MLP decode |
 | `--spec` | `auto` | `draft` 需要 `--draft` |
-| `--draft` | — | 同词表小草稿模型；隐含 `--spec draft` |
+| `--draft` | — | 草稿权重；隐含 `--spec draft`。推荐 [`Qwen3.5-0.8B`](https://huggingface.co/Qwen/Qwen3.5-0.8B) |
 | `--batch` | `1` | 同一 prompt 的副本数；会设置 `RAPIDLLM_MAX_BATCH` |
 | `--vision` / `--image` | 关 | 加载 `visual.*`（编码器在 CPU；generate 尚未吃进图像） |
 | `--thinking` | 开 | `bench` 与 `serve` 始终关闭 |
 
 权重来源：
 
-- 官方：[`Qwen/Qwen3.6-27B-FP8`](https://huggingface.co/Qwen/Qwen3.6-27B-FP8)
+- 目标模型：[`Qwen/Qwen3.6-27B-FP8`](https://huggingface.co/Qwen/Qwen3.6-27B-FP8)
 - 社区 GGUF（32 GB 主路径）：[`unsloth/Qwen3.6-27B-GGUF`](https://huggingface.co/unsloth/Qwen3.6-27B-GGUF) Q4_K_M
+- 推荐草稿：[`Qwen/Qwen3.5-0.8B`](https://huggingface.co/Qwen/Qwen3.5-0.8B) — 同属 `qwen3_5`，词表同为 **248320**，24 层 hybrid（18 DeltaNet + 6 Gated Attn），hidden 1024
+
+`--spec auto` 按此顺序选草稿：已挂上的 `--draft` session → 目标模型自带 MTP 头 → n-gram 续写。CUDA 且未传 `--draft` 时只走 n-gram。`set_draft` 要求词表一致，架构可以不同。
 
 ## HTTP 服务
 
