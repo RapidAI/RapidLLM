@@ -23,7 +23,7 @@ RapidLLM loads official HuggingFace **block-FP8** directories and community **GG
 - **48 × Gated DeltaNet** (`linear_attention`) — O(1) FP32 recurrent state
 - **16 × Gated Attention** (`full_attention`) — GQA KV cache
 
-v1 runs the **language model only**. Vision tensors are skipped at load time. MTP is parsed and can draft tokens; it is not a full multimodal stack.
+The default path is **text-only**. Vision tensors are skipped unless `--vision` or `--image` is set. MTP is parsed and can draft tokens.
 
 ## Why a hybrid engine
 
@@ -46,8 +46,11 @@ At 32K context, KV is about 2 GiB FP16 (1 GiB INT8). The 48 linear-attention lay
 - Dual cache: attention KV + DeltaNet recurrent + causal conv state
 - Memory planner: refuse or shrink context instead of letting the OS OOM-kill the process
 - Fused decode path (`--fuse=on|off`) for A/B against unfused ops
-- Speculative decode: `off` / `ngram` / `mtp` / `auto`
-- Thinking on by default; `rapidllm bench` forces `enable_thinking=false`
+- Speculative decode: `off` / `ngram` / `mtp` / `auto` / `draft` (smaller same-vocab model via `--draft`)
+- Continuous batch: `--batch N` (same prompt, one shared weight pass per step; CUDA via `RAPIDLLM_MAX_BATCH`)
+- HTTP serve: OpenAI `/v1/chat/completions` + `/v1/responses`, Anthropic `/v1/messages`
+- Qwen3.6 ViT encoder (`vision_encode`); `--vision` / `--image` keep `visual.*` weights
+- Thinking on by default; `bench` and `serve` force `enable_thinking=false`
 - Versioned **C API** (`include/rapidllm/api.h`) + CLI
 
 ## Requirements
@@ -67,7 +70,7 @@ At 32K context, KV is about 2 GiB FP16 (1 GiB INT8). The 48 linear-attention lay
 | 64 GB | official FP8 or Q4_K / Q5_K | 32K |
 | ≥ 96 GB | FP8; 262K is the capability cap | 32K–128K |
 
-Factory default `ctx = 32768`. Official FP8 text weights are ~27–28 GiB resident — a 32 GB box must use GGUF Q4_K or INT4 repack.
+Factory default `ctx = 32768`. Official FP8 text weights are ~27–28 GiB resident — a 32 GB box must use GGUF Q4_K or INT4 repack. Loading the vision tower adds another ~1–2 GiB.
 
 ## Build
 
@@ -83,7 +86,7 @@ cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DRAPIDLLM_WITH_CUDA=ON
 cmake --build build
 ```
 
-On Windows without Ninja, omit `-G Ninja` and use the Visual Studio generator.
+On Windows without Ninja, omit `-G Ninja` and use the Visual Studio generator. `rapidllm serve` links `ws2_32` on Windows.
 
 ## CLI
 
@@ -91,9 +94,12 @@ On Windows without Ninja, omit `-G Ninja` and use the Visual Studio generator.
 rapidllm -m <hf-dir|file.gguf> [--device cpu|cuda] [--ctx 32768] [--prompt TEXT]
          [--max-new N] [--threads N] [--max-layers N] [--max-ram-mb N]
          [--thinking | --no-thinking] [--fuse=on|off]
-         [--spec off|ngram|mtp|auto] [--spec-n N]
+         [--spec off|ngram|mtp|auto|draft] [--spec-n N] [--draft <hf-dir|file.gguf>]
+         [--image PATH] [--vision] [--batch N]
 
-rapidllm bench -m <path> [--device cpu|cuda] [--fuse=on|off] [--micro]
+rapidllm bench -m <path> [--device cpu|cuda] [--fuse=on|off] [--micro] [--batch N]
+
+rapidllm serve -m <path> [--host 127.0.0.1] [--port 8080] [--device cpu|cuda]
 ```
 
 Examples:
@@ -101,8 +107,11 @@ Examples:
 ```bash
 rapidllm -m /path/to/Qwen3.6-27B-FP8 --device cpu --ctx 32768 --prompt "Hello"
 rapidllm -m model.gguf --device cpu --prompt "Hello"
+rapidllm -m target.gguf --draft draft.gguf --spec draft --spec-n 3 --prompt "Hello"
 rapidllm bench -m model.gguf
+rapidllm bench -m model.gguf --device cuda --batch 4
 rapidllm bench --micro
+rapidllm serve -m /path/to/Qwen3.6-27B-FP8 --host 127.0.0.1 --port 8080 --device cuda
 ```
 
 | Flag | Default | Notes |
@@ -111,13 +120,36 @@ rapidllm bench --micro
 | `--ctx` | `32768` | planner may shrink or refuse |
 | `--max-new` | `8` | generated tokens |
 | `--fuse` | `on` | fused DeltaNet / Attn / MLP decode |
-| `--spec` | `auto` | n-gram or MTP draft |
-| `--thinking` | on | bench always turns it off |
+| `--spec` | `auto` | `draft` needs `--draft` |
+| `--draft` | — | smaller same-vocab draft model; implies `--spec draft` |
+| `--batch` | `1` | copies of the same prompt; sets `RAPIDLLM_MAX_BATCH` |
+| `--vision` / `--image` | off | load `visual.*` (encoder is CPU; generate does not yet consume the image) |
+| `--thinking` | on | `bench` and `serve` always turn it off |
 
 Weight sources:
 
 - Official: [`Qwen/Qwen3.6-27B-FP8`](https://huggingface.co/Qwen/Qwen3.6-27B-FP8)
 - Community GGUF (32 GB path): [`unsloth/Qwen3.6-27B-GGUF`](https://huggingface.co/unsloth/Qwen3.6-27B-GGUF) Q4_K_M
+
+## HTTP serve
+
+`rapidllm serve` is a single-connection JSON server (no SSE yet). Thinking is off.
+
+| Method | Path | Protocol |
+| --- | --- | --- |
+| `GET` | `/health`, `/v1/health` | liveness |
+| `GET` | `/v1/models` | model list |
+| `POST` | `/v1/chat/completions` | OpenAI Chat Completions |
+| `POST` | `/v1/responses` | OpenAI Responses |
+| `POST` | `/v1/messages` | Anthropic Messages |
+
+```bash
+curl http://127.0.0.1:8080/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{"model":"qwen","messages":[{"role":"user","content":"Hello"}],"max_tokens":64}'
+```
+
+`max_tokens` is clamped to 4096. `temperature <= 0` is greedy.
 
 ## C API
 
@@ -129,13 +161,14 @@ cfg.model_path = "model.gguf";
 cfg.device = "cpu";
 cfg.ctx = 32768;
 cfg.fuse = 1;
+cfg.language_only = 1;
 
 RapidError err = {0};
 RapidLLM* eng = rapidllm_load(&cfg, &err);
 RapidSessionConfig sc = {0};
 sc.enable_thinking = 1;
 sc.max_new_tokens = 64;
-sc.spec = 3; /* auto */
+sc.spec = 3; /* auto; 4 = draft-model */
 RapidSession* sess = rapidllm_session_new(eng, &sc, &err);
 
 int32_t ids[256], out[64];
@@ -144,11 +177,16 @@ RapidSampleParams sp = {0};
 sp.greedy = 1;
 int got = rapidllm_generate(sess, ids, n, &sp, out, 64, &err);
 
+/* Same prompt, N sequences, one shared weight pass per step (CUDA). */
+int out_n[4];
+int32_t bout[4 * 64];
+rapidllm_generate_batch(sess, ids, n, 4, &sp, bout, 64, out_n, &err);
+
 rapidllm_session_free(sess);
 rapidllm_free(eng);
 ```
 
-`RAPIDLLM_API_VERSION` is currently `1`. See `include/rapidllm/api.h` for the full surface (`prefill` / `decode` / `sample`, spec stats, bench stats).
+Attach a draft model with `rapidllm_session_set_draft`. `RAPIDLLM_API_VERSION` is `1`. See `include/rapidllm/api.h`.
 
 ## Tests
 
@@ -160,38 +198,39 @@ ctest --test-dir build --output-on-failure
 
 | Test | What it checks |
 | --- | --- |
-| `test_ir` | `ModelDesc`, `layer_types[]` |
-| `test_loader` | HF FP8 + GGUF + reject-bad fixtures |
+| `test_ir` | `ModelDesc`, `layer_types[]`, `VisionDesc` |
+| `test_loader` | HF FP8 + GGUF + reject-bad fixtures + visual name map |
 | `test_hybrid` | greedy tokens vs golden, fuse on/off, both formats |
 | `test_simd_bench` | AVX2 / AVX-512 vs scalar |
 | `test_nv` | DP4A GEMV reference |
-| `test_spec` | n-gram / MTP speculative decode |
+| `test_spec` | n-gram / MTP / draft-model speculative decode |
+| `test_batch` | continuous batch generate |
+| `test_protocol` | OpenAI / Anthropic parse + render + `/health` |
 | `test_cuda_decode` | CUDA path or host-ref fallback |
 
 ## Layout
 
 ```text
-include/rapidllm/   public headers (C API, IR, runtime, kernels)
+include/rapidllm/   public headers (C API, IR, runtime, kernels, server)
 src/api/            extern "C" implementation
 src/cli/            rapidllm, rapidllm_version
+src/server/         HTTP serve (OpenAI + Anthropic)
 src/frontend/       HF safetensors, GGUF, name map, WeightStore
-src/ir/             ModelDesc
-src/kernels/        scalar / AVX2 / AVX-512 / fused / CUDA
+src/ir/             ModelDesc + VisionDesc
+src/kernels/        scalar / AVX2 / AVX-512 / fused / vision / CUDA
 src/runtime/        session, DualCache, planner, tokenizer, sampler
 src/backend/cpu/    CpuDevice
+shaders/            GLSL compute (not wired into the default build)
 python/goldens/     tiny hybrid fixture + golden tokens
-tests/              unit / golden / loader / spec
+tests/              unit / golden / loader / spec / batch / protocol
 docs/               architecture (EN/ZH)
 ```
 
 ## Non-goals (v1)
 
-- HTTP serve: OpenAI `/v1/chat/completions` + `/v1/responses`, Anthropic `/v1/messages`
-
-```text
-rapidllm serve -m /path/to/Qwen3.6-27B-FP8 --host 127.0.0.1 --port 8080 --device cuda
-```
-- No vision / video encoder
+- No SSE / token streaming on `serve` (JSON request → JSON response)
+- No image-conditioned generate in the CLI (encoder exists; tokens are not inserted yet)
+- No video encoder
 - No MoE expert path
 - No ARM / Apple Silicon
 - No linking or vendoring llama.cpp / ggml / FLA
