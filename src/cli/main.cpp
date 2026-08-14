@@ -18,7 +18,7 @@ static void usage() {
                  "  rapidllm -m <hf-dir|file.gguf> [--device cpu|cuda] [--ctx 32768] [--prompt TEXT]\n"
                  "           [--max-new N] [--fuse=on|off] [--spec off|ngram|mtp|auto|draft] [--spec-n N]\n"
                  "           [--draft <hf-dir|file.gguf>]\n"
-                 "           [--image PATH] [--vision] [--batch N]\n"
+                 "           [--image PATH] [--vision] [--batch N] [--prompt-n N]\n"
                  "  rapidllm bench -m <path> [--device cpu|cuda] [--fuse=on|off] [--micro]\n"
                  "  rapidllm serve -m <path> [--host 127.0.0.1] [--port 8080] [--device cpu|cuda]\n"
                  "           OpenAI: POST /v1/chat/completions  POST /v1/responses\n"
@@ -43,6 +43,7 @@ int main(int argc, char** argv) {
     std::string image_path;
     std::string draft_path;
     int batch_n = 1;
+    int prompt_n = 0;
     bool serve = false;
     std::string host = "127.0.0.1";
     int port = 8080;
@@ -108,6 +109,8 @@ int main(int argc, char** argv) {
             language_only = 0;
         else if (a == "--batch")
             batch_n = std::atoi(need("--batch"));
+        else if (a == "--prompt-n")
+            prompt_n = std::atoi(need("--prompt-n"));
         else if (a == "--host")
             host = need("--host");
         else if (a == "--port")
@@ -287,8 +290,19 @@ int main(int argc, char** argv) {
         return rc;
     }
 
-    std::vector<int32_t> ids(4096);
-    const int n = rapidllm_encode(eng, prompt.c_str(), ids.data(), static_cast<int>(ids.size()), &err);
+    std::vector<int32_t> ids;
+    int n = 0;
+    if (prompt_n > 0) {
+        // Non-repeating ids so n-gram spec cannot fake long-ctx throughput.
+        ids.resize(static_cast<size_t>(prompt_n));
+        const int vocab = rapidllm_vocab(eng);
+        const int span = vocab > 20000 ? 10000 : (vocab > 256 ? vocab - 256 : 1);
+        for (int i = 0; i < prompt_n; ++i) ids[static_cast<size_t>(i)] = 256 + (i % span);
+        n = prompt_n;
+    } else {
+        ids.assign(static_cast<size_t>(ctx > 4096 ? ctx : 4096), 0);
+        n = rapidllm_encode(eng, prompt.c_str(), ids.data(), static_cast<int>(ids.size()), &err);
+    }
     if (n <= 0) {
         std::fprintf(stderr, "encode failed\n");
         rapidllm_session_free(sess);

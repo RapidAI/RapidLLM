@@ -2,7 +2,7 @@
 
 [English](README.md) · [中文](README.zh-CN.md)
 
-C++20 local inference engine for **Qwen3.6-27B** hybrid text models.
+C++20 local inference engine for **Qwen3.5 / 3.6 / 3.8-27B** hybrid text models.
 
 This is not a wrapper around llama.cpp, ggml, vLLM, or MLC.
 
@@ -110,6 +110,7 @@ rapidllm -m model.gguf --device cpu --prompt "Hello"
 rapidllm -m /path/to/Qwen3.6-27B-FP8 --draft /path/to/Qwen3.5-0.8B --spec draft --spec-n 3 --prompt "Hello"
 rapidllm bench -m model.gguf
 rapidllm bench -m model.gguf --device cuda --batch 4
+rapidllm bench -m /path/to/Qwen3.6-27B-FP8 --device cuda --ctx 131072 --prompt-n 8192 --max-new 8 --spec off
 rapidllm bench --micro
 rapidllm serve -m /path/to/Qwen3.6-27B-FP8 --host 127.0.0.1 --port 8080 --device cuda
 ```
@@ -123,14 +124,73 @@ rapidllm serve -m /path/to/Qwen3.6-27B-FP8 --host 127.0.0.1 --port 8080 --device
 | `--spec` | `auto` | `draft` needs `--draft` |
 | `--draft` | — | draft weights; implies `--spec draft`. Use [`Qwen3.5-0.8B`](https://huggingface.co/Qwen/Qwen3.5-0.8B) |
 | `--batch` | `1` | copies of the same prompt; sets `RAPIDLLM_MAX_BATCH` |
+| `--prompt-n` | — | synthesize `N` non-repeating token ids (skips the tokenizer). For long-ctx benches. |
 | `--vision` / `--image` | off | load `visual.*` (encoder is CPU; generate does not yet consume the image) |
 | `--thinking` | on | `bench` and `serve` always turn it off |
 
 Weight sources:
 
-- Target: [`Qwen/Qwen3.6-27B-FP8`](https://huggingface.co/Qwen/Qwen3.6-27B-FP8)
-- Community GGUF (32 GB path): [`unsloth/Qwen3.6-27B-GGUF`](https://huggingface.co/unsloth/Qwen3.6-27B-GGUF) Q4_K_M
-- Draft (recommended): [`Qwen/Qwen3.5-0.8B`](https://huggingface.co/Qwen/Qwen3.5-0.8B) — same `qwen3_5` family and vocab **248320**, 24-layer hybrid (18 DeltaNet + 6 Gated Attn), hidden 1024
+- Target (latest): [`Qwen/Qwen3.8-27B-FP8`](https://huggingface.co/Qwen/Qwen3.8-27B-FP8) — same `qwen3_5` hybrid IR as 3.6-27B
+- Target (previous): [`Qwen/Qwen3.6-27B-FP8`](https://huggingface.co/Qwen/Qwen3.6-27B-FP8)
+- Community GGUF: [`unsloth/Qwen3.8-27B-GGUF`](https://huggingface.co/unsloth/Qwen3.8-27B-GGUF) Q8_0 / Q6_K (also [`unsloth/Qwen3.6-27B-GGUF`](https://huggingface.co/unsloth/Qwen3.6-27B-GGUF) Q4_K_M)
+- Draft (recommended for 3.5 / 3.6 / **3.8**): [`Qwen/Qwen3.5-0.8B`](https://huggingface.co/Qwen/Qwen3.5-0.8B) — same family and vocab **248320**, 24-layer hybrid (18 DeltaNet + 6 Gated Attn), hidden 1024
+
+## Long-context limit numbers (RTX 6000 Ada 48 GB)
+
+Same box as the short-prompt bakeoff: **NVIDIA RTX 6000 Ada Generation, 49140 MiB**. Official FP8 text weights ~28 GiB. RapidLLM CUDA KV is FP32 (about **128 KiB / token** across the 16 gated-attention layers). vLLM uses paged FP16 KV (about **64 KiB / token**).
+
+All RapidLLM rows below are `--device cuda --fuse=on --spec off --no-thinking` (decode CUDA graph + fused GDN/RMS/MLP). `--spec auto` / draft is not used here: a repeating prompt would let n-gram fake throughput.
+
+`--prompt-n N` fills `N` non-repeating ids. `tok/s` is wall (prefill + 8–16 new tokens). `decode_tok/s` is the decode-only rate after that fill. Prefill tok/s = `N / prefill_s`.
+
+### RapidLLM official FP8
+
+| Window `--ctx` | Filled tokens | Prefill s | Prefill tok/s | Decode tok/s | Wall tok/s (8–16 new) | Notes |
+| --- | ---: | ---: | ---: | ---: | ---: | --- |
+| 256 (short bakeoff) | 3 | 0.037 | — | **32.02** | **31.65** | keep; vs vLLM 19.58 = **1.62×** |
+| 4096 | 64 | 0.60 | 107 | 31.84 | 9.74 | still the short-ctx attn kernel |
+| 16384 | 2048 | 23.68 | 86.5 | 15.64 | 0.33 | online softmax (`ctx>8192`) |
+| 131072 | 256 | 2.61 | 98 | **27.97** | 2.80 | 128k window allocated |
+| 131072 | 8192 | 121.17 | 67.6 | **6.31** | 0.065 | attn already dominates decode |
+| 131072 | 131056 | — | — | — | — | full fill not finished (O(N²) attn; ~hours) |
+| 200000 | 256 | — | — | — | — | **CUDA OOM** (~26 GiB FP32 KV + 28 GiB weights > 48 GiB) |
+
+vLLM on this card reported that 200k needs **12.39 GiB** KV vs **12.05 GiB** free at `gpu_memory_utilization=0.90` (estimated max len **194432**).
+
+### vLLM FP8 (graphs on, `enforce_eager=False`, `max_model_len=131072`)
+
+Same token-id pattern, 8 new tokens, wall `tok/s` includes prefill:
+
+| Window | Filled tokens | Wall s | Wall tok/s | vLLM logged in/out tok/s |
+| --- | ---: | ---: | ---: | --- |
+| 131072 | 256 | 0.456 | **17.54** | in 563 / out 17.6 |
+| 131072 | 2048 | 1.013 | **7.90** | in 1738 / out 6.8 |
+| 131072 | 8192 | 3.274 | **2.44** | in 2504 / out 2.45 |
+| 200000 | — | — | — | load failed: KV 12.39 GiB > 12.05 GiB |
+
+Short official pair (prompt `1,2,3`, 16 new): vLLM **19.5801** tok/s.
+
+### GGUF Q6_K / Q8_0 on CUDA
+
+Files: `bartowski/Qwen_Qwen3.6-27B-GGUF` → `Qwen_Qwen3.6-27B-Q6_K.gguf` (23 GiB), `Qwen_Qwen3.6-27B-Q8_0.gguf` (28 GiB).
+
+CUDA session **OOM even at `--ctx 256`** on this 48 GB card. Q8 stays packed (~28 GiB) but embed is dequantized to FP32 (~5 GiB) and the engine also keeps GDN S / conv / workspace; the extra copies do not leave enough headroom. Q6_K is requantized to the FP8 GEMV path at load (same ~28 GiB device footprint) and hits the same wall.
+
+So there is **no CUDA limit number** for Q6/Q8 on 48 GB. CPU GGUF still loads; that is not the GPU peak.
+
+### How to reproduce
+
+```bash
+# RapidLLM 128k window, 8k fill (fits 48 GB)
+rapidllm bench -m /path/to/Qwen3.6-27B-FP8 \
+  --device cuda --ctx 131072 --prompt-n 8192 --max-new 8 \
+  --spec off --fuse=on --no-thinking
+
+# vLLM 128k window (graphs on)
+# see scratch vllm_long.py: max_model_len=131072, TokensPrompt, 8 new tokens
+```
+
+Full 128k/200k **fills** are not a useful default: RapidLLM prefill attn is still O(N²) on the 16 gated-attention layers (8k fill already 121 s). Decode at a 128k **allocation** with a short fill is the number that isolates the window cost.
 
 ## Speculative decode
 
@@ -142,18 +202,19 @@ Weight sources:
 
 CUDA without `--draft` uses n-gram only. `set_draft` requires matching vocab; architecture may differ.
 
-Recommended draft for Qwen3.6-27B: [`Qwen/Qwen3.5-0.8B`](https://huggingface.co/Qwen/Qwen3.5-0.8B).
+Recommended draft for Qwen3.6-27B **and Qwen3.8-27B**: [`Qwen/Qwen3.5-0.8B`](https://huggingface.co/Qwen/Qwen3.5-0.8B). `set_draft` only requires matching vocab; architecture may differ. 3.8 is still `qwen3_5` with vocab **248320**, so the 0.8B draft stays valid.
 
-| | Qwen3.6-27B (target) | Qwen3.5-0.8B (draft) |
+| | Qwen3.8 / 3.6-27B (target) | Qwen3.5-0.8B (draft) |
 | --- | --- | --- |
 | Family | `qwen3_5` hybrid | same |
 | Vocab | 248320 | **248320** |
 | Layers | 64 (48 DeltaNet + 16 Attn) | 24 (18 DeltaNet + 6 Attn) |
 | Hidden | 5120 | 1024 |
 | DeltaNet V heads | 48 | 16 |
+| Attn | 24 Q / 4 KV, hd 256 | 8 Q / 2 KV, hd 256 |
 
 ```bash
-rapidllm -m /path/to/Qwen3.6-27B-FP8 \
+rapidllm -m /path/to/Qwen3.8-27B-FP8 \
   --draft /path/to/Qwen3.5-0.8B \
   --spec draft --spec-n 3 \
   --prompt "Hello"

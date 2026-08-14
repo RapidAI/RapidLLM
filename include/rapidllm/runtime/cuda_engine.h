@@ -17,6 +17,15 @@ public:
 
     virtual void prefill(const int32_t* ids, int n) = 0;
     virtual void decode_token(int32_t token) = 0;
+    // n graph replays; embed comes from the previous argmax (d_tok_). One host sync at the end.
+    // After return, greedy() is the last produced token; copy_gen_tokens() has the n tokens.
+    virtual void decode_steps(int n) {
+        for (int i = 0; i < n; ++i) decode_token(greedy());
+    }
+    virtual void copy_gen_tokens(int32_t* host, int n) {
+        (void)host;
+        (void)n;
+    }
     virtual void copy_logits(float* host) const = 0;
     virtual int32_t greedy() const = 0;
     virtual int pos() const = 0;

@@ -1,0 +1,139 @@
+name: Build release binaries
+
+on:
+  push:
+    tags:
+      # GitHub Actions tag filters are glob patterns. The validation job below
+      # enforces the complete v1.0.0.0 / V1.0.0.0 version format.
+      - 'v*'
+      - 'V*'
+
+permissions:
+  attestations: write
+  contents: read
+  id-token: write
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  validate-tag:
+    name: Validate release tag
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.version.outputs.value }}
+    steps:
+      - id: version
+        name: Check version format
+        shell: bash
+        env:
+          TAG: ${{ github.ref_name }}
+        run: |
+          if [[ ! "$TAG" =~ ^[Vv][0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "Tag '$TAG' must use the format v1.0.0.0 or V1.0.0.0." >&2
+            exit 1
+          fi
+          echo "value=$TAG" >> "$GITHUB_OUTPUT"
+
+  build:
+    name: Build ${{ matrix.name }} x64
+    needs: validate-tag
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: Windows
+            os: windows-latest
+            executable: rapidllm.exe
+            archive: rapidllm-windows-x64-${{ needs.validate-tag.outputs.version }}.zip
+          - name: Linux
+            os: ubuntu-latest
+            executable: rapidllm
+            archive: rapidllm-linux-x64-${{ needs.validate-tag.outputs.version }}.tar.gz
+    runs-on: ${{ matrix.os }}
+    steps:
+      - name: Check out source
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+
+      - name: Verify x86-64 runner
+        shell: bash
+        run: |
+          case "$(uname -m)" in
+            x86_64|amd64) ;;
+            *) echo "Expected an x86-64 runner, got $(uname -m)." >&2; exit 1 ;;
+          esac
+
+      - name: Set up MSVC environment
+        if: runner.os == 'Windows'
+        uses: ilammy/msvc-dev-cmd@a102174a2b586eec2ea151a69e6fd14404a8ce7c # v1.13.0
+        with:
+          arch: x64
+
+      - name: Configure
+        shell: pwsh
+        run: >-
+          cmake -S . -B build -G Ninja
+          -DCMAKE_BUILD_TYPE=Release
+          -DCMAKE_MSVC_RUNTIME_LIBRARY='MultiThreaded$<$<CONFIG:Debug>:Debug>'
+
+      - name: Build
+        shell: bash
+        run: cmake --build build --parallel
+
+      - name: Test
+        run: ctest --test-dir build --output-on-failure --no-tests=error
+
+      - name: Check release binary
+        shell: pwsh
+        run: |
+          $binary = "build/${{ matrix.executable }}"
+          if (-not (Test-Path -LiteralPath $binary -PathType Leaf)) {
+            throw "Expected release binary '$binary' was not produced."
+          }
+          & $binary --help
+
+      - name: Package Windows binary
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $packageDir = 'package'
+          New-Item -ItemType Directory -Path $packageDir | Out-Null
+          Copy-Item "build/${{ matrix.executable }}" "$packageDir/${{ matrix.executable }}"
+          Copy-Item LICENSE "$packageDir/LICENSE"
+          Compress-Archive -Path "$packageDir/*" -DestinationPath "${{ matrix.archive }}"
+
+      - name: Package Linux binary
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          mkdir package
+          cp "build/${{ matrix.executable }}" package/
+          cp LICENSE package/LICENSE
+          tar -C package -czf "../${{ matrix.archive }}" "${{ matrix.executable }}" LICENSE
+
+      - name: Generate artifact checksum
+        shell: bash
+        run: |
+          if command -v sha256sum >/dev/null; then
+            sha256sum "${{ matrix.archive }}" > "${{ matrix.archive }}.sha256"
+          else
+            shasum -a 256 "${{ matrix.archive }}" > "${{ matrix.archive }}.sha256"
+          fi
+
+      - name: Attest artifact provenance
+        uses: actions/attest-build-provenance@e8998f949152b193b063cb0ec769d69d929409be # v2.4.0
+        with:
+          subject-path: ${{ matrix.archive }}
+
+      - name: Upload binary package
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: ${{ matrix.archive }}
+          path: |
+            ${{ matrix.archive }}
+            ${{ matrix.archive }}.sha256
+          if-no-files-found: error
+          compression-level: 0

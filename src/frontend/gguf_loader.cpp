@@ -230,8 +230,15 @@ public:
         }
         if (n_embd < 0 && embed_hidden > 0) n_embd = embed_hidden;
         if (n_vocab < 0 && embed_vocab > 0) n_vocab = embed_vocab;
+        // Qwen3.5 / 3.6 / 3.8 27B share the same hybrid IR (hidden 5120, 64 layers).
+        const bool family_27b = architecture.find("qwen35") != std::string::npos ||
+                                architecture.find("qwen3_5") != std::string::npos ||
+                                architecture.find("qwen36") != std::string::npos ||
+                                architecture.find("qwen38") != std::string::npos ||
+                                architecture.find("qwen3_8") != std::string::npos ||
+                                architecture.find("qwen3.8") != std::string::npos;
         const bool is_27b = (n_layers >= 32 && (n_embd == 5120 || embed_hidden == 5120)) ||
-                            (architecture.find("qwen35") != std::string::npos && n_layers >= 32);
+                            (family_27b && n_layers >= 32);
         table.model = is_27b ? make_qwen36_27b_desc() : make_tiny_hybrid_desc();
         if (n_layers != table.model.n_layers) {
             table.model.n_layers = n_layers;

@@ -135,6 +135,8 @@ struct ModelDesc {
 
 LayerKind layer_kind_from_type(std::string_view type);
 ModelDesc make_qwen36_27b_desc();
+// Qwen3.8-27B is the same qwen3_5 hybrid IR as 3.6-27B (24Q/4KV hd256, 48/16 GDN).
+inline ModelDesc make_qwen38_27b_desc() { return make_qwen36_27b_desc(); }
 ModelDesc make_tiny_hybrid_desc();
 void apply_layer_types(ModelDesc& m, const std::vector<std::string>& types);
 

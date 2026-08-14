@@ -32,6 +32,7 @@ set(RAPIDLLM_SOURCES
   src/runtime/tokenizer.cpp
   src/runtime/sampler.cpp
   src/runtime/session.cpp
+  src/runtime/ngram_draft.cpp
   src/kernels/ops.cpp
   src/kernels/cpu_caps.cpp
   src/kernels/ops_simd_avx2.cpp
@@ -68,7 +69,8 @@ if(RAPIDLLM_WITH_CUDA)
   target_compile_definitions(rapidllm_core PUBLIC RAPIDLLM_WITH_CUDA=1)
   set_target_properties(rapidllm_core PROPERTIES CUDA_ARCHITECTURES "75;86;89")
   # Legacy default stream (stream 0) cannot be captured; per-thread stream can.
-  target_compile_options(rapidllm_core PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:--default-stream=per-thread>)
+  target_compile_options(rapidllm_core PRIVATE
+    $<$<COMPILE_LANGUAGE:CUDA>:--default-stream=per-thread;--use_fast_math;-Xptxas=-O3>)
   find_package(CUDAToolkit REQUIRED)
   target_link_libraries(rapidllm_core PUBLIC CUDA::cudart CUDA::cublas)
 endif()
@@ -120,6 +122,7 @@ rapidllm_test(test_spec tests/test_spec.cpp)
 rapidllm_test(test_cuda_decode tests/test_cuda_decode.cpp)
 rapidllm_test(test_batch tests/test_batch.cpp)
 rapidllm_test(test_protocol tests/test_protocol.cpp)
+rapidllm_test(test_ngram_draft tests/test_ngram_draft.cpp)
 
 enable_testing()
 add_test(NAME ir COMMAND test_ir)
@@ -131,3 +134,4 @@ add_test(NAME spec COMMAND test_spec)
 add_test(NAME batch COMMAND test_batch)
 add_test(NAME cuda_decode COMMAND test_cuda_decode)
 add_test(NAME protocol COMMAND test_protocol)
+add_test(NAME ngram_draft COMMAND test_ngram_draft)

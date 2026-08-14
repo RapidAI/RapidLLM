@@ -1,4 +1,5 @@
 #include "rapidllm/runtime/session.h"
+#include "rapidllm/runtime/ngram_draft.h"
 
 #include "rapidllm/kernels/ops.h"
 #include "rapidllm/runtime/sampler.h"
@@ -515,50 +516,7 @@ int Session::mtp_draft(int32_t first, int n, int32_t* out) {
 }
 
 int Session::ngram_draft(const int32_t* ctx, int ctx_n, int32_t first, int n, int32_t* out) const {
-    if (n <= 0 || ctx_n <= 0) return 0;
-    std::vector<int32_t> hay(ctx, ctx + ctx_n);
-    hay.push_back(first);
-    const int ng = std::min(3, static_cast<int>(hay.size()));
-    const int start = static_cast<int>(hay.size()) - ng;
-    int found = -1;
-    for (int i = 0; i + ng < start; ++i) {
-        bool ok = true;
-        for (int j = 0; j < ng; ++j) {
-            if (hay[i + j] != hay[start + j]) {
-                ok = false;
-                break;
-            }
-        }
-        if (ok) found = i + ng;
-    }
-    if (found >= 0) {
-        int got = 0;
-        for (int k = 0; k < n && found + k < static_cast<int>(hay.size()); ++k) out[got++] = hay[found + k];
-        if (got > 0 && got < n) {
-            bool run = true;
-            for (int i = 1; i < got; ++i) {
-                if (out[i] != out[0]) run = false;
-            }
-            if (run) {
-                while (got < n) out[got++] = out[0];
-            }
-        }
-        if (got > 0) return got;
-    }
-    // Self-repeat only after the same adjacent pair has been seen twice (avoids the
-    // one-off 3,3 → 59 reject on this model's greedy collapse).
-    if (ctx_n >= 2 && ctx[ctx_n - 1] == ctx[ctx_n - 2]) {
-        const int32_t t = ctx[ctx_n - 1];
-        int pairs = 0;
-        for (int i = 0; i + 1 < ctx_n; ++i) {
-            if (ctx[i] == t && ctx[i + 1] == t) ++pairs;
-        }
-        if (pairs >= 2) {
-            for (int i = 0; i < n; ++i) out[i] = t;
-            return n;
-        }
-    }
-    return 0;
+    return ngram_draft_tokens(ctx, ctx_n, first, n, out);
 }
 
 int Session::generate(const int32_t* ids, int n, int32_t* out, int cap, const GenerateConfig& cfg) {
@@ -574,6 +532,28 @@ int Session::generate(const int32_t* ids, int n, int32_t* out, int cap, const Ge
         if (cfg.spec != SpecKind::Off && draft_) sk = SpecKind::Draft;
         const int spec_n = std::max(0, cfg.spec_n);
         const auto t_d0 = std::chrono::steady_clock::now();
+        int n_decode_fwd = 0;
+        if (sk == SpecKind::Off && want > 0) {
+            // Prefill logits already produced token 0. Only decode the remaining
+            // want-1 tokens — the old decode_steps(want) ran one unused forward.
+            out[0] = gpu_->greedy();
+            ctx_tokens_.push_back(out[0]);
+            produced = 1;
+            const int n_dec = want - 1;
+            if (n_dec > 0) {
+                gpu_->decode_steps(n_dec);
+                int32_t rest[64];
+                gpu_->copy_gen_tokens(rest, n_dec);
+                const int take = n_dec < 64 ? n_dec : 64;
+                for (int i = 0; i < take; ++i) {
+                    out[i + 1] = rest[i];
+                    ctx_tokens_.push_back(out[i + 1]);
+                }
+                produced = 1 + take;
+            }
+            pos_ = gpu_->pos();
+            n_decode_fwd = n_dec;
+        }
         while (produced < want) {
             const int32_t t0 = gpu_->greedy();
             out[produced++] = t0;
@@ -608,7 +588,7 @@ int Session::generate(const int32_t* ids, int n, int32_t* out, int cap, const Ge
         }
         const auto t_d1 = std::chrono::steady_clock::now();
         last_decode_sec_ = std::chrono::duration<double>(t_d1 - t_d0).count();
-        last_decode_tokens_ = produced;
+        last_decode_tokens_ = n_decode_fwd > 0 ? n_decode_fwd : produced;
         gpu_->copy_logits(logits_.data());
         return produced;
     }

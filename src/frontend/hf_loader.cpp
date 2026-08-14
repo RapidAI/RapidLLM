@@ -4,6 +4,7 @@
 #include "frontend/json_mini.h"
 #include "frontend/safetensors.h"
 
+#include <algorithm>
 #include <cstring>
 #include <fstream>
 #include <map>
@@ -134,8 +135,15 @@ public:
             }
         } else {
             const auto single = path / "model.safetensors";
-            if (!std::filesystem::exists(single)) throw LoadError("no safetensors in " + path.string());
-            shards.push_back(single);
+            if (std::filesystem::exists(single)) {
+                shards.push_back(single);
+            } else {
+                for (const auto& e : std::filesystem::directory_iterator(path)) {
+                    if (e.path().extension() == ".safetensors") shards.push_back(e.path());
+                }
+                if (shards.empty()) throw LoadError("no safetensors in " + path.string());
+                std::sort(shards.begin(), shards.end());
+            }
         }
 
         std::unordered_map<std::string, STTensor> all;
