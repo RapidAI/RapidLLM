@@ -2,7 +2,7 @@
 
 [English](README.md) · [中文](README.zh-CN.md)
 
-C++20 local inference engine for **Qwen3.5 / 3.6 / 3.8-27B** hybrid text models.
+C++20 local inference engine for the **Qwen3.6-27B** and **Qwen3.8-27B** hybrid architecture.
 
 This is not a wrapper around llama.cpp, ggml, vLLM, or MLC.
 
@@ -14,16 +14,25 @@ This is not a wrapper around llama.cpp, ggml, vLLM, or MLC.
 | Platforms | Windows x86-64 · Linux x86-64 |
 | Version | 0.1.0 |
 
+**Supported now**
+
+| | |
+| --- | --- |
+| Architecture | Qwen3.6-27B and Qwen3.8-27B (`qwen3_5` hybrid: 48 Gated DeltaNet + 16 Gated Attention) |
+| Speculative decode | `--spec off\|ngram\|mtp\|auto\|draft` |
+| MTP | Target model's own multi-token prediction head (`mtp.fc` / `mtp.norm`) as draft |
+| Continuous batch | `--batch N` / `rapidllm_generate_batch` — one shared weight pass per step |
+
 Design: [docs/architecture.md](docs/architecture.md) · [docs/设计方案.md](docs/设计方案.md)
 
 ## What it is
 
-RapidLLM loads official HuggingFace **block-FP8** directories and community **GGUF** files into one `ModelDesc` + `TensorTable`. The scheduler walks `layer_types[]` and dispatches:
+RapidLLM loads official HuggingFace **block-FP8** directories and community **GGUF** files into one `ModelDesc` + `TensorTable`. Qwen3.6-27B and Qwen3.8-27B share this IR. The scheduler walks `layer_types[]` and dispatches:
 
 - **48 × Gated DeltaNet** (`linear_attention`) — O(1) FP32 recurrent state
 - **16 × Gated Attention** (`full_attention`) — GQA KV cache
 
-The default path is **text-only**. Vision tensors are skipped unless `--vision` or `--image` is set. MTP is parsed and can draft tokens.
+The default path is **text-only**. Vision tensors are skipped unless `--vision` or `--image` is set. MTP is loaded and used for speculative decode (`--spec mtp` / `auto`).
 
 ## Why a hybrid engine
 
@@ -46,8 +55,10 @@ At 32K context, KV is about 2 GiB FP16 (1 GiB INT8). The 48 linear-attention lay
 - Dual cache: attention KV + DeltaNet recurrent + causal conv state
 - Memory planner: refuse or shrink context instead of letting the OS OOM-kill the process
 - Fused decode path (`--fuse=on|off`) for A/B against unfused ops
-- Speculative decode: `off` / `ngram` / `mtp` / `auto` / `draft`. Recommended draft: [`Qwen/Qwen3.5-0.8B`](https://huggingface.co/Qwen/Qwen3.5-0.8B)
-- Continuous batch: `--batch N` (same prompt, one shared weight pass per step; CUDA via `RAPIDLLM_MAX_BATCH`)
+- **Speculative decode**: `off` / `ngram` / `mtp` / `auto` / `draft`
+- **MTP**: 27B's embedded 1-layer MTP head drafts tokens; `--spec mtp` or default `auto` when no `--draft` is attached
+- **Continuous batch**: `--batch N` (same prompt, one shared weight pass per step; CUDA via `RAPIDLLM_MAX_BATCH`)
+- External draft model: [`Qwen/Qwen3.5-0.8B`](https://huggingface.co/Qwen/Qwen3.5-0.8B)
 - HTTP serve: OpenAI `/v1/chat/completions` + `/v1/responses`, Anthropic `/v1/messages`
 - Qwen3.6 ViT encoder (`vision_encode`); `--vision` / `--image` keep `visual.*` weights
 - Thinking on by default; `bench` and `serve` force `enable_thinking=false`
@@ -192,15 +203,21 @@ rapidllm bench -m /path/to/Qwen3.6-27B-FP8 \
 
 Full 128k/200k **fills** are not a useful default: RapidLLM prefill attn is still O(N²) on the 16 gated-attention layers (8k fill already 121 s). Decode at a 128k **allocation** with a short fill is the number that isolates the window cost.
 
-## Speculative decode
+## Speculative decode and MTP
+
+Qwen3.6 / 3.8-27B ship an embedded **MTP** head (`mtp.fc`, `mtp.norm`, `mtp_num_hidden_layers=1`). RapidLLM parses it and runs it as a draft: `--spec mtp` always uses that head; `--spec auto` uses it when no `--draft` session is attached.
 
 `--spec auto` (the default) picks a draft source in this order:
 
-1. Attached `--draft` session
-2. The target's own MTP head (`mtp.fc` / `mtp.norm`)
+1. Attached `--draft` session (recommended: Qwen3.5-0.8B)
+2. The target's own **MTP** head
 3. N-gram continuation from already generated tokens
 
-CUDA without `--draft` uses n-gram only. `set_draft` requires matching vocab; architecture may differ.
+```bash
+rapidllm -m /path/to/Qwen3.8-27B-FP8 --spec mtp --spec-n 3 --prompt "Hello"
+```
+
+CUDA without `--draft` uses n-gram only (MTP draft on CUDA is CPU-session). `set_draft` requires matching vocab; architecture may differ.
 
 Recommended draft for Qwen3.6-27B **and Qwen3.8-27B**: [`Qwen/Qwen3.5-0.8B`](https://huggingface.co/Qwen/Qwen3.5-0.8B). `set_draft` only requires matching vocab; architecture may differ. 3.8 is still `qwen3_5` with vocab **248320**, so the 0.8B draft stays valid.
 
@@ -219,6 +236,16 @@ rapidllm -m /path/to/Qwen3.8-27B-FP8 \
   --spec draft --spec-n 3 \
   --prompt "Hello"
 ```
+
+## Continuous batch
+
+`--batch N` runs **N copies of the same prompt** with one shared weight pass per decode step. On CUDA, set `RAPIDLLM_MAX_BATCH` (the CLI does this from `--batch`). CPU falls back to N sequential generates.
+
+```bash
+rapidllm bench -m /path/to/Qwen3.8-27B-FP8 --device cuda --batch 4 --spec off
+```
+
+C API: `rapidllm_generate_batch`. Session API: `Session::generate_batch`.
 
 ## HTTP serve
 

@@ -2,7 +2,7 @@
 
 [English](README.md) · [中文](README.zh-CN.md)
 
-面向 **Qwen3.5 / 3.6 / 3.8-27B** 混合文本模型的 C++20 本地推理引擎。
+面向 **Qwen3.6-27B** 与 **Qwen3.8-27B** 混合架构的 C++20 本地推理引擎。
 
 本项目不是 llama.cpp / ggml / vLLM / MLC 的包装层。
 
@@ -14,16 +14,25 @@
 | 目标平台 | Windows x86-64 · Linux x86-64 |
 | 版本 | 0.1.0 |
 
+**当前支持**
+
+| | |
+| --- | --- |
+| 架构 | Qwen3.6-27B、Qwen3.8-27B（`qwen3_5` hybrid：48 层 Gated DeltaNet + 16 层 Gated Attention） |
+| 投机解码 | `--spec off\|ngram\|mtp\|auto\|draft` |
+| MTP | 目标模型自带多 token 预测头（`mtp.fc` / `mtp.norm`）作草稿 |
+| 连续批 | `--batch N` / `rapidllm_generate_batch` — 每步共享一次权重扫描 |
+
 设计文档：[docs/设计方案.md](docs/设计方案.md) · [docs/architecture.md](docs/architecture.md)
 
 ## 这是什么
 
-RapidLLM 把官方 HuggingFace **block-FP8** 目录和社区 **GGUF** 文件加载成同一套 `ModelDesc` + `TensorTable`。调度器按 `layer_types[]` 分发：
+RapidLLM 把官方 HuggingFace **block-FP8** 目录和社区 **GGUF** 文件加载成同一套 `ModelDesc` + `TensorTable`。Qwen3.6-27B 与 Qwen3.8-27B 共用这套 IR。调度器按 `layer_types[]` 分发：
 
 - **48 层 Gated DeltaNet**（`linear_attention`）——与序列长度无关的 FP32 循环状态
 - **16 层 Gated Attention**（`full_attention`）——GQA KV 缓存
 
-默认走 **纯文本**。未指定 `--vision` / `--image` 时跳过视觉张量。MTP 会解析并可用于草稿 token。
+默认走 **纯文本**。未指定 `--vision` / `--image` 时跳过视觉张量。MTP 会加载并用于投机解码（`--spec mtp` / `auto`）。
 
 ## 为什么要为混合架构自研
 
@@ -46,8 +55,10 @@ RapidLLM 把官方 HuggingFace **block-FP8** 目录和社区 **GGUF** 文件加�
 - 双缓存：注意力 KV + DeltaNet 循环态 + 因果 conv 状态
 - MemoryPlanner：超预算时缩短 ctx 或拒载，避免被操作系统杀掉
 - 融合 decode（`--fuse=on|off`），便于与未融合算子对拍
-- 投机解码：`off` / `ngram` / `mtp` / `auto` / `draft`。推荐草稿：[`Qwen/Qwen3.5-0.8B`](https://huggingface.co/Qwen/Qwen3.5-0.8B)
-- 连续 batch：`--batch N`（同一 prompt 多副本，每步共享一次权重扫描；CUDA 用 `RAPIDLLM_MAX_BATCH`）
+- **投机解码**：`off` / `ngram` / `mtp` / `auto` / `draft`
+- **MTP**：27B 内嵌 1 层 MTP 头出草稿 token；`--spec mtp`，或未挂 `--draft` 时默认 `auto` 会用它
+- **连续批**：`--batch N`（同一 prompt 多副本，每步共享一次权重扫描；CUDA 用 `RAPIDLLM_MAX_BATCH`）
+- 外挂草稿模型：[`Qwen/Qwen3.5-0.8B`](https://huggingface.co/Qwen/Qwen3.5-0.8B)
 - HTTP 服务：OpenAI `/v1/chat/completions`、`/v1/responses`，以及 Anthropic `/v1/messages`
 - Qwen3.6 ViT 编码器（`vision_encode`）；`--vision` / `--image` 会保留 `visual.*` 权重
 - 默认开启 thinking；`bench` 与 `serve` 强制 `enable_thinking=false`
@@ -189,15 +200,21 @@ rapidllm bench -m /path/to/Qwen3.6-27B-FP8 \
 
 整窗填满 128k/200k 不是默认该跑的：RapidLLM prefill attn 在 16 层 gated attn 上仍是 O(N²)（填 8k 已经 121 s）。看窗口代价，用 128k **分配** + 短填的 decode 数字即可。
 
-## 投机解码
+## 投机解码与 MTP
+
+Qwen3.6 / 3.8-27B 自带 **MTP** 头（`mtp.fc`、`mtp.norm`，`mtp_num_hidden_layers=1`）。RapidLLM 会解析并当作草稿跑：`--spec mtp` 固定用这颗头；未挂 `--draft` 时 `--spec auto` 也会用它。
 
 `--spec auto`（默认）按此顺序选草稿：
 
-1. 已挂上的 `--draft` session
-2. 目标模型自带 MTP 头（`mtp.fc` / `mtp.norm`）
+1. 已挂上的 `--draft` session（推荐 Qwen3.5-0.8B）
+2. 目标模型自带 **MTP** 头
 3. 从已生成上下文做 n-gram 续写
 
-CUDA 且未传 `--draft` 时只走 n-gram。`set_draft` 要求词表一致，架构可以不同。
+```bash
+rapidllm -m /path/to/Qwen3.8-27B-FP8 --spec mtp --spec-n 3 --prompt "你好"
+```
+
+CUDA 且未传 `--draft` 时只走 n-gram（MTP 草稿在 CPU session）。`set_draft` 要求词表一致，架构可以不同。
 
 Qwen3.6-27B **和 Qwen3.8-27B** 的推荐草稿都是 [`Qwen/Qwen3.5-0.8B`](https://huggingface.co/Qwen/Qwen3.5-0.8B)。`set_draft` 只要求词表一致，架构可以不同。3.8 仍是 `qwen3_5`、词表 **248320**，所以 0.8B 草稿继续可用。
 
@@ -216,6 +233,16 @@ rapidllm -m /path/to/Qwen3.8-27B-FP8 \
   --spec draft --spec-n 3 \
   --prompt "你好"
 ```
+
+## 连续批
+
+`--batch N` 对 **同一 prompt 跑 N 份副本**，每步 decode 只扫一遍权重。CUDA 上通过 `RAPIDLLM_MAX_BATCH` 生效（CLI 会按 `--batch` 设置）。CPU 会退回成 N 次串行 generate。
+
+```bash
+rapidllm bench -m /path/to/Qwen3.8-27B-FP8 --device cuda --batch 4 --spec off
+```
+
+C API：`rapidllm_generate_batch`。Session API：`Session::generate_batch`。
 
 ## HTTP 服务
 
