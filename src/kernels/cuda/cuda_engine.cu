@@ -8612,6 +8612,12 @@ public:
         const size_t s1 = s_bytes_ / static_cast<size_t>(max_batch_);
         const size_t c1 = conv_bytes_ / static_cast<size_t>(max_batch_);
         const size_t k1 = kv_bytes_ / static_cast<size_t>(max_batch_);
+        const int nblk = std::max(1, max_hd_ / kTqBlk);
+        const size_t tq_tok = static_cast<size_t>(n_attn_) * ctx_ * static_cast<size_t>(std::max(max_nkv_, 1));
+        const size_t kq1 = tq_tok * static_cast<size_t>(std::max(max_hd_, 1));
+        const size_t ksc1 = tq_tok * sizeof(__half);
+        const size_t vq1 = tq_tok * static_cast<size_t>(nblk) * kTq3B;
+        const size_t vsc1 = tq_tok * static_cast<size_t>(nblk) * sizeof(__half);
         for (int b = 1; b < n_slots; ++b) {
             if (s1) CUDA_CHECK(cudaMemcpy(reinterpret_cast<uint8_t*>(d_S_) + s1 * b, d_S_, s1, cudaMemcpyDeviceToDevice));
             if (c1)
@@ -8621,6 +8627,14 @@ public:
                 CUDA_CHECK(cudaMemcpy(reinterpret_cast<uint8_t*>(d_kcache_) + k1 * b, d_kcache_, k1,
                                       cudaMemcpyDeviceToDevice));
                 CUDA_CHECK(cudaMemcpy(reinterpret_cast<uint8_t*>(d_vcache_) + k1 * b, d_vcache_, k1,
+                                      cudaMemcpyDeviceToDevice));
+            }
+            if (kv_tq_ && d_k_q8_ && d_k_sc_ && d_v_qs_ && d_v_sc_) {
+                CUDA_CHECK(cudaMemcpy(d_k_q8_ + kq1 * b, d_k_q8_, kq1, cudaMemcpyDeviceToDevice));
+                CUDA_CHECK(cudaMemcpy(reinterpret_cast<uint8_t*>(d_k_sc_) + ksc1 * b, d_k_sc_, ksc1,
+                                      cudaMemcpyDeviceToDevice));
+                CUDA_CHECK(cudaMemcpy(d_v_qs_ + vq1 * b, d_v_qs_, vq1, cudaMemcpyDeviceToDevice));
+                CUDA_CHECK(cudaMemcpy(reinterpret_cast<uint8_t*>(d_v_sc_) + vsc1 * b, d_v_sc_, vsc1,
                                       cudaMemcpyDeviceToDevice));
             }
         }
@@ -8991,19 +9005,19 @@ private:
 
     int kv_stride() const { return kv_tq_ ? kv_win_ : ctx_; }
 
-    int8_t* k_q8_slot(int slot) {
-        return d_k_q8_ + static_cast<size_t>(slot) * ctx_ * max_nkv_ * max_hd_;
+    int8_t* k_q8_slot(int slot, int b = 0) {
+        return d_k_q8_ + (static_cast<size_t>(b) * n_attn_ + slot) * ctx_ * max_nkv_ * max_hd_;
     }
-    __half* k_sc_slot(int slot) {
-        return d_k_sc_ + static_cast<size_t>(slot) * ctx_ * max_nkv_;
+    __half* k_sc_slot(int slot, int b = 0) {
+        return d_k_sc_ + (static_cast<size_t>(b) * n_attn_ + slot) * ctx_ * max_nkv_;
     }
-    uint8_t* v_qs_slot(int slot) {
+    uint8_t* v_qs_slot(int slot, int b = 0) {
         const int nblk = std::max(1, max_hd_ / kTqBlk);
-        return d_v_qs_ + static_cast<size_t>(slot) * ctx_ * max_nkv_ * nblk * kTq3B;
+        return d_v_qs_ + (static_cast<size_t>(b) * n_attn_ + slot) * ctx_ * max_nkv_ * nblk * kTq3B;
     }
-    __half* v_sc_slot(int slot) {
+    __half* v_sc_slot(int slot, int b = 0) {
         const int nblk = std::max(1, max_hd_ / kTqBlk);
-        return d_v_sc_ + static_cast<size_t>(slot) * ctx_ * max_nkv_ * nblk;
+        return d_v_sc_ + (static_cast<size_t>(b) * n_attn_ + slot) * ctx_ * max_nkv_ * nblk;
     }
 
     void store_tq_kv(const GpuLayer& L, const float* ksrc, const float* vsrc, int pos0, int T) {
@@ -9473,6 +9487,8 @@ private:
     void launch_decode_batch(int B) {
         embed_batch(B);
         const ModelDesc& m = store_->model();
+        int hpos0 = 0;
+        CUDA_CHECK(cudaMemcpy(&hpos0, d_pos_b_, 4, cudaMemcpyDeviceToHost));
         for (GpuLayer& L : layers_) {
             launch_rms_batch(d_h_seq_, L.attn_norm, d_xn_seq_, hidden_, B, L.eps);
             if (L.kind == LayerKind::GatedDeltaNet) {
@@ -9504,24 +9520,39 @@ private:
                 launch_linear(L.wv, d_xn_seq_, d_v_seq_, B);
                 dim3 sg((qn + 255) / 256, B);
                 split_qg_batch_k<<<sg, 256>>>(d_qg_seq_, d_q_seq_, d_gate_seq_, qn, B);
-                dim3 hg(L.nq, B);
-                head_rms_batch_k<<<hg, 32>>>(d_q_seq_, L.q_norm, L.nq, L.hd, B, L.eps);
-                dim3 hkg(L.nkv, B);
-                head_rms_batch_k<<<hkg, 32>>>(d_k_seq_, L.k_norm, L.nkv, L.hd, B, L.eps);
+                const int use_win = kv_tq_ && hpos0 < kv_win_;
+                const int kctx = use_win ? 16384 : (kv_tq_ ? ctx_ : ctx_);
+                const size_t sm = kctx > 8192 ? static_cast<size_t>(L.hd) * sizeof(float)
+                                              : (static_cast<size_t>(kctx) + static_cast<size_t>(L.hd)) *
+                                                    sizeof(float);
+                const int kv_mode =
+                    (kv_tq_ && L.hd == 256 && !use_win) ? 3 : (kv_f16_ && L.hd == 256 ? 1 : 0);
+                const int ath = L.hd >= 256 ? 256 : 128;
                 for (int b = 0; b < B; ++b) {
-                    CUDA_CHECK(cudaMemcpyAsync(d_pos_, d_pos_b_ + b, 4, cudaMemcpyDeviceToDevice,
-                                               cudaStreamPerThread));
-                    dim3 rg(2, std::max(L.nq, L.nkv));
-                    rope_k<<<rg, 32>>>(d_q_seq_ + static_cast<size_t>(b) * qn, d_k_seq_ + static_cast<size_t>(b) * kn,
-                                       L.nq, L.nkv, L.hd, L.rotary, d_pos_, L.theta);
-                    float* kc = d_kcache_ + (static_cast<size_t>(b) * n_attn_ + L.slot) * ctx_ * kn;
-                    float* vc = d_vcache_ + (static_cast<size_t>(b) * n_attn_ + L.slot) * ctx_ * kn;
-                    store_kv_k<<<(kn + 127) / 128, 128>>>(kc, d_k_seq_ + static_cast<size_t>(b) * kn, d_pos_, kn);
-                    store_kv_k<<<(kn + 127) / 128, 128>>>(vc, d_v_seq_ + static_cast<size_t>(b) * kn, d_pos_, kn);
-                    const size_t sm = static_cast<size_t>(ctx_) * sizeof(float);
-                    attn_decode_k<<<L.nq, 32, sm>>>(d_q_seq_ + static_cast<size_t>(b) * qn, kc, vc,
-                                                    d_o_seq_ + static_cast<size_t>(b) * qn, d_pos_, L.nq, L.nkv,
-                                                    L.hd);
+                    float* kc =
+                        kv_f16_ && L.hd == 256
+                            ? reinterpret_cast<float*>(reinterpret_cast<__half*>(d_kcache_) +
+                                                       (static_cast<size_t>(b) * n_attn_ + L.slot) *
+                                                           kv_stride() * kn)
+                            : d_kcache_ + (static_cast<size_t>(b) * n_attn_ + L.slot) * kv_stride() * kn;
+                    float* vc =
+                        kv_f16_ && L.hd == 256
+                            ? reinterpret_cast<float*>(reinterpret_cast<__half*>(d_vcache_) +
+                                                       (static_cast<size_t>(b) * n_attn_ + L.slot) *
+                                                           kv_stride() * kn)
+                            : d_vcache_ + (static_cast<size_t>(b) * n_attn_ + L.slot) * kv_stride() * kn;
+                    qk_attn_decode_k<<<L.nq, ath, sm>>>(
+                        d_q_seq_ + static_cast<size_t>(b) * qn, d_k_seq_ + static_cast<size_t>(b) * kn,
+                        d_v_seq_ + static_cast<size_t>(b) * kn, L.q_norm, L.k_norm, kc, vc,
+                        d_o_seq_ + static_cast<size_t>(b) * qn, d_pos_b_ + b, L.nq, L.nkv, L.hd, L.rotary,
+                        L.theta, L.eps, kctx, kv_mode, kv_tq_ ? k_q8_slot(L.slot, b) : nullptr,
+                        kv_tq_ ? k_sc_slot(L.slot, b) : nullptr, kv_tq_ ? v_qs_slot(L.slot, b) : nullptr,
+                        kv_tq_ ? v_sc_slot(L.slot, b) : nullptr);
+                    if (kv_mode == 3)
+                        qk_attn_decode_tq_gqa_k<<<L.nkv, 256>>>(
+                            d_q_seq_ + static_cast<size_t>(b) * qn, d_o_seq_ + static_cast<size_t>(b) * qn,
+                            d_pos_b_ + b, L.nq, L.nkv, L.hd, k_q8_slot(L.slot, b), k_sc_slot(L.slot, b),
+                            v_qs_slot(L.slot, b), v_sc_slot(L.slot, b));
                 }
                 apply_gate_n_k<<<(qn * B + 255) / 256, 256>>>(d_o_seq_, d_gate_seq_, qn * B);
                 launch_linear(L.wo_a, d_o_seq_, d_h_seq_, B, 1);
@@ -9990,6 +10021,13 @@ private:
                          f16_full > 0 ? 100.0 * (1.0 - double(tq_bytes + kv_bytes_ * 2) / double(f16_full * 2))
                                       : 0.0);
         }
+        {
+            size_t free_b = 0, tot_b = 0;
+            if (cudaMemGetInfo(&free_b, &tot_b) == cudaSuccess)
+                std::fprintf(stderr, "cuda_mem used=%zuMiB free=%zuMiB total=%zuMiB max_batch=%d\n",
+                             (tot_b - free_b) / (1024 * 1024), free_b / (1024 * 1024), tot_b / (1024 * 1024),
+                             max_batch_);
+        }
 
         d_h_seq_ = static_cast<float*>(alloc(sizeof(float) * pf_cap_ * hidden_));
         d_xn_seq_ = static_cast<float*>(alloc(sizeof(float) * pf_cap_ * hidden_));
@@ -10168,6 +10206,12 @@ private:
                 maybe_capture_pf_tile(0, 1024);
                 maybe_capture_pf_tile(1024, 1024);
             }
+        }
+        {
+            size_t free_b = 0, tot_b = 0;
+            if (cudaMemGetInfo(&free_b, &tot_b) == cudaSuccess)
+                std::fprintf(stderr, "cuda_mem_ready used=%zuMiB free=%zuMiB max_batch=%d\n",
+                             (tot_b - free_b) / (1024 * 1024), free_b / (1024 * 1024), max_batch_);
         }
         for (auto& [_, t] : store_->table().tensors) {
             t.data.clear();
