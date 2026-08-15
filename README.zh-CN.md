@@ -207,7 +207,7 @@ rapidllm bench -m /path/to/Qwen3.8-27B-FP8 \
 | ---: | --- | ---: | ---: | ---: |
 | 131072 | 通过 | 44292 | 32.07 | 29.11 |
 | 147456 | 通过 | 46340 | 32.03 | 28.85 |
-| **163840** | **能跑的最大** | **48388** | 31.97 | 28.56 |
+| **163840** | **不开 TurboQuant 时的上限** | **48388** | 31.97 | 28.56 |
 | 167936 | session 时 CUDA OOM | — | — | — |
 | 172032 | session 时 CUDA OOM | — | — | — |
 | 200000 | 未试（已在 OOM 之上） | — | — | — |
@@ -234,12 +234,46 @@ rapidllm bench -m /path/to/Qwen3.8-27B-FP8 \
 
 合计峰值约 **94.5 tok/s**（batch 24–32）。batch 8 之后权重扫描已经饱和，再加序列几乎不再涨。
 
+### 262k TurboQuant + 连续批
+
+`--ctx 262144` 开 TurboQuant（`RAPIDLLM_KV_TQ=1` / `--kv-type q8k_tq3v`，`--ctx>163840` 时自动打开）才能在 48 GB 上分配：K=q8、V=tq3 持久化约 5.7–6.1 GiB/路，外加 8k F16 工作窗口。全量 F16 的 262k 大约 16–17 GiB/路，装不下。下面是同机扫描：`--device cuda --fuse=on --spec off --no-thinking --max-new 16 --prompt 1,2,3`，连续批（`--batch N`，每步共享一次权重扫描）。`tok/s` 是**合计**。峰值 MiB 取 graph 打完后的 `cuda_mem_ready`。
+
+| 权重 | `--batch` | 墙钟 tok/s | Decode tok/s | 每条 decode | 峰值 MiB | 结果 |
+| --- | ---: | ---: | ---: | ---: | ---: | --- |
+| 官方 FP8 | 1 | 29.04 | 30.79 | 30.79 | 35925 | 通过 |
+| 官方 FP8 | **2** | **40.75** | **43.90** | 21.95 | 42325 | **能跑的最大并发** |
+| 官方 FP8 | 3 | — | — | — | 46857 | session 时 CUDA OOM |
+| Q4_K_M | 1 | 31.14 | 31.55 | 31.55 | 38991 | 通过 |
+| Q4_K_M | **2** | **49.08** | **52.20** | 26.10 | 45781 | 通过 |
+| Q4_K_M | 4 | — | — | — | — | OOM（连接被掐） |
+| Q6_K | 1 | 30.44 | 31.04 | 31.04 | 39761 | 通过 |
+| Q6_K | **2** | **46.71** | **49.83** | 24.91 | 46551 | 通过 |
+| Q8_0 | 1 | 34.84 | 35.68 | 35.68 | 40631 | 通过（eager；graph 捕获失败） |
+| Q8_0 | **2** | **55.50** | **59.55** | 29.78 | 47421 | **合计 TPS 最高** |
+
+fill-256（仍在 8k F16 窗口内）`--ctx 262144`：
+
+| 权重 | `--batch` | 墙钟 tok/s | Decode tok/s | Prefill s | 峰值 MiB |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| 官方 FP8 | 1 | 26.99 | 30.36 | 0.066 | 35925 |
+| 官方 FP8 | 2 | 37.95 | 44.87 | 0.065 | 42325 |
+
+这张 48 GB 卡在 262k 下并发上限是 **`--batch 2`**。合计 TPS 峰值是 **55.50 tok/s**（Q8_0，batch 2）。官方 FP8 峰值是 **40.75 tok/s**（batch 2）。batch 3+ 会 OOM：持久化 KV 按路线性涨（约 5.7–6.1 GiB/路）。
+
 ```bash
-# 48 GB 上能分配的最大窗口
+# 不开 TurboQuant 时 48 GB 能分配的最大窗口
 rapidllm bench -m /path/to/Qwen3.8-27B-FP8 \
   --device cuda --ctx 163840 --max-new 8 --spec off --fuse=on --no-thinking --prompt 1,2,3
 
-# 并发合计 TPS
+# 262k + TurboQuant + 连续批（官方 FP8 合计 TPS 最高点）
+RAPIDLLM_KV_TQ=1 rapidllm bench -m /path/to/Qwen3.8-27B-FP8 \
+  --device cuda --ctx 262144 --batch 2 --max-new 16 --spec off --fuse=on --no-thinking --prompt 1,2,3
+
+# 这台机器上 262k 合计 TPS 最高
+RAPIDLLM_KV_TQ=1 rapidllm bench -m /path/to/Qwen3.8-27B-Q8_0.gguf \
+  --device cuda --ctx 262144 --batch 2 --max-new 16 --spec off --fuse=on --no-thinking --prompt 1,2,3
+
+# 短 ctx 并发合计 TPS
 rapidllm bench -m /path/to/Qwen3.8-27B-FP8 \
   --device cuda --ctx 256 --batch 24 --max-new 16 --spec off --fuse=on --no-thinking --prompt 1,2,3
 ```

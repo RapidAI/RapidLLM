@@ -207,7 +207,7 @@ Allocate `--ctx`, then generate 8 new tokens from prompt `1,2,3` (3-token fill).
 | ---: | --- | ---: | ---: | ---: |
 | 131072 | ok | 44292 | 32.07 | 29.11 |
 | 147456 | ok | 46340 | 32.03 | 28.85 |
-| **163840** | **max that runs** | **48388** | 31.97 | 28.56 |
+| **163840** | **max without TurboQuant** | **48388** | 31.97 | 28.56 |
 | 167936 | CUDA OOM at session | — | — | — |
 | 172032 | CUDA OOM at session | — | — | — |
 | 200000 | not tried (above OOM) | — | — | — |
@@ -234,12 +234,46 @@ Official pair: `--ctx 256 --max-new 16 --prompt 1,2,3`. `tok/s` is **aggregate**
 
 Peak aggregate is **~94.5 tok/s** at batch 24–32. After batch 8 the weight scan is already saturated; more sequences only add a little.
 
+### 262k TurboQuant + continuous batch
+
+`--ctx 262144` with TurboQuant (`RAPIDLLM_KV_TQ=1` / `--kv-type q8k_tq3v`, auto when `--ctx>163840`) allocates on 48 GB: K q8 + V tq3 persist ~5.7–6.1 GiB/seq plus an 8k F16 scratch window. Full F16 at 262k is ~16–17 GiB/seq and does not fit. Same-box sweep below: `--device cuda --fuse=on --spec off --no-thinking --max-new 16 --prompt 1,2,3`, continuous batch (`--batch N`, one shared weight pass). `tok/s` is **aggregate**. Peak MiB is `cuda_mem_ready` after graphs.
+
+| Weights | `--batch` | Wall tok/s | Decode tok/s | Per-seq decode | Peak MiB | Result |
+| --- | ---: | ---: | ---: | ---: | ---: | --- |
+| Official FP8 | 1 | 29.04 | 30.79 | 30.79 | 35925 | ok |
+| Official FP8 | **2** | **40.75** | **43.90** | 21.95 | 42325 | **max that fits** |
+| Official FP8 | 3 | — | — | — | 46857 | CUDA OOM at session |
+| Q4_K_M | 1 | 31.14 | 31.55 | 31.55 | 38991 | ok |
+| Q4_K_M | **2** | **49.08** | **52.20** | 26.10 | 45781 | ok |
+| Q4_K_M | 4 | — | — | — | — | OOM (SSH dropped) |
+| Q6_K | 1 | 30.44 | 31.04 | 31.04 | 39761 | ok |
+| Q6_K | **2** | **46.71** | **49.83** | 24.91 | 46551 | ok |
+| Q8_0 | 1 | 34.84 | 35.68 | 35.68 | 40631 | ok (eager; graph capture failed) |
+| Q8_0 | **2** | **55.50** | **59.55** | 29.78 | 47421 | **highest aggregate TPS** |
+
+Fill-256 (still inside the 8k F16 window) at `--ctx 262144`:
+
+| Weights | `--batch` | Wall tok/s | Decode tok/s | Prefill s | Peak MiB |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Official FP8 | 1 | 26.99 | 30.36 | 0.066 | 35925 |
+| Official FP8 | 2 | 37.95 | 44.87 | 0.065 | 42325 |
+
+On this 48 GB card the 262k concurrency cap is **`--batch 2`**. Peak total TPS is **55.50 tok/s** (Q8_0, batch 2). Official FP8 peaks at **40.75 tok/s** (batch 2). Batch 3+ OOMs because persist KV scales linearly (~5.7–6.1 GiB/seq).
+
 ```bash
-# max window that allocates on 48 GB
+# max window that allocates on 48 GB without TurboQuant
 rapidllm bench -m /path/to/Qwen3.8-27B-FP8 \
   --device cuda --ctx 163840 --max-new 8 --spec off --fuse=on --no-thinking --prompt 1,2,3
 
-# concurrent aggregate TPS
+# 262k + TurboQuant + continuous batch (highest official-FP8 total TPS)
+RAPIDLLM_KV_TQ=1 rapidllm bench -m /path/to/Qwen3.8-27B-FP8 \
+  --device cuda --ctx 262144 --batch 2 --max-new 16 --spec off --fuse=on --no-thinking --prompt 1,2,3
+
+# 262k peak aggregate TPS on this box
+RAPIDLLM_KV_TQ=1 rapidllm bench -m /path/to/Qwen3.8-27B-Q8_0.gguf \
+  --device cuda --ctx 262144 --batch 2 --max-new 16 --spec off --fuse=on --no-thinking --prompt 1,2,3
+
+# short-ctx concurrent aggregate TPS
 rapidllm bench -m /path/to/Qwen3.8-27B-FP8 \
   --device cuda --ctx 256 --batch 24 --max-new 16 --spec off --fuse=on --no-thinking --prompt 1,2,3
 ```
