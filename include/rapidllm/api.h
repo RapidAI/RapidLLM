@@ -75,6 +75,10 @@ void          rapidllm_free(RapidLLM*);
 int           rapidllm_vocab(const RapidLLM*);
 int           rapidllm_encode(RapidLLM*, const char* utf8, int32_t* ids, int cap, RapidError*);
 int           rapidllm_decode_ids(RapidLLM*, const int32_t*, int n, char* out, int cap, RapidError*);
+/* Load image, run ViT, store embeds on the session. Writes n_vis. */
+int           rapidllm_session_load_image(RapidSession*, const char* path, int* n_vis, RapidError*);
+/* Encode prompt and prefix vision_start / image_pad*n / vision_end from a loaded image. */
+int           rapidllm_encode_vl(RapidLLM*, RapidSession*, const char* utf8, int32_t* ids, int cap, RapidError*);
 int           rapidllm_generate(RapidSession*, const int32_t* ids, int n,
                                 const RapidSampleParams*, int32_t* out, int cap, RapidError*);
 /* Continuous batch: n_seq copies of the same prompt, one shared weight pass per step. */

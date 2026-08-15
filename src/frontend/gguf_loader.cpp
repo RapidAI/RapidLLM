@@ -3,6 +3,7 @@
 #include "rapidllm/kernels/ops.h"
 
 #include <algorithm>
+#include <cstring>
 #include <fstream>
 #include <sstream>
 #include <vector>
@@ -307,8 +308,35 @@ public:
             r.in.read(reinterpret_cast<char*>(td.data.data()), static_cast<std::streamsize>(nbytes));
             if (!r.in) throw LoadError("GGUF truncated tensor " + m.name);
 
-            if (opt.reject_quantized_leftover && is_leftover_name(ir) && leftover_quant_forbidden(td.quant)) {
-                throw LoadError("leftover over-quantized: " + m.name);
+            if (is_leftover_name(ir) && leftover_quant_forbidden(td.quant)) {
+                // Community Q8_0 files sometimes quantize DeltaNet in_proj_a/b.
+                // A_log / dt_bias / conv / norms must stay uncompressed.
+                const bool linear_leftover = ir.find("in_proj_a") != std::string::npos ||
+                                             ir.find("in_proj_b") != std::string::npos ||
+                                             ir.find("in_proj_ba") != std::string::npos;
+                int64_t ne = 1;
+                for (int d = 0; d < td.ndim; ++d) {
+                    if (td.shape[d] > 0) ne *= td.shape[d];
+                }
+                if (!linear_leftover || ne <= 0 || ne > 64ll * 1024 * 1024)
+                    throw LoadError("leftover over-quantized: " + m.name);
+                std::vector<float> f(static_cast<size_t>(ne));
+                const int n = static_cast<int>(ne);
+                if (td.quant == QuantKind::Q8_0 && (ne % 32) == 0)
+                    ops::dequant_q8_0(td.data.data(), f.data(), n);
+                else if (td.quant == QuantKind::Q4_K && (ne % 256) == 0)
+                    ops::dequant_q4_k(td.data.data(), f.data(), n);
+                else if (td.quant == QuantKind::Q5_K && (ne % 256) == 0)
+                    ops::dequant_q5_k(td.data.data(), f.data(), n);
+                else if (td.quant == QuantKind::Q6_K && (ne % 256) == 0)
+                    ops::dequant_q6_k(td.data.data(), f.data(), n);
+                else
+                    throw LoadError("leftover over-quantized: " + m.name);
+                td.data.resize(static_cast<size_t>(ne) * 4);
+                std::memcpy(td.data.data(), f.data(), static_cast<size_t>(ne) * 4);
+                td.quant = QuantKind::F32;
+                td.nbytes = static_cast<size_t>(ne) * 4;
+                (void)opt;
             }
             if (td.quant == QuantKind::IQUnknown && !opt.allow_iq_dequant) {
                 throw LoadError("unsupported ggml_type on " + m.name);

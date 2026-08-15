@@ -33,6 +33,7 @@ set(RAPIDLLM_SOURCES
   src/runtime/sampler.cpp
   src/runtime/session.cpp
   src/runtime/ngram_draft.cpp
+  src/runtime/image_io.cpp
   src/kernels/ops.cpp
   src/kernels/cpu_caps.cpp
   src/kernels/ops_simd_avx2.cpp
@@ -50,6 +51,7 @@ target_link_libraries(rapidllm_core PUBLIC Threads::Threads)
 target_include_directories(rapidllm_core PUBLIC
   ${CMAKE_SOURCE_DIR}/include
   ${CMAKE_SOURCE_DIR}/src
+  ${CMAKE_SOURCE_DIR}/third_party
 )
 target_compile_definitions(rapidllm_core PUBLIC RAPIDLLM_VERSION="${PROJECT_VERSION}")
 # ISA kernels live in their own TUs so AVX-512 opcodes are never emitted on the AVX2-only path.
@@ -73,6 +75,9 @@ if(RAPIDLLM_WITH_CUDA)
     $<$<COMPILE_LANGUAGE:CUDA>:--default-stream=per-thread;--use_fast_math;-Xptxas=-O3>)
   find_package(CUDAToolkit REQUIRED)
   target_link_libraries(rapidllm_core PUBLIC CUDA::cudart CUDA::cublas)
+  if(TARGET CUDA::cublasLt)
+    target_link_libraries(rapidllm_core PUBLIC CUDA::cublasLt)
+  endif()
 endif()
 
 add_executable(rapidllm src/cli/main.cpp)
@@ -123,6 +128,7 @@ rapidllm_test(test_cuda_decode tests/test_cuda_decode.cpp)
 rapidllm_test(test_batch tests/test_batch.cpp)
 rapidllm_test(test_protocol tests/test_protocol.cpp)
 rapidllm_test(test_ngram_draft tests/test_ngram_draft.cpp)
+rapidllm_test(test_vision tests/test_vision.cpp)
 
 enable_testing()
 add_test(NAME ir COMMAND test_ir)
@@ -135,3 +141,4 @@ add_test(NAME batch COMMAND test_batch)
 add_test(NAME cuda_decode COMMAND test_cuda_decode)
 add_test(NAME protocol COMMAND test_protocol)
 add_test(NAME ngram_draft COMMAND test_ngram_draft)
+add_test(NAME vision COMMAND test_vision)

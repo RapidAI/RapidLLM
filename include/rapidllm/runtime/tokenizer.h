@@ -24,6 +24,11 @@ private:
     int vocab_ = 0;
 };
 
+// vision_start + image_pad * n_vis + vision_end + text_ids. Returns n or -1 if cap is short.
+int pack_vl_prompt(int n_vis, const int32_t* text, int n_text, int32_t* out, int cap,
+                   int vision_start = Tokenizer::kVisionStart, int image_id = Tokenizer::kImage,
+                   int vision_end = Tokenizer::kVisionEnd);
+
 std::string apply_chat_template(std::string_view user, bool enable_thinking);
 
 struct ChatTurn {

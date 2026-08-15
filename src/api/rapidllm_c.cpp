@@ -15,6 +15,7 @@
 #include <cstring>
 #include <memory>
 #include <string>
+#include <vector>
 
 using namespace rapidllm;
 
@@ -129,6 +130,43 @@ int rapidllm_encode(RapidLLM* e, const char* utf8, int32_t* ids, int cap, RapidE
         return -1;
     }
     return e->tok.encode(utf8, ids, cap);
+}
+
+int rapidllm_session_load_image(RapidSession* s, const char* path, int* n_vis, RapidError* err) {
+    try {
+        if (!s || !s->sess || !path) {
+            set_err(err, RAPID_ERR_RANGE, "null image");
+            return RAPID_ERR_RANGE;
+        }
+        const int n = s->sess->load_image(path);
+        if (n_vis) *n_vis = n;
+        return RAPID_OK;
+    } catch (const std::exception& e) {
+        set_err(err, RAPID_ERR_INTERNAL, e.what());
+        return RAPID_ERR_INTERNAL;
+    }
+}
+
+int rapidllm_encode_vl(RapidLLM* e, RapidSession* s, const char* utf8, int32_t* ids, int cap, RapidError* err) {
+    if (!e || !utf8 || !ids) {
+        set_err(err, RAPID_ERR_RANGE, "null");
+        return -1;
+    }
+    const int n_vis = (s && s->sess) ? s->sess->vision_token_count() : 0;
+    if (n_vis <= 0) return e->tok.encode(utf8, ids, cap);
+    std::vector<int32_t> text(static_cast<size_t>(cap > 0 ? cap : 1), 0);
+    const int nt = e->tok.encode(utf8, text.data(), cap);
+    if (nt < 0) return nt;
+    const ModelDesc& m = e->store.model();
+    const int vs = m.vision.vision_start_id ? m.vision.vision_start_id : Tokenizer::kVisionStart;
+    const int img = m.vision.image_token_id ? m.vision.image_token_id : Tokenizer::kImage;
+    const int ve = m.vision.vision_end_id ? m.vision.vision_end_id : Tokenizer::kVisionEnd;
+    const int n = pack_vl_prompt(n_vis, text.data(), nt, ids, cap, vs, img, ve);
+    if (n < 0) {
+        set_err(err, RAPID_ERR_RANGE, "vl prompt exceeds cap");
+        return -1;
+    }
+    return n;
 }
 
 int rapidllm_decode_ids(RapidLLM* e, const int32_t* ids, int n, char* out, int cap, RapidError* err) {

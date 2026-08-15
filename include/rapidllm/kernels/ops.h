@@ -134,9 +134,12 @@ void swiglu(const float* gate, const float* up, float* y, int n);
 float gelu_tanh(float x);
 void layernorm(const float* x, const float* w, const float* b, float* y, int n, float eps);
 
-// Qwen3.6 ViT: patch-embed (T=2, P=16) + 27 LN-attn-MLP blocks + spatial-merge MLP.
-// pixels: RGB float [0,1], row-major H*W*3. out: [gh*gw, out_hidden], gh=H/(patch*merge).
+// Qwen3.5/3.6/3.8 ViT: patch-embed (T=2, P=16) + LN-attn-MLP + spatial-merge MLP.
+// pixels: RGB float [0,1], row-major H*W*3 (mean/std 0.5 applied inside encode).
+// out: [gh*gw, out_hidden], gh=H/(patch*merge).
 int vision_grid(int img_h, int img_w, int patch, int merge, int* gh, int* gw);
+int vision_smart_resize(int h, int w, int factor, int min_pixels, int max_pixels, int* oh, int* ow);
+void vision_resize_bilinear(const float* src, int sh, int sw, float* dst, int dh, int dw);
 void vision_encode(const float* rgb, int img_h, int img_w, const VisionDesc& V,
                    const TensorTable& weights, float* out);
 

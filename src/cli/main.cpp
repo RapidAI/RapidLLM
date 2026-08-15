@@ -2,6 +2,7 @@
 #include "rapidllm/kernels/nv_gemv.h"
 #include "rapidllm/kernels/ops.h"
 #include "rapidllm/runtime/thread_pool.h"
+#include "rapidllm/runtime/tokenizer.h"
 #include "rapidllm/server/http_serve.h"
 #include "rapidllm/version.h"
 
@@ -9,6 +10,9 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#ifdef _WIN32
+#include <stdlib.h>
+#endif
 #include <string>
 #include <vector>
 
@@ -19,6 +23,8 @@ static void usage() {
                  "           [--max-new N] [--fuse=on|off] [--spec off|ngram|mtp|auto|draft] [--spec-n N]\n"
                  "           [--draft <hf-dir|file.gguf>]\n"
                  "           [--image PATH] [--vision] [--batch N] [--prompt-n N]\n"
+                 "           [--kv-type f16|q8k_tq3v]\n"
+                 "           --image runs the ViT and splices visual tokens into generate\n"
                  "  rapidllm bench -m <path> [--device cpu|cuda] [--fuse=on|off] [--micro]\n"
                  "  rapidllm serve -m <path> [--host 127.0.0.1] [--port 8080] [--device cpu|cuda]\n"
                  "           OpenAI: POST /v1/chat/completions  POST /v1/responses\n"
@@ -111,6 +117,25 @@ int main(int argc, char** argv) {
             batch_n = std::atoi(need("--batch"));
         else if (a == "--prompt-n")
             prompt_n = std::atoi(need("--prompt-n"));
+        else if (a == "--kv-type") {
+            const std::string v = need("--kv-type");
+            if (v == "f16" || v == "fp16") {
+#ifdef _WIN32
+                _putenv_s("RAPIDLLM_KV_TQ", "0");
+#else
+                setenv("RAPIDLLM_KV_TQ", "0", 1);
+#endif
+            } else if (v == "q8k_tq3v" || v == "tq" || v == "turboquant") {
+#ifdef _WIN32
+                _putenv_s("RAPIDLLM_KV_TQ", "1");
+#else
+                setenv("RAPIDLLM_KV_TQ", "1", 1);
+#endif
+            } else {
+                std::fprintf(stderr, "unknown --kv-type %s (f16|q8k_tq3v)\n", v.c_str());
+                return 2;
+            }
+        }
         else if (a == "--host")
             host = need("--host");
         else if (a == "--port")
@@ -224,6 +249,11 @@ int main(int argc, char** argv) {
 #endif
     }
 
+    if (!image_path.empty() && spec == 4) {
+        std::fprintf(stderr, "image: draft spec disabled (draft cannot see vision embeds)\n");
+        spec = 0;
+        draft_path.clear();
+    }
     if (!draft_path.empty() && spec != 0) spec = 4;
 
     RapidSessionConfig sc{};
@@ -292,16 +322,40 @@ int main(int argc, char** argv) {
 
     std::vector<int32_t> ids;
     int n = 0;
+    int n_vis = 0;
+    if (!image_path.empty()) {
+        if (rapidllm_session_load_image(sess, image_path.c_str(), &n_vis, &err) != RAPID_OK) {
+            std::fprintf(stderr, "image: %s\n", err.message);
+            rapidllm_session_free(sess);
+            rapidllm_free(eng);
+            if (draft_sess) rapidllm_session_free(draft_sess);
+            if (draft_eng) rapidllm_free(draft_eng);
+            return 1;
+        }
+        std::fprintf(stderr, "image %s vis_tokens=%d\n", image_path.c_str(), n_vis);
+        std::fflush(stderr);
+    }
+
     if (prompt_n > 0) {
         // Non-repeating ids so n-gram spec cannot fake long-ctx throughput.
-        ids.resize(static_cast<size_t>(prompt_n));
+        std::vector<int32_t> text(static_cast<size_t>(prompt_n));
         const int vocab = rapidllm_vocab(eng);
         const int span = vocab > 20000 ? 10000 : (vocab > 256 ? vocab - 256 : 1);
-        for (int i = 0; i < prompt_n; ++i) ids[static_cast<size_t>(i)] = 256 + (i % span);
-        n = prompt_n;
+        for (int i = 0; i < prompt_n; ++i) text[static_cast<size_t>(i)] = 256 + (i % span);
+        if (n_vis > 0) {
+            ids.assign(static_cast<size_t>(prompt_n + n_vis + 8), 0);
+            n = rapidllm::pack_vl_prompt(n_vis, text.data(), prompt_n, ids.data(),
+                                         static_cast<int>(ids.size()));
+        } else {
+            ids = std::move(text);
+            n = prompt_n;
+        }
     } else {
         ids.assign(static_cast<size_t>(ctx > 4096 ? ctx : 4096), 0);
-        n = rapidllm_encode(eng, prompt.c_str(), ids.data(), static_cast<int>(ids.size()), &err);
+        if (n_vis > 0)
+            n = rapidllm_encode_vl(eng, sess, prompt.c_str(), ids.data(), static_cast<int>(ids.size()), &err);
+        else
+            n = rapidllm_encode(eng, prompt.c_str(), ids.data(), static_cast<int>(ids.size()), &err);
     }
     if (n <= 0) {
         std::fprintf(stderr, "encode failed\n");

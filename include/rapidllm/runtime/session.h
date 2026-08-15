@@ -44,6 +44,13 @@ public:
     int last_decode_tokens() const { return last_decode_tokens_; }
 
     void prefill(const int32_t* ids, int n);
+    // Encode PATH through the ViT and keep [n_vis, hidden] to splice over image-pad tokens.
+    int load_image(const std::string& path);
+    void set_vision_embeds(const float* embeds, int n_vis, int placeholder_id = -1);
+    void clear_vision();
+    int vision_token_count() const { return vis_n_; }
+    int vision_height() const { return vis_h_; }
+    int vision_width() const { return vis_w_; }
     void decode_token(int32_t token, float* logits);
     int generate(const int32_t* ids, int n, int32_t* out, int cap, const GenerateConfig& cfg);
     // Continuous batch: n_seq independent prompts, one weight-shared decode step per token.
@@ -87,6 +94,11 @@ private:
     std::vector<float> mtp_k_;
     std::vector<float> mtp_v_;
     std::vector<int32_t> ctx_tokens_;
+    std::vector<float> vis_embeds_;
+    int vis_n_ = 0;
+    int vis_ph_ = -1;
+    int vis_h_ = 0;
+    int vis_w_ = 0;
     SpecStats spec_stats_{};
     int pos_ = 0;
     int ctx_ = 0;

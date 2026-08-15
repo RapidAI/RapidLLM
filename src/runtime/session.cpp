@@ -1,5 +1,6 @@
 #include "rapidllm/runtime/session.h"
 #include "rapidllm/runtime/ngram_draft.h"
+#include "rapidllm/runtime/image_io.h"
 
 #include "rapidllm/kernels/ops.h"
 #include "rapidllm/runtime/sampler.h"
@@ -369,10 +370,80 @@ void Session::forward_hidden(const float* x_in, float* x_out, bool is_prefill, i
     }
 }
 
+void Session::set_vision_embeds(const float* embeds, int n_vis, int placeholder_id) {
+    const int H = store_->model().hidden;
+    if (n_vis < 0 || (n_vis > 0 && !embeds)) throw std::runtime_error("vision embeds");
+    vis_n_ = n_vis;
+    vis_ph_ = placeholder_id;
+    vis_h_ = 0;
+    vis_w_ = 0;
+    if (n_vis == 0) {
+        vis_embeds_.clear();
+        return;
+    }
+    vis_embeds_.assign(embeds, embeds + static_cast<size_t>(n_vis) * H);
+}
+
+void Session::clear_vision() { set_vision_embeds(nullptr, 0, -1); }
+
+int Session::load_image(const std::string& path) {
+    const ModelDesc& m = store_->model();
+    const VisionDesc& V = m.vision;
+    if (!store_->table().find("visual.patch_embed"))
+        throw std::runtime_error("image given but visual.* weights were not loaded (pass --image / --vision)");
+    ImageRgb im = load_image_rgb(path);
+    const int factor = std::max(1, V.patch * V.spatial_merge);
+    const int min_px = 65536;
+    const int max_vis = 1024;
+    const int max_px = max_vis * factor * factor;
+    int oh = 0, ow = 0;
+    if (ops::vision_smart_resize(im.h, im.w, factor, min_px, max_px, &oh, &ow) != 0)
+        throw std::runtime_error("vision smart_resize failed");
+    std::vector<float> resized(static_cast<size_t>(oh) * ow * 3);
+    ops::vision_resize_bilinear(im.rgb.data(), im.h, im.w, resized.data(), oh, ow);
+    int gh = 0, gw = 0;
+    const int n_vis = ops::vision_grid(oh, ow, V.patch, V.spatial_merge, &gh, &gw);
+    if (n_vis <= 0) throw std::runtime_error("vision grid empty after resize");
+    vis_embeds_.assign(static_cast<size_t>(n_vis) * m.hidden, 0.f);
+    ops::vision_encode(resized.data(), oh, ow, V, store_->table(), vis_embeds_.data());
+    vis_n_ = n_vis;
+    vis_ph_ = V.image_token_id;
+    vis_h_ = oh;
+    vis_w_ = ow;
+    return n_vis;
+}
+
+static int first_placeholder_span(const int32_t* ids, int n, int ph, int* start) {
+    *start = -1;
+    int count = 0;
+    for (int i = 0; i < n; ++i) {
+        if (ids[i] == ph) {
+            if (*start < 0) *start = i;
+            ++count;
+        } else if (*start >= 0) {
+            break;
+        }
+    }
+    return count;
+}
+
 void Session::prefill(const int32_t* ids, int n) {
     const ModelDesc& m = store_->model();
     if (n <= 0 || n > ctx_) throw std::runtime_error("prefill length");
+    int vis_off = -1;
+    if (vis_n_ > 0) {
+        const int ph = vis_ph_ >= 0 ? vis_ph_ : m.vision.image_token_id;
+        const int got = first_placeholder_span(ids, n, ph, &vis_off);
+        if (got != vis_n_ || vis_off < 0) {
+            throw std::runtime_error("vision token count mismatch (prompt has " + std::to_string(got) +
+                                     " image pads, encoder produced " + std::to_string(vis_n_) + ")");
+        }
+    }
     if (gpu_) {
+        if (vis_n_ > 0)
+            gpu_->set_vision_override(vis_embeds_.data(), vis_n_, vis_off);
+        else
+            gpu_->set_vision_override(nullptr, 0, -1);
         gpu_->prefill(ids, n);
         gpu_->copy_logits(logits_.data());
         ctx_tokens_.assign(ids, ids + n);
@@ -387,6 +458,10 @@ void Session::prefill(const int32_t* ids, int n) {
         const int id = ids[t];
         if (id < 0 || id >= m.vocab) throw std::runtime_error("token oob");
         embed_row(emb, id, x.data() + t * H, H);
+    }
+    if (vis_n_ > 0 && vis_off >= 0) {
+        std::memcpy(x.data() + static_cast<size_t>(vis_off) * H, vis_embeds_.data(),
+                    sizeof(float) * static_cast<size_t>(vis_n_) * H);
     }
     hidden_.assign(static_cast<size_t>(n) * H, 0.f);
     forward_hidden(x.data(), hidden_.data(), true, n, 0);

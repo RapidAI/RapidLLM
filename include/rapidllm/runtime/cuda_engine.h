@@ -16,6 +16,8 @@ public:
     virtual ~Engine() = default;
 
     virtual void prefill(const int32_t* ids, int n) = 0;
+    // Optional visual token override: n rows of hidden, spliced at offset after embed.
+    virtual void set_vision_override(const float* /*host*/, int /*n*/, int /*offset*/) {}
     virtual void decode_token(int32_t token) = 0;
     // n graph replays; embed comes from the previous argmax (d_tok_). One host sync at the end.
     // After return, greedy() is the last produced token; copy_gen_tokens() has the n tokens.

@@ -41,10 +41,11 @@ RapidLLM 把官方 HuggingFace **block-FP8** 目录和社区 **GGUF** 文件加�
 | 状态 | 体积 | 是否随序列增长 |
 | --- | --- | --- |
 | Gated Attention KV（16 层，FP16） | 64 KiB / token | 是 |
+| Gated Attention KV（`--kv-type q8k_tq3v`） | 约 22 KiB / token | 是（K=q8，V=TurboQuant-3） |
 | DeltaNet 循环态 `S`（48 层，FP32） | 约 144 MiB | 否 |
 | conv1d 滑窗 | 约 7.5 MiB | 否 |
 
-32K 上下文下，KV 约 2 GiB FP16（INT8 为 1 GiB）。48 层线性注意力不长 KV。
+32K 上下文下，KV 约 2 GiB FP16。`--ctx>163840`（或 `--kv-type q8k_tq3v` / `RAPIDLLM_KV_TQ=1`）把 K 压成 q8、V 压成 WHT+3bit，48 GB 才能分配 **262144**。落在 F16 窗口（8k）内的前缀仍走原来的 F16 attn，T=1 FP8 GEMV 不动。`RAPIDLLM_KV_TQ=0` 强制全量 F16（262k 会 OOM）。48 层线性注意力不长 KV。
 
 ## 功能
 
@@ -53,6 +54,7 @@ RapidLLM 把官方 HuggingFace **block-FP8** 目录和社区 **GGUF** 文件加�
 - 默认 CPU decode：**AVX2** 必选，运行时派遣 **AVX-512**
 - 可选 **CUDA**（`-DRAPIDLLM_WITH_CUDA=ON`）；无设备时可编译，host-ref 可测
 - 双缓存：注意力 KV + DeltaNet 循环态 + 因果 conv 状态
+- 可选 TurboQuant 风格 KV（`--kv-type q8k_tq3v`）：K 用 q8、V 用 3-bit WHT，大约是 FP16 的 1/3
 - MemoryPlanner：超预算时缩短 ctx 或拒载，避免被操作系统杀掉
 - 融合 decode（`--fuse=on|off`），便于与未融合算子对拍
 - **投机解码**：`off` / `ngram` / `mtp` / `auto` / `draft`
@@ -60,7 +62,7 @@ RapidLLM 把官方 HuggingFace **block-FP8** 目录和社区 **GGUF** 文件加�
 - **连续批**：`--batch N`（同一 prompt 多副本，每步共享一次权重扫描；CUDA 用 `RAPIDLLM_MAX_BATCH`）
 - 外挂草稿模型：[`Qwen/Qwen3.5-0.8B`](https://huggingface.co/Qwen/Qwen3.5-0.8B)
 - HTTP 服务：OpenAI `/v1/chat/completions`、`/v1/responses`，以及 Anthropic `/v1/messages`
-- Qwen3.6 ViT 编码器（`vision_encode`）；`--vision` / `--image` 会保留 `visual.*` 权重
+- Qwen3.5 / 3.6 / 3.8 ViT + CLI 图文联合生成（`--image PATH`）
 - 默认开启 thinking；`bench` 与 `serve` 强制 `enable_thinking=false`
 - 带版本号的 **C API**（`include/rapidllm/api.h`）+ CLI
 
@@ -122,6 +124,7 @@ rapidllm -m /path/to/Qwen3.6-27B-FP8 --draft /path/to/Qwen3.5-0.8B --spec draft 
 rapidllm bench -m model.gguf
 rapidllm bench -m model.gguf --device cuda --batch 4
 rapidllm bench -m /path/to/Qwen3.6-27B-FP8 --device cuda --ctx 131072 --prompt-n 8192 --max-new 8 --spec off
+rapidllm -m /path/to/Qwen3.8-27B-FP8 --image photo.png --prompt "图里有什么？" --max-new 64 --device cuda
 rapidllm bench --micro
 rapidllm serve -m /path/to/Qwen3.6-27B-FP8 --host 127.0.0.1 --port 8080 --device cuda
 ```
@@ -133,18 +136,124 @@ rapidllm serve -m /path/to/Qwen3.6-27B-FP8 --host 127.0.0.1 --port 8080 --device
 | `--max-new` | `8` | 生成 token 数 |
 | `--fuse` | `on` | 融合 DeltaNet / Attn / MLP decode |
 | `--spec` | `auto` | `draft` 需要 `--draft` |
+| `--kv-type` | `f16`；`--ctx>163840` 自动 `q8k_tq3v` | `q8k_tq3v` = K q8 + V TurboQuant-3。环境变量 `RAPIDLLM_KV_TQ=0\|1` |
 | `--draft` | — | 草稿权重；隐含 `--spec draft`。推荐 [`Qwen3.5-0.8B`](https://huggingface.co/Qwen/Qwen3.5-0.8B) |
 | `--batch` | `1` | 同一 prompt 的副本数；会设置 `RAPIDLLM_MAX_BATCH` |
 | `--prompt-n` | — | 直接合成 `N` 个不重复 token id（不走分词）。长上下文 bench 用 |
-| `--vision` / `--image` | 关 | 加载 `visual.*`（编码器在 CPU；generate 尚未吃进图像） |
+| `--vision` / `--image` | 关 | 加载 `visual.*`。`--image PATH` 会跑 ViT 并把视觉 token 拼进 generate |
 | `--thinking` | 开 | `bench` 与 `serve` 始终关闭 |
 
 权重来源：
 
 - 最新目标：[`Qwen/Qwen3.8-27B-FP8`](https://huggingface.co/Qwen/Qwen3.8-27B-FP8) — 与 3.6-27B 同一套 `qwen3_5` hybrid IR
 - 上一版目标：[`Qwen/Qwen3.6-27B-FP8`](https://huggingface.co/Qwen/Qwen3.6-27B-FP8)
-- 社区 GGUF：[`unsloth/Qwen3.8-27B-GGUF`](https://huggingface.co/unsloth/Qwen3.8-27B-GGUF) Q8_0 / Q6_K（亦可 [`unsloth/Qwen3.6-27B-GGUF`](https://huggingface.co/unsloth/Qwen3.6-27B-GGUF) Q4_K_M）
+- 社区 GGUF：[`unsloth/Qwen3.8-27B-GGUF`](https://huggingface.co/unsloth/Qwen3.8-27B-GGUF) Q4_K_M / Q5_K_M / Q6_K / Q8_0（亦可 [`unsloth/Qwen3.6-27B-GGUF`](https://huggingface.co/unsloth/Qwen3.6-27B-GGUF)）
 - 推荐草稿（3.5 / 3.6 / **3.8 通用**）：[`Qwen/Qwen3.5-0.8B`](https://huggingface.co/Qwen/Qwen3.5-0.8B) — 同族，词表 **248320**，24 层 hybrid（18 DeltaNet + 6 Gated Attn），hidden 1024
+
+## Qwen3.8-27B 量化 bakeoff（RTX 6000 Ada 48 GB）
+
+与 3.6 同一套官方 pair：prompt `1,2,3`，16 个新 token，`--spec off --fuse=on --device cuda --ctx 256`，thinking 关。墙钟 tok/s 是 warmup generate 之后。Q4_K / Q5_K / Q6_K 保持 packed，走原生 CUDA GEMV（`RAPIDLLM_REQUANT_KQUANT=1` 才 requant 成 FP8）。Q8_0 保持 packed，走原生 Q8 GEMV。
+
+| 权重 | 体积 | 墙钟 tok/s | Decode tok/s | Prefill 秒 | 备注 |
+| --- | ---: | ---: | ---: | ---: | --- |
+| 官方 FP8 | 30.9 GB | **31.67** | **32.05** | 0.037 | 对齐 3.6-27B keep（31.66 / 32.03） |
+| Unsloth Q4_K_M | 17.1 GB | **31.09** | 31.46 | 0.038 | CUDA requant → FP8 |
+| Unsloth Q5_K_M | 19.8 GB | **31.08** | 31.44 | 0.038 | CUDA requant → FP8 |
+| Unsloth Q6_K | 22.9 GB | **30.26** | 30.84 | 0.042 | CUDA requant → FP8 |
+| Unsloth Q8_0 | 29.0 GB | **26.26** | 27.43 | 0.062 | 原生 Q8 GEMV（不走 FP8 tensor core） |
+
+```bash
+rapidllm bench -m /path/to/Qwen3.8-27B-Q4_K_M.gguf \
+  --device cuda --ctx 256 --max-new 16 --spec off --fuse=on --no-thinking --prompt 1,2,3
+```
+
+社区 Q8_0 有时会量化 DeltaNet 的 `in_proj_a` / `in_proj_b`；loader 会把这些 leftover 反量化成 F32。`A_log` / conv / norm 若被量化仍会拒载。
+
+## Qwen3.6 / 3.8-27B 对比 vLLM（RTX 6000 Ada 48 GB）
+
+同机官方 pair：prompt `1,2,3`，16 个新 token，thinking 关，prefix-cache 关。RapidLLM 为 `--spec off --fuse=on --device cuda --ctx 256`。墙钟 tok/s 是加载 + warmup generate 之后。
+
+vLLM 为 **0.21.1rc1.dev260+g10d264a2b**，graphs on（`enforce_eager=False`，FULL + PIECEWISE）。vLLM **不能加载 hybrid GGUF**（`qwen35` 尚未支持）。GGUF 行因此是 RapidLLM GGUF 对 **同族官方 FP8** 的 vLLM。本机没有 Qwen3.6 的 Q4_K / Q5_K。
+
+Q4_K / Q5_K / Q6_K 保持 packed，走原生 CUDA GEMV。Q8_0 走原生 Q8 GEMV。`RAPIDLLM_REQUANT_KQUANT=1` 可恢复旧的 requant-to-FP8 加载路径。
+
+| 模型 | 权重 | RapidLLM 墙钟 | RapidLLM decode | vLLM 墙钟 | 相对 vLLM |
+| --- | --- | ---: | ---: | ---: | ---: |
+| Qwen3.6-27B | 官方 FP8 | **31.67** | 32.04 | **19.36** | **1.635×** |
+| Qwen3.6-27B | Q6_K GGUF | **29.69** | 30.24 | 19.36（FP8） | **1.533×** |
+| Qwen3.6-27B | Q8_0 GGUF | **26.23** | 27.40 | 19.36（FP8） | **1.355×** |
+| Qwen3.8-27B | 官方 FP8 | **31.65** | 32.02 | **19.34** | **1.636×** |
+| Qwen3.8-27B | Q4_K_M GGUF | **31.08** | 31.46 | 19.34（FP8） | **1.607×** |
+| Qwen3.8-27B | Q5_K_M GGUF | **31.08** | 31.45 | 19.34（FP8） | **1.607×** |
+| Qwen3.8-27B | Q6_K GGUF | **30.27** | 30.84 | 19.34（FP8） | **1.565×** |
+| Qwen3.8-27B | Q8_0 GGUF | **26.22** | 27.39 | 19.34（FP8） | **1.356×** |
+
+```bash
+rapidllm bench -m /path/to/Qwen3.8-27B-FP8 \
+  --device cuda --ctx 256 --max-new 16 --spec off --fuse=on --no-thinking --prompt 1,2,3
+```
+
+未跑：Qwen3.6 Q4_K / Q5_K（本机没有权重）。vLLM 加载 Qwen3.8-27B-Q4_K_M 失败：`GGUF model with architecture qwen35 is not supported yet.`
+
+## Qwen3.8-27B 单请求最大窗口与并发 TPS（RTX 6000 Ada 48 GB）
+
+官方 FP8，`--device cuda --fuse=on --spec off --no-thinking`。墙钟 tok/s 是 warmup generate 之后。RapidLLM CUDA KV 是 FP32（约 **128 KiB / token**）。显卡 49140 MiB。
+
+### 单请求最大窗口
+
+分配 `--ctx`，再用 prompt `1,2,3`（3 token）生成 8 个新 token。测的是**能装下的最大窗口**，不是把窗口填满。
+
+| `--ctx` | 结果 | 峰值 MiB | Decode tok/s | 墙钟 tok/s |
+| ---: | --- | ---: | ---: | ---: |
+| 131072 | 通过 | 44292 | 32.07 | 29.11 |
+| 147456 | 通过 | 46340 | 32.03 | 28.85 |
+| **163840** | **能跑的最大** | **48388** | 31.97 | 28.56 |
+| 167936 | session 时 CUDA OOM | — | — | — |
+| 172032 | session 时 CUDA OOM | — | — | — |
+| 200000 | 未试（已在 OOM 之上） | — | — | — |
+
+`--ctx 163840` + `--prompt-n 256` + 8 新：prefill **2.69 s**，decode **27.83** tok/s，墙钟 **2.72** tok/s（prefill 占主导）。峰值仍是 48388 MiB。
+
+`--ctx 256` 约 27.8 GiB；每多 16384 token 的 KV 约 2.00 GiB。167936 比 163840 再多约 0.5 GiB，装不下。
+
+`serve` 是单连接；并发路径是 `--batch N`（同一 prompt，每步共享一次权重扫描）。`ctx<=4096` 时 `RAPIDLLM_MAX_BATCH` 上限 32（`pf_cap`）。
+
+### 并发 batch TPS
+
+官方 pair：`--ctx 256 --max-new 16 --prompt 1,2,3`。`tok/s` 是**合计**（所有序列）。每条序列的 decode = decode tok/s / batch。
+
+| `--batch` | 墙钟 tok/s | Decode tok/s | 每条 decode | 峰值 MiB |
+| ---: | ---: | ---: | ---: | ---: |
+| 1 | 31.63 | 32.01 | 32.01 | 27832 |
+| 2 | 50.00 | 53.12 | 26.56 | 28024 |
+| 4 | 87.90 | 92.77 | 23.19 | 28404 |
+| 8 | 92.11 | 94.77 | 11.85 | 29168 |
+| 16 | 94.13 | 95.57 | 5.97 | 30704 |
+| **24** | **94.49** | 95.48 | 3.98 | 32240 |
+| 32 | 94.42 | 95.38 | 2.98 | 33776 |
+
+合计峰值约 **94.5 tok/s**（batch 24–32）。batch 8 之后权重扫描已经饱和，再加序列几乎不再涨。
+
+```bash
+# 48 GB 上能分配的最大窗口
+rapidllm bench -m /path/to/Qwen3.8-27B-FP8 \
+  --device cuda --ctx 163840 --max-new 8 --spec off --fuse=on --no-thinking --prompt 1,2,3
+
+# 并发合计 TPS
+rapidllm bench -m /path/to/Qwen3.8-27B-FP8 \
+  --device cuda --ctx 256 --batch 24 --max-new 16 --spec off --fuse=on --no-thinking --prompt 1,2,3
+```
+
+## 图文联合生成
+
+`--image PATH` 读 PNG / JPEG / PPM / BMP，跑自研 ViT（CPU），并在 prompt 前插入 `vision_start + image_pad × N + vision_end`。generate 会把这些 `image_pad` 的 embedding 换成编码器输出（CPU 与 CUDA）。需要 HF 权重里仍有 `visual.*`（加 `--image` 才不会跳过）。草稿投机会关掉：草稿模型看不到图。
+
+```bash
+rapidllm -m /path/to/Qwen3.8-27B-FP8 --image photo.png \
+  --prompt "图里有什么？" --max-new 64 --device cuda --spec off
+```
+
+视频还不支持。
 
 ## 长上下文极限数字（RTX 6000 Ada 48 GB）
 
@@ -158,13 +267,14 @@ rapidllm serve -m /path/to/Qwen3.6-27B-FP8 --host 127.0.0.1 --port 8080 --device
 
 | 窗口 `--ctx` | 已填 token | Prefill 秒 | Prefill tok/s | Decode tok/s | 墙钟 tok/s（8–16 新） | 备注 |
 | --- | ---: | ---: | ---: | ---: | ---: | --- |
-| 256（短 bakeoff） | 3 | 0.037 | — | **32.02** | **31.65** | keep；对 vLLM 19.58 = **1.62×** |
+| 256（短 bakeoff） | 3 | 0.038 | — | **32.03** | **31.61** | keep；对 vLLM 19.36 = **1.63×** |
 | 4096 | 64 | 0.60 | 107 | 31.84 | 9.74 | 仍走短 ctx attn 核 |
-| 16384 | 2048 | 23.68 | 86.5 | 15.64 | 0.33 | online softmax（`ctx>8192`） |
-| 131072 | 256 | 2.61 | 98 | **27.97** | 2.80 | 128k 窗口已分配 |
-| 131072 | 8192 | 121.17 | 67.6 | **6.31** | 0.065 | decode 已被 attn 拖住 |
+| 16384 | 2048 | 23.68 | 86.5 | 15.64 | 0.33 | 旧 T=4 GEMM（已被下面取代） |
+| 131072 | 256 | **0.43** | **595** | **28.51** | **11.93** | cuBLAS prefill + 切分 GDN + warp attn；vLLM 17.54 |
+| 131072 | 2048 | **3.25** | **630** | 15.86 | **2.17** | 两段 1024 token；vLLM 7.90 |
+| 131072 | 8192 | 121.17 | 67.6 | **6.31** | 0.065 | cuBLAS prefill 后尚未重跑 |
 | 131072 | 131056 | — | — | — | — | 整窗填满未跑完（attn O(N²)，约数小时） |
-| 200000 | 256 | — | — | — | — | **CUDA OOM**（约 26 GiB FP32 KV + 28 GiB 权重 > 48 GiB） |
+| 200000 | 256 | — | — | — | — | **CUDA OOM**。3.8-FP8 实测最大可分配 **163840** |
 
 vLLM 在这张卡上报告 200k 需要 **12.39 GiB** KV，`gpu_memory_utilization=0.90` 只剩 **12.05 GiB**（估计上限 **194432**）。
 
@@ -179,15 +289,13 @@ vLLM 在这张卡上报告 200k 需要 **12.39 GiB** KV，`gpu_memory_utilizatio
 | 131072 | 8192 | 3.274 | **2.44** | in 2504 / out 2.45 |
 | 200000 | — | — | — | 加载失败：KV 12.39 GiB > 12.05 GiB |
 
-短官方 pair（prompt `1,2,3`，16 新）：vLLM **19.5801** tok/s。
+短官方 pair（prompt `1,2,3`，16 新）：vLLM **19.36** tok/s（3.6-27B FP8，graphs on）。见上面的 vs-vLLM 表。
 
 ### GGUF Q6_K / Q8_0 的 CUDA
 
-权重：`bartowski/Qwen_Qwen3.6-27B-GGUF` → `Qwen_Qwen3.6-27B-Q6_K.gguf`（23 GiB）、`Qwen_Qwen3.6-27B-Q8_0.gguf`（28 GiB）。
+Qwen3.6 的 Q6_K / Q8_0 以及 Qwen3.8 的 Q4_K / Q5_K / Q6_K / Q8_0 在这张 48 GB 卡上都能以 `--ctx 256` 加载并 decode（见上面的 vs-vLLM 表）。Embed 会反量化成 FP32（约 5 GiB）。Q4–Q6 加载时 requant 成 FP8 GEMV 路径；Q8 保持 packed。
 
-在这张 48 GB 卡上，CUDA session **连 `--ctx 256` 也 OOM**。Q8 保持 packed（约 28 GiB），但 embed 会反量化成 FP32（约 5 GiB），再加上 GDN S / conv / 工作区，显存不够。Q6_K 加载时 requant 成 FP8 GEMV 路径（设备侧同样约 28 GiB），一样顶满。
-
-所以 48 GB 上 **没有** Q6/Q8 的 CUDA 极限数字。CPU GGUF 仍可加载，但那不是 GPU 峰值。
+48 GB 上长上下文的 GGUF 仍然紧：Q8 packed 权重（约 28–29 GiB）+ FP32 embed + FP32 KV，短窗口以外余量很小。128k 分配 bench 请用官方 FP8（或 Q4/Q5）。
 
 ### 怎么复现
 
@@ -342,7 +450,6 @@ docs/               架构设计（中英）
 ## v1 明确不做
 
 - `serve` 不做 SSE / token 流式（一次 JSON 请求对应一次 JSON 响应）
-- CLI 不做图文联合生成（编码器已实现，尚未把图像 token 插入 generate）
 - 不做视频编码器
 - 不做 MoE 专家路径
 - 不做 ARM / Apple Silicon

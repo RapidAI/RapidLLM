@@ -89,6 +89,66 @@ int vision_grid(int img_h, int img_w, int patch, int merge, int* gh, int* gw) {
     return (*gh) * (*gw);
 }
 
+int vision_smart_resize(int h, int w, int factor, int min_pixels, int max_pixels, int* oh, int* ow) {
+    if (h <= 0 || w <= 0 || factor <= 0) return -1;
+    auto rnd = [&](int x) {
+        const int q = (x + factor / 2) / factor * factor;
+        return std::max(factor, q);
+    };
+    int hb = rnd(h);
+    int wb = rnd(w);
+    const double area = static_cast<double>(hb) * wb;
+    if (max_pixels > 0 && area > static_cast<double>(max_pixels)) {
+        const double beta = std::sqrt(area / static_cast<double>(max_pixels));
+        hb = std::max(factor, static_cast<int>(std::floor(h / beta / factor)) * factor);
+        wb = std::max(factor, static_cast<int>(std::floor(w / beta / factor)) * factor);
+    } else if (min_pixels > 0 && area < static_cast<double>(min_pixels)) {
+        const double beta = std::sqrt(static_cast<double>(min_pixels) / area);
+        hb = static_cast<int>(std::ceil(h * beta / factor)) * factor;
+        wb = static_cast<int>(std::ceil(w * beta / factor)) * factor;
+        if (hb < factor) hb = factor;
+        if (wb < factor) wb = factor;
+    }
+    while (min_pixels > 0 && static_cast<long long>(hb) * wb < min_pixels) {
+        if (hb <= wb) hb += factor;
+        else wb += factor;
+    }
+    *oh = hb;
+    *ow = wb;
+    return 0;
+}
+
+void vision_resize_bilinear(const float* src, int sh, int sw, float* dst, int dh, int dw) {
+    if (sh == dh && sw == dw) {
+        std::memcpy(dst, src, sizeof(float) * static_cast<size_t>(dh) * dw * 3);
+        return;
+    }
+    const float yscale = sh > 1 && dh > 1 ? static_cast<float>(sh - 1) / static_cast<float>(dh - 1) : 0.f;
+    const float xscale = sw > 1 && dw > 1 ? static_cast<float>(sw - 1) / static_cast<float>(dw - 1) : 0.f;
+    for (int y = 0; y < dh; ++y) {
+        const float fy = y * yscale;
+        int y0 = static_cast<int>(fy);
+        int y1 = std::min(y0 + 1, sh - 1);
+        const float wy = fy - static_cast<float>(y0);
+        for (int x = 0; x < dw; ++x) {
+            const float fx = x * xscale;
+            int x0 = static_cast<int>(fx);
+            int x1 = std::min(x0 + 1, sw - 1);
+            const float wx = fx - static_cast<float>(x0);
+            float* o = dst + (static_cast<size_t>(y) * dw + x) * 3;
+            for (int c = 0; c < 3; ++c) {
+                const float v00 = src[(static_cast<size_t>(y0) * sw + x0) * 3 + c];
+                const float v01 = src[(static_cast<size_t>(y0) * sw + x1) * 3 + c];
+                const float v10 = src[(static_cast<size_t>(y1) * sw + x0) * 3 + c];
+                const float v11 = src[(static_cast<size_t>(y1) * sw + x1) * 3 + c];
+                const float a = v00 * (1.f - wx) + v01 * wx;
+                const float b = v10 * (1.f - wx) + v11 * wx;
+                o[c] = a * (1.f - wy) + b * wy;
+            }
+        }
+    }
+}
+
 void vision_encode(const float* rgb, int img_h, int img_w, const VisionDesc& V,
                    const TensorTable& weights, float* out) {
     int gh = 0, gw = 0;
@@ -101,6 +161,11 @@ void vision_encode(const float* rgb, int img_h, int img_w, const VisionDesc& V,
     const int P = V.patch;
     const int Tp = V.temporal_patch;
     const int D = V.hidden;
+
+    // Official Qwen2VL processor: image_mean = image_std = 0.5
+    std::vector<float> pix(static_cast<size_t>(img_h) * img_w * 3);
+    for (size_t i = 0; i < pix.size(); ++i) pix[i] = (rgb[i] - 0.5f) / 0.5f;
+    rgb = pix.data();
 
     std::vector<float> proj, proj_b, pos, x(static_cast<size_t>(n_tok) * D), xn(x.size());
     dequant_row(must_w(weights, "visual.patch_embed"), proj);

@@ -45,6 +45,20 @@ std::string Tokenizer::decode(const int32_t* ids, int n) const {
     return o;
 }
 
+int pack_vl_prompt(int n_vis, const int32_t* text, int n_text, int32_t* out, int cap, int vision_start,
+                   int image_id, int vision_end) {
+    if (n_vis < 0 || n_text < 0 || !out) return -1;
+    if (n_text > 0 && !text) return -1;
+    const int need = 2 + n_vis + n_text;
+    if (need > cap) return -1;
+    int i = 0;
+    out[i++] = vision_start;
+    for (int k = 0; k < n_vis; ++k) out[i++] = image_id;
+    out[i++] = vision_end;
+    for (int k = 0; k < n_text; ++k) out[i++] = text[k];
+    return i;
+}
+
 std::string apply_chat_template(std::string_view user, bool enable_thinking) {
     std::string s = "<|im_start|>user\n";
     s.append(user);

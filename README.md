@@ -41,10 +41,11 @@ Short decode is still a weight-bandwidth problem (22–30 GB of linears). Long c
 | State | Size | Grows with sequence? |
 | --- | --- | --- |
 | Gated Attention KV (16 layers, FP16) | 64 KiB / token | yes |
+| Gated Attention KV (`--kv-type q8k_tq3v`) | ~22 KiB / token | yes (q8 K + TurboQuant-3 V) |
 | DeltaNet recurrent `S` (48 layers, FP32) | ~144 MiB | no |
 | conv1d window | ~7.5 MiB | no |
 
-At 32K context, KV is about 2 GiB FP16 (1 GiB INT8). The 48 linear-attention layers do not grow a KV cache.
+At 32K context, KV is about 2 GiB FP16. `--ctx>163840` (or `--kv-type q8k_tq3v` / `RAPIDLLM_KV_TQ=1`) keeps K as q8 and compresses V with a Walsh–Hadamard + 3-bit Lloyd-Max codebook so a 48 GB card can allocate **262144**. Compute for prefixes that fit the F16 window (8k) stays on the existing F16 attn path; T=1 FP8 GEMV is unchanged. `RAPIDLLM_KV_TQ=0` forces a full F16 cache (will OOM at 262k on 48 GB). The 48 linear-attention layers do not grow a KV cache.
 
 ## Features
 
@@ -53,6 +54,7 @@ At 32K context, KV is about 2 GiB FP16 (1 GiB INT8). The 48 linear-attention lay
 - CPU decode by default: **AVX2** required, **AVX-512** dispatched at runtime
 - Optional **CUDA** (`-DRAPIDLLM_WITH_CUDA=ON`) with host-ref kernels when no device is present
 - Dual cache: attention KV + DeltaNet recurrent + causal conv state
+- Optional TurboQuant-style KV (`--kv-type q8k_tq3v`): q8 keys + 3-bit WHT values, ~3× smaller than FP16
 - Memory planner: refuse or shrink context instead of letting the OS OOM-kill the process
 - Fused decode path (`--fuse=on|off`) for A/B against unfused ops
 - **Speculative decode**: `off` / `ngram` / `mtp` / `auto` / `draft`
@@ -60,7 +62,7 @@ At 32K context, KV is about 2 GiB FP16 (1 GiB INT8). The 48 linear-attention lay
 - **Continuous batch**: `--batch N` (same prompt, one shared weight pass per step; CUDA via `RAPIDLLM_MAX_BATCH`)
 - External draft model: [`Qwen/Qwen3.5-0.8B`](https://huggingface.co/Qwen/Qwen3.5-0.8B)
 - HTTP serve: OpenAI `/v1/chat/completions` + `/v1/responses`, Anthropic `/v1/messages`
-- Qwen3.6 ViT encoder (`vision_encode`); `--vision` / `--image` keep `visual.*` weights
+- Qwen3.5 / 3.6 / 3.8 ViT + CLI image+text generate (`--image PATH`)
 - Thinking on by default; `bench` and `serve` force `enable_thinking=false`
 - Versioned **C API** (`include/rapidllm/api.h`) + CLI
 
@@ -124,6 +126,7 @@ rapidllm bench -m model.gguf --device cuda --batch 4
 rapidllm bench -m /path/to/Qwen3.6-27B-FP8 --device cuda --ctx 131072 --prompt-n 8192 --max-new 8 --spec off
 rapidllm bench --micro
 rapidllm serve -m /path/to/Qwen3.6-27B-FP8 --host 127.0.0.1 --port 8080 --device cuda
+rapidllm -m /path/to/Qwen3.8-27B-FP8 --image photo.png --prompt "What is in this image?" --max-new 64 --device cuda
 ```
 
 | Flag | Default | Notes |
@@ -133,18 +136,124 @@ rapidllm serve -m /path/to/Qwen3.6-27B-FP8 --host 127.0.0.1 --port 8080 --device
 | `--max-new` | `8` | generated tokens |
 | `--fuse` | `on` | fused DeltaNet / Attn / MLP decode |
 | `--spec` | `auto` | `draft` needs `--draft` |
+| `--kv-type` | `f16`; auto `q8k_tq3v` if `--ctx>163840` | `q8k_tq3v` = K q8 + V TurboQuant-3. Env `RAPIDLLM_KV_TQ=0\|1` |
 | `--draft` | — | draft weights; implies `--spec draft`. Use [`Qwen3.5-0.8B`](https://huggingface.co/Qwen/Qwen3.5-0.8B) |
 | `--batch` | `1` | copies of the same prompt; sets `RAPIDLLM_MAX_BATCH` |
 | `--prompt-n` | — | synthesize `N` non-repeating token ids (skips the tokenizer). For long-ctx benches. |
-| `--vision` / `--image` | off | load `visual.*` (encoder is CPU; generate does not yet consume the image) |
+| `--vision` / `--image` | off | load `visual.*`. `--image PATH` runs the ViT and splices visual tokens into generate |
 | `--thinking` | on | `bench` and `serve` always turn it off |
 
 Weight sources:
 
 - Target (latest): [`Qwen/Qwen3.8-27B-FP8`](https://huggingface.co/Qwen/Qwen3.8-27B-FP8) — same `qwen3_5` hybrid IR as 3.6-27B
 - Target (previous): [`Qwen/Qwen3.6-27B-FP8`](https://huggingface.co/Qwen/Qwen3.6-27B-FP8)
-- Community GGUF: [`unsloth/Qwen3.8-27B-GGUF`](https://huggingface.co/unsloth/Qwen3.8-27B-GGUF) Q8_0 / Q6_K (also [`unsloth/Qwen3.6-27B-GGUF`](https://huggingface.co/unsloth/Qwen3.6-27B-GGUF) Q4_K_M)
+- Community GGUF: [`unsloth/Qwen3.8-27B-GGUF`](https://huggingface.co/unsloth/Qwen3.8-27B-GGUF) Q4_K_M / Q5_K_M / Q6_K / Q8_0 (also [`unsloth/Qwen3.6-27B-GGUF`](https://huggingface.co/unsloth/Qwen3.6-27B-GGUF))
 - Draft (recommended for 3.5 / 3.6 / **3.8**): [`Qwen/Qwen3.5-0.8B`](https://huggingface.co/Qwen/Qwen3.5-0.8B) — same family and vocab **248320**, 24-layer hybrid (18 DeltaNet + 6 Gated Attn), hidden 1024
+
+## Qwen3.8-27B quant bakeoff (RTX 6000 Ada 48 GB)
+
+Same official pair as 3.6: prompt `1,2,3`, 16 new, `--spec off --fuse=on --device cuda --ctx 256`, thinking off. Wall tok/s after warmup generate. Q4_K / Q5_K / Q6_K stay packed and use native CUDA GEMV (set `RAPIDLLM_REQUANT_KQUANT=1` to requant to FP8). Q8_0 stays packed and uses the native Q8 GEMV.
+
+| Weights | Size | Wall tok/s | Decode tok/s | Prefill s | Notes |
+| --- | ---: | ---: | ---: | ---: | --- |
+| Official FP8 | 30.9 GB | **31.67** | **32.05** | 0.037 | matches 3.6-27B keep (31.66 / 32.03) |
+| Unsloth Q4_K_M | 17.1 GB | **31.09** | 31.46 | 0.038 | CUDA requant → FP8 |
+| Unsloth Q5_K_M | 19.8 GB | **31.08** | 31.44 | 0.038 | CUDA requant → FP8 |
+| Unsloth Q6_K | 22.9 GB | **30.26** | 30.84 | 0.042 | CUDA requant → FP8 |
+| Unsloth Q8_0 | 29.0 GB | **26.26** | 27.43 | 0.062 | native Q8 GEMV (no tensor-core FP8) |
+
+```bash
+rapidllm bench -m /path/to/Qwen3.8-27B-Q4_K_M.gguf \
+  --device cuda --ctx 256 --max-new 16 --spec off --fuse=on --no-thinking --prompt 1,2,3
+```
+
+Q8_0 community files may quantize DeltaNet `in_proj_a` / `in_proj_b`; the loader dequants those leftovers to F32. `A_log` / conv / norms still reject if quantized.
+
+## Qwen3.6 / 3.8-27B vs vLLM (RTX 6000 Ada 48 GB)
+
+Same-box official pair: prompt `1,2,3`, 16 new tokens, thinking off, prefix-cache off. RapidLLM is `--spec off --fuse=on --device cuda --ctx 256`. Wall tok/s is after load + warmup generate.
+
+vLLM is **0.21.1rc1.dev260+g10d264a2b**, graphs on (`enforce_eager=False`, FULL + PIECEWISE). vLLM **cannot load hybrid GGUF** (`qwen35` is not supported). GGUF rows therefore compare RapidLLM GGUF to the **same family's official FP8** on vLLM. Qwen3.6 Q4_K / Q5_K were not on the box.
+
+Q4_K / Q5_K / Q6_K stay packed and use native CUDA GEMV. Q8_0 uses the native Q8 GEMV. `RAPIDLLM_REQUANT_KQUANT=1` restores the old requant-to-FP8 load path.
+
+| Model | Weights | RapidLLM wall | RapidLLM decode | vLLM wall | vs vLLM |
+| --- | --- | ---: | ---: | ---: | ---: |
+| Qwen3.6-27B | Official FP8 | **31.67** | 32.04 | **19.36** | **1.635×** |
+| Qwen3.6-27B | Q6_K GGUF | **29.69** | 30.24 | 19.36 (FP8) | **1.533×** |
+| Qwen3.6-27B | Q8_0 GGUF | **26.23** | 27.40 | 19.36 (FP8) | **1.355×** |
+| Qwen3.8-27B | Official FP8 | **31.65** | 32.02 | **19.34** | **1.636×** |
+| Qwen3.8-27B | Q4_K_M GGUF | **31.08** | 31.46 | 19.34 (FP8) | **1.607×** |
+| Qwen3.8-27B | Q5_K_M GGUF | **31.08** | 31.45 | 19.34 (FP8) | **1.607×** |
+| Qwen3.8-27B | Q6_K GGUF | **30.27** | 30.84 | 19.34 (FP8) | **1.565×** |
+| Qwen3.8-27B | Q8_0 GGUF | **26.22** | 27.39 | 19.34 (FP8) | **1.356×** |
+
+```bash
+rapidllm bench -m /path/to/Qwen3.8-27B-FP8 \
+  --device cuda --ctx 256 --max-new 16 --spec off --fuse=on --no-thinking --prompt 1,2,3
+```
+
+Did not run: Qwen3.6 Q4_K / Q5_K (weights not present). vLLM GGUF load of Qwen3.8-27B-Q4_K_M failed with `GGUF model with architecture qwen35 is not supported yet.`
+
+## Qwen3.8-27B max context and concurrent TPS (RTX 6000 Ada 48 GB)
+
+Official FP8, `--device cuda --fuse=on --spec off --no-thinking`. Wall tok/s after warmup generate. RapidLLM CUDA KV is FP32 (~**128 KiB / token**). GPU is 49140 MiB.
+
+### Single-request max window
+
+Allocate `--ctx`, then generate 8 new tokens from prompt `1,2,3` (3-token fill). This measures the largest window that fits, not a full-window prefill.
+
+| `--ctx` | Result | Peak MiB | Decode tok/s | Wall tok/s |
+| ---: | --- | ---: | ---: | ---: |
+| 131072 | ok | 44292 | 32.07 | 29.11 |
+| 147456 | ok | 46340 | 32.03 | 28.85 |
+| **163840** | **max that runs** | **48388** | 31.97 | 28.56 |
+| 167936 | CUDA OOM at session | — | — | — |
+| 172032 | CUDA OOM at session | — | — | — |
+| 200000 | not tried (above OOM) | — | — | — |
+
+`--ctx 163840` + `--prompt-n 256` + 8 new: prefill **2.69 s**, decode **27.83** tok/s, wall **2.72** tok/s (prefill dominates). Peak still 48388 MiB.
+
+`--ctx 256` is ~27.8 GiB; each extra 16384 tokens of KV is ~2.00 GiB. 167936 needs ~0.5 GiB more than 163840 and does not fit.
+
+`serve` is single-connection; this engine's concurrent path is `--batch N` (same prompt, one shared weight pass). `ctx<=4096` caps `RAPIDLLM_MAX_BATCH` at 32 (`pf_cap`).
+
+### Concurrent batch TPS
+
+Official pair: `--ctx 256 --max-new 16 --prompt 1,2,3`. `tok/s` is **aggregate** (all sequences). Per-seq decode = decode tok/s / batch.
+
+| `--batch` | Wall tok/s | Decode tok/s | Per-seq decode | Peak MiB |
+| ---: | ---: | ---: | ---: | ---: |
+| 1 | 31.63 | 32.01 | 32.01 | 27832 |
+| 2 | 50.00 | 53.12 | 26.56 | 28024 |
+| 4 | 87.90 | 92.77 | 23.19 | 28404 |
+| 8 | 92.11 | 94.77 | 11.85 | 29168 |
+| 16 | 94.13 | 95.57 | 5.97 | 30704 |
+| **24** | **94.49** | 95.48 | 3.98 | 32240 |
+| 32 | 94.42 | 95.38 | 2.98 | 33776 |
+
+Peak aggregate is **~94.5 tok/s** at batch 24–32. After batch 8 the weight scan is already saturated; more sequences only add a little.
+
+```bash
+# max window that allocates on 48 GB
+rapidllm bench -m /path/to/Qwen3.8-27B-FP8 \
+  --device cuda --ctx 163840 --max-new 8 --spec off --fuse=on --no-thinking --prompt 1,2,3
+
+# concurrent aggregate TPS
+rapidllm bench -m /path/to/Qwen3.8-27B-FP8 \
+  --device cuda --ctx 256 --batch 24 --max-new 16 --spec off --fuse=on --no-thinking --prompt 1,2,3
+```
+
+## Image + text
+
+`--image PATH` loads PNG / JPEG / PPM / BMP, runs the in-tree ViT (CPU), and splices `vision_start + image_pad × N + vision_end` in front of the prompt. Generate replaces those `image_pad` embeddings with the encoder output (CPU and CUDA). Needs an HF checkpoint that still has `visual.*` (pass `--image` so they are not skipped). Draft spec is turned off because the draft model does not see the picture.
+
+```bash
+rapidllm -m /path/to/Qwen3.8-27B-FP8 --image photo.png \
+  --prompt "What is in this image?" --max-new 64 --device cuda --spec off
+```
+
+Video is not supported.
 
 ## Long-context limit numbers (RTX 6000 Ada 48 GB)
 
@@ -158,13 +267,16 @@ All RapidLLM rows below are `--device cuda --fuse=on --spec off --no-thinking` (
 
 | Window `--ctx` | Filled tokens | Prefill s | Prefill tok/s | Decode tok/s | Wall tok/s (8–16 new) | Notes |
 | --- | ---: | ---: | ---: | ---: | ---: | --- |
-| 256 (short bakeoff) | 3 | 0.037 | — | **32.02** | **31.65** | keep; vs vLLM 19.58 = **1.62×** |
+| 256 (short bakeoff) | 3 | 0.038 | — | **32.03** | **31.61** | keep; vs vLLM 19.36 = **1.63×** |
 | 4096 | 64 | 0.60 | 107 | 31.84 | 9.74 | still the short-ctx attn kernel |
-| 16384 | 2048 | 23.68 | 86.5 | 15.64 | 0.33 | online softmax (`ctx>8192`) |
-| 131072 | 256 | 2.61 | 98 | **27.97** | 2.80 | 128k window allocated |
-| 131072 | 8192 | 121.17 | 67.6 | **6.31** | 0.065 | attn already dominates decode |
-| 131072 | 131056 | — | — | — | — | full fill not finished (O(N²) attn; ~hours) |
-| 200000 | 256 | — | — | — | — | **CUDA OOM** (~26 GiB FP32 KV + 28 GiB weights > 48 GiB) |
+| 16384 | 2048 | 23.68 | 86.5 | 15.64 | 0.33 | old T=4 GEMM (superseded below) |
+| 131072 | 256 | **0.073** | **3500** | **27.43** | **24.35** | cublasLt FP8 + F32 GQA-GEMM attn; vs vLLM 17.54 |
+| 131072 | 2048 | **0.70** | **2920** | 16.89 | **7.17** | two 1024-token tiles; vs vLLM 7.90 (still short) |
+| 131072 | 4096 | **1.49** | **2746** | 11.83 | **3.84** | 4×1024 tiles; no paired vLLM |
+| 131072 | 8192 | **3.21** | **2550** | 7.44 | **1.93** | vs vLLM 2.44 |
+| 131072 | 16384 | **7.22** | **2270** | 4.27 | **0.90** | 16×1024 tiles; tokens non-zero |
+| 131072 | 131056 | — | — | — | — | full fill not useful (O(N²) on 16 attn layers) |
+| 200000 | 256 | — | — | — | — | **CUDA OOM**. Measured max alloc for 3.8-FP8 is **163840** |
 
 vLLM on this card reported that 200k needs **12.39 GiB** KV vs **12.05 GiB** free at `gpu_memory_utilization=0.90` (estimated max len **194432**).
 
@@ -179,15 +291,13 @@ Same token-id pattern, 8 new tokens, wall `tok/s` includes prefill:
 | 131072 | 8192 | 3.274 | **2.44** | in 2504 / out 2.45 |
 | 200000 | — | — | — | load failed: KV 12.39 GiB > 12.05 GiB |
 
-Short official pair (prompt `1,2,3`, 16 new): vLLM **19.5801** tok/s.
+Short official pair (prompt `1,2,3`, 16 new): vLLM **19.36** tok/s (3.6-27B FP8, graphs on). See the vs-vLLM table above.
 
 ### GGUF Q6_K / Q8_0 on CUDA
 
-Files: `bartowski/Qwen_Qwen3.6-27B-GGUF` → `Qwen_Qwen3.6-27B-Q6_K.gguf` (23 GiB), `Qwen_Qwen3.6-27B-Q8_0.gguf` (28 GiB).
+Qwen3.6 Q6_K / Q8_0 and Qwen3.8 Q4_K / Q5_K / Q6_K / Q8_0 all load and decode at `--ctx 256` on this 48 GB card (see the vs-vLLM table above). Embeddings are dequantized to FP32 (~5 GiB). Q4–Q6 requant to the FP8 GEMV path; Q8 stays packed.
 
-CUDA session **OOM even at `--ctx 256`** on this 48 GB card. Q8 stays packed (~28 GiB) but embed is dequantized to FP32 (~5 GiB) and the engine also keeps GDN S / conv / workspace; the extra copies do not leave enough headroom. Q6_K is requantized to the FP8 GEMV path at load (same ~28 GiB device footprint) and hits the same wall.
-
-So there is **no CUDA limit number** for Q6/Q8 on 48 GB. CPU GGUF still loads; that is not the GPU peak.
+Long-ctx GGUF on 48 GB is still tight: Q8 packed weights (~28–29 GiB) + FP32 embed + FP32 KV leave little room past a short window. Use official FP8 (or Q4/Q5) for 128k allocation benches.
 
 ### How to reproduce
 
@@ -345,7 +455,6 @@ docs/               architecture (EN/ZH)
 ## Non-goals (v1)
 
 - No SSE / token streaming on `serve` (JSON request → JSON response)
-- No image-conditioned generate in the CLI (encoder exists; tokens are not inserted yet)
 - No video encoder
 - No MoE expert path
 - No ARM / Apple Silicon
