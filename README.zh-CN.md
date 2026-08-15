@@ -22,6 +22,7 @@
 | 投机解码 | `--spec off\|ngram\|mtp\|auto\|draft` |
 | MTP | 目标模型自带多 token 预测头（`mtp.fc` / `mtp.norm`）作草稿 |
 | 连续批 | `--batch N` / `rapidllm_generate_batch` — 每步共享一次权重扫描 |
+| 相对 vLLM（同机） | 短 decode **1.50–1.80×**；能跑 hybrid GGUF；163k–262k 能分配。见 [相对 vLLM 的结论](#相对-vllm-的结论) |
 
 设计文档：[docs/设计方案.md](docs/设计方案.md) · [docs/architecture.md](docs/architecture.md)
 
@@ -194,6 +195,27 @@ rapidllm bench -m /path/to/Qwen3.8-27B-FP8 \
 ```
 
 未跑：Qwen3.6 Q4_K / Q5_K（本机没有权重）。vLLM 加载 Qwen3.8-27B-Q4_K_M 失败：`GGUF model with architecture qwen35 is not supported yet.`
+
+## 相对 vLLM 的结论
+
+同机（RTX 6000 Ada 48 GB），同一套官方 pair（短 prompt、16 个新 token、graphs on）。数字见上表。
+
+**RapidLLM 领先的地方**
+
+1. **单请求 decode。** 官方 FP8 墙钟是 vLLM 的 **1.50–1.64×**（3.8：28.99 vs 19.34；3.6：31.67 vs 19.36）。原生 Q8_0 相对同一趟 vLLM FP8 是 **1.80×**（34.77）。Decode 是融合 C++/CUDA，热路径没有 Python。
+2. **hybrid GGUF。** vLLM 0.21.1rc1 加载不了 `qwen35` GGUF。RapidLLM 的 Q4_K / Q5_K / Q6_K / Q8_0 与官方 FP8 走同一套 IR，32 GB / 48 GB 机器可以继续用 packed 权重。
+3. **这套混合架构。** 引擎按 `layer_types[]` 调度：48 层 O(1) DeltaNet 状态 + 16 层 KV。vLLM 把它当通用 serving 图；RapidLLM 的双缓存和融合 GDN/RMS/MLP 是为 3:1 交错写的。
+4. **长窗口分配。** 不开 TurboQuant 能分配 **163840**；`--kv-type q8k_tq3v` 在 48 GB 上能分配 **262144**。同机 vLLM 加载 200k 失败（KV 12.39 GiB > `gpu_memory_utilization=0.90` 时剩余 12.05 GiB）。
+5. **大窗口、短填的 decode。** 分配 128k、填 256 token：RapidLLM decode **27.43** tok/s，vLLM 墙钟 **17.54**。
+6. **本地 / 可嵌入。** C API + CLI + 单进程 `serve`。没有 PyTorch 运行时。有 CPU AVX2/AVX-512 路径；vLLM 没有。
+
+**vLLM 仍然更强的地方（不要夸大）**
+
+- **长 prefill。** 128k 窗口填 2048–8192 时，vLLM 墙钟更高（7.90 vs 7.17；2.44 vs 1.93）。RapidLLM 16 层 gated attn 的 prefill 仍是 O(N²)。
+- **多用户 serving。** vLLM 分页、把不同 prompt 连续批在一起，并且是完整的 OpenAI HTTP 栈。RapidLLM 的 `--batch N` 是**同一 prompt** 共享权重；`serve` 是单连接，没有 SSE。
+- **生态。** 采样、工具、LoRA、多卡 TP/PP 是 vLLM 的地盘。RapidLLM 是面向这一族架构的单卡 / CPU 引擎。
+
+**选 RapidLLM**：本地跑 Qwen3.6 / 3.8-27B 的 decode（尤其是 GGUF、128k–262k 分配、或不想上 Python）。**选 vLLM**：共享端点、混合请求、长 prefill。
 
 ## Qwen3.8-27B 单请求最大窗口与并发 TPS（RTX 6000 Ada 48 GB）
 

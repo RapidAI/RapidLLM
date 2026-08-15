@@ -22,6 +22,7 @@ This is not a wrapper around llama.cpp, ggml, vLLM, or MLC.
 | Speculative decode | `--spec off\|ngram\|mtp\|auto\|draft` |
 | MTP | Target model's own multi-token prediction head (`mtp.fc` / `mtp.norm`) as draft |
 | Continuous batch | `--batch N` / `rapidllm_generate_batch` — one shared weight pass per step |
+| vs vLLM (same box) | Short-decode **1.50–1.80×**; hybrid GGUF; 163k–262k alloc. See [Conclusion vs vLLM](#conclusion-vs-vllm) |
 
 Design: [docs/architecture.md](docs/architecture.md) · [docs/设计方案.md](docs/设计方案.md)
 
@@ -194,6 +195,27 @@ rapidllm bench -m /path/to/Qwen3.8-27B-FP8 \
 ```
 
 Did not run: Qwen3.6 Q4_K / Q5_K (weights not present). vLLM GGUF load of Qwen3.8-27B-Q4_K_M failed with `GGUF model with architecture qwen35 is not supported yet.`
+
+## Conclusion vs vLLM
+
+Same box (RTX 6000 Ada 48 GB), same official pair (short prompt, 16 new, graphs on). Numbers above.
+
+**Where RapidLLM is ahead**
+
+1. **Single-request decode.** Official FP8 wall tok/s is **1.50–1.64×** vLLM (3.8: 28.99 vs 19.34; 3.6: 31.67 vs 19.36). Native Q8_0 is **1.80×** the same vLLM FP8 run (34.77). Decode is fused C++/CUDA with no Python in the hot path.
+2. **Hybrid GGUF.** vLLM 0.21.1rc1 cannot load `qwen35` GGUF. RapidLLM runs Q4_K / Q5_K / Q6_K / Q8_0 on the same IR as official FP8, so a 32 GB / 48 GB box can stay on packed weights.
+3. **This hybrid architecture.** The engine owns `layer_types[]`: 48 O(1) DeltaNet states + 16-layer KV. vLLM treats the model as a generic serving graph; RapidLLM's dual cache and fused GDN/RMS/MLP are written for this 3:1 mix.
+4. **Long-window allocation.** Without TurboQuant, RapidLLM allocates **163840**. With `--kv-type q8k_tq3v` it allocates **262144** on 48 GB. vLLM on this card failed a 200k load (KV 12.39 GiB > 12.05 GiB free at `gpu_memory_utilization=0.90`).
+5. **Short-fill decode at a large window.** 128k allocated, 256-token fill: RapidLLM decode **27.43** tok/s vs vLLM wall **17.54**.
+6. **Local / embeddable.** C API + CLI + one-process `serve`. No PyTorch runtime. CPU AVX2/AVX-512 path exists; vLLM does not.
+
+**Where vLLM is ahead (do not oversell)**
+
+- **Long prefill.** At 128k / 2048–8192 fill, vLLM wall tok/s is higher (7.90 vs 7.17; 2.44 vs 1.93). RapidLLM prefill attention on the 16 gated layers is still O(N²).
+- **Multi-user serving.** vLLM pages independent sequences, continuous-batches different prompts, and speaks a production OpenAI HTTP stack. RapidLLM `--batch N` is **same-prompt** weight sharing; `serve` is single-connection and not SSE.
+- **Ecosystem.** Sampling, tools, LoRA, and multi-GPU TP/PP are vLLM's job. RapidLLM is a single-GPU / CPU engine for this one architecture family.
+
+**Pick RapidLLM** for local Qwen3.6 / 3.8-27B decode (especially GGUF, 128k–262k allocation, or no Python). **Pick vLLM** for a shared endpoint with mixed prompts and long prefills.
 
 ## Qwen3.8-27B max context and concurrent TPS (RTX 6000 Ada 48 GB)
 
