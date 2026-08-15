@@ -559,6 +559,10 @@ __global__ void gemv_q8_soa_2row_k(const int8_t* Q, const __half* scales, const 
 constexpr int kQ4KBsz = 144;
 constexpr int kQ5KBsz = 176;
 constexpr int kQ6KBsz = 210;
+// GPU SoA: pre-expanded scales, 4/5/6-bit quants still packed (not FP8).
+constexpr int kQ4KSoaBsz = 160; // half dscale[8] + half dmin[8] + qs[128]
+constexpr int kQ5KSoaBsz = 192; // half dscale[8] + half dmin[8] + qh[32] + ql[128]
+constexpr int kQ6KSoaBsz = 224; // half dscale[16] + ql[128] + qh[64]
 
 __device__ __forceinline__ void q4k_scale_min_d(const uint8_t* sc, int j, int& s, int& mn) {
     if (j < 4) {
@@ -660,6 +664,88 @@ __device__ __forceinline__ float acc_q6k_row(const uint8_t* row, const float* xs
     return acc;
 }
 
+__device__ __forceinline__ float acc_q4k_soa_row(const uint8_t* row, const float* xs, int nb, int lane) {
+    float acc = 0.f;
+    for (int b = 0; b < nb; ++b) {
+        const uint8_t* blk = row + static_cast<size_t>(b) * kQ4KSoaBsz;
+        const __half* ds = reinterpret_cast<const __half*>(blk);
+        const __half* dm = reinterpret_cast<const __half*>(blk + 16);
+        const uint8_t* q = blk + 32;
+        const float* xb = xs + b * 256;
+        const uint32_t qpack = (static_cast<uint32_t>(__ldcs(q + lane))) |
+                               (static_cast<uint32_t>(__ldcs(q + 32 + lane)) << 8) |
+                               (static_cast<uint32_t>(__ldcs(q + 64 + lane)) << 16) |
+                               (static_cast<uint32_t>(__ldcs(q + 96 + lane)) << 24);
+#pragma unroll
+        for (int grp = 0; grp < 4; ++grp) {
+            const uint8_t qq = static_cast<uint8_t>(qpack >> (grp * 8));
+            acc = fmaf(__half2float(ds[grp * 2]) * static_cast<float>(qq & 15) - __half2float(dm[grp * 2]),
+                       xb[lane], acc);
+            acc = fmaf(__half2float(ds[grp * 2 + 1]) * static_cast<float>(qq >> 4) - __half2float(dm[grp * 2 + 1]),
+                       xb[32 + lane], acc);
+            xb += 64;
+        }
+    }
+    return acc;
+}
+
+__device__ __forceinline__ float acc_q5k_soa_row(const uint8_t* row, const float* xs, int nb, int lane) {
+    float acc = 0.f;
+    for (int b = 0; b < nb; ++b) {
+        const uint8_t* blk = row + static_cast<size_t>(b) * kQ5KSoaBsz;
+        const __half* ds = reinterpret_cast<const __half*>(blk);
+        const __half* dm = reinterpret_cast<const __half*>(blk + 16);
+        const uint8_t* qh = blk + 32;
+        const uint8_t* ql = blk + 64;
+        const float* xb = xs + b * 256;
+        uint8_t u1 = 1, u2 = 2;
+#pragma unroll
+        for (int grp = 0; grp < 4; ++grp) {
+            const int qlo = ql[lane];
+            const int qhi = qh[lane];
+            const int v0 = (qlo & 15) + ((qhi & u1) ? 16 : 0);
+            const int v1 = (qlo >> 4) + ((qhi & u2) ? 16 : 0);
+            acc = fmaf(__half2float(ds[grp * 2]) * static_cast<float>(v0) - __half2float(dm[grp * 2]), xb[lane],
+                       acc);
+            acc = fmaf(__half2float(ds[grp * 2 + 1]) * static_cast<float>(v1) - __half2float(dm[grp * 2 + 1]),
+                       xb[32 + lane], acc);
+            ql += 32;
+            xb += 64;
+            u1 = static_cast<uint8_t>(u1 << 2);
+            u2 = static_cast<uint8_t>(u2 << 2);
+        }
+    }
+    return acc;
+}
+
+__device__ __forceinline__ float acc_q6k_soa_row(const uint8_t* row, const float* xs, int nb, int lane) {
+    float acc = 0.f;
+    const int is = lane / 16;
+    for (int b = 0; b < nb; ++b) {
+        const uint8_t* blk = row + static_cast<size_t>(b) * kQ6KSoaBsz;
+        const __half* ds = reinterpret_cast<const __half*>(blk);
+        const uint8_t* ql = blk + 32;
+        const uint8_t* qh = blk + 160;
+        const float* xb = xs + b * 256;
+#pragma unroll
+        for (int n128 = 0; n128 < 2; ++n128) {
+            const int q1 = static_cast<int>((ql[lane] & 0xF) | (((qh[lane] >> 0) & 3) << 4)) - 32;
+            const int q2 = static_cast<int>((ql[lane + 32] & 0xF) | (((qh[lane] >> 2) & 3) << 4)) - 32;
+            const int q3 = static_cast<int>((ql[lane] >> 4) | (((qh[lane] >> 4) & 3) << 4)) - 32;
+            const int q4 = static_cast<int>((ql[lane + 32] >> 4) | (((qh[lane] >> 6) & 3) << 4)) - 32;
+            acc = fmaf(__half2float(ds[is]) * static_cast<float>(q1), xb[lane], acc);
+            acc = fmaf(__half2float(ds[is + 2]) * static_cast<float>(q2), xb[32 + lane], acc);
+            acc = fmaf(__half2float(ds[is + 4]) * static_cast<float>(q3), xb[64 + lane], acc);
+            acc = fmaf(__half2float(ds[is + 6]) * static_cast<float>(q4), xb[96 + lane], acc);
+            ql += 64;
+            qh += 32;
+            ds += 8;
+            xb += 128;
+        }
+    }
+    return acc;
+}
+
 template <int Bsz>
 __global__ void gemv_qk_k(const uint8_t* W, const float* x, float* y, int m, int n, int add) {
     extern __shared__ float xs[];
@@ -676,7 +762,10 @@ __global__ void gemv_qk_k(const uint8_t* W, const float* x, float* y, int m, int
         __syncthreads();
         if (row < m && nb > 0) {
             const uint8_t* roww = W + (static_cast<size_t>(row) * nb_all + static_cast<size_t>(t0 / 256)) * Bsz;
-            if (Bsz == kQ4KBsz) acc += acc_q4k_row(roww, xs, nb, lane);
+            if (Bsz == kQ4KSoaBsz) acc += acc_q4k_soa_row(roww, xs, nb, lane);
+            else if (Bsz == kQ5KSoaBsz) acc += acc_q5k_soa_row(roww, xs, nb, lane);
+            else if (Bsz == kQ6KSoaBsz) acc += acc_q6k_soa_row(roww, xs, nb, lane);
+            else if (Bsz == kQ4KBsz) acc += acc_q4k_row(roww, xs, nb, lane);
             else if (Bsz == kQ5KBsz) acc += acc_q5k_row(roww, xs, nb, lane);
             else acc += acc_q6k_row(roww, xs, nb, lane);
         }
@@ -706,12 +795,18 @@ __global__ void gemv_qk_2row_k(const uint8_t* W, const float* x, float* y, int m
         __syncthreads();
         if (row0 < m && nb > 0) {
             const uint8_t* r0 = W + (static_cast<size_t>(row0) * nb_all + static_cast<size_t>(t0 / 256)) * Bsz;
-            if (Bsz == kQ4KBsz) acc0 += acc_q4k_row(r0, xs, nb, lane);
+            if (Bsz == kQ4KSoaBsz) acc0 += acc_q4k_soa_row(r0, xs, nb, lane);
+            else if (Bsz == kQ5KSoaBsz) acc0 += acc_q5k_soa_row(r0, xs, nb, lane);
+            else if (Bsz == kQ6KSoaBsz) acc0 += acc_q6k_soa_row(r0, xs, nb, lane);
+            else if (Bsz == kQ4KBsz) acc0 += acc_q4k_row(r0, xs, nb, lane);
             else if (Bsz == kQ5KBsz) acc0 += acc_q5k_row(r0, xs, nb, lane);
             else acc0 += acc_q6k_row(r0, xs, nb, lane);
             if (row1 < m) {
                 const uint8_t* r1 = W + (static_cast<size_t>(row1) * nb_all + static_cast<size_t>(t0 / 256)) * Bsz;
-                if (Bsz == kQ4KBsz) acc1 += acc_q4k_row(r1, xs, nb, lane);
+                if (Bsz == kQ4KSoaBsz) acc1 += acc_q4k_soa_row(r1, xs, nb, lane);
+                else if (Bsz == kQ5KSoaBsz) acc1 += acc_q5k_soa_row(r1, xs, nb, lane);
+                else if (Bsz == kQ6KSoaBsz) acc1 += acc_q6k_soa_row(r1, xs, nb, lane);
+                else if (Bsz == kQ4KBsz) acc1 += acc_q4k_row(r1, xs, nb, lane);
                 else if (Bsz == kQ5KBsz) acc1 += acc_q5k_row(r1, xs, nb, lane);
                 else acc1 += acc_q6k_row(r1, xs, nb, lane);
             }
@@ -751,7 +846,10 @@ __global__ void gemm_qk_t_k(const uint8_t* W, const float* X, float* Y, int m, i
             const uint8_t* roww =
                 W + (static_cast<size_t>(row) * nb_all + static_cast<size_t>(t0 / 256)) * Bsz;
             for (int t = 0; t < T; ++t) {
-                if (Bsz == kQ4KBsz) acc[t] += acc_q4k_row(roww, xs + t * tile, 1, lane);
+                if (Bsz == kQ4KSoaBsz) acc[t] += acc_q4k_soa_row(roww, xs + t * tile, 1, lane);
+                else if (Bsz == kQ5KSoaBsz) acc[t] += acc_q5k_soa_row(roww, xs + t * tile, 1, lane);
+                else if (Bsz == kQ6KSoaBsz) acc[t] += acc_q6k_soa_row(roww, xs + t * tile, 1, lane);
+                else if (Bsz == kQ4KBsz) acc[t] += acc_q4k_row(roww, xs + t * tile, 1, lane);
                 else if (Bsz == kQ5KBsz) acc[t] += acc_q5k_row(roww, xs + t * tile, 1, lane);
                 else acc[t] += acc_q6k_row(roww, xs + t * tile, 1, lane);
             }
@@ -6650,6 +6748,7 @@ struct GpuW {
     bool fp8_tiled = false; // 16x32 e4m3 tiles for MMA
     bool fp8_kmajor = false; // 512-col lane-interleaved: W[(sg*rows+row)*512 + lane*16 + t*4]
     bool fp8_rowmaj = false; // row-major e4, scales absorbed — cublasLt prefill
+    bool qk_soa = false;    // K-quant scales pre-expanded, quants still packed
 };
 
 cublasHandle_t g_blas = nullptr;
@@ -6986,22 +7085,16 @@ void launch_gemv(const GpuW& w, const float* x, float* y, int add = 0, float* ac
             throw std::runtime_error("CUDA K-quant GEMV cols must be multiple of 256");
         const int tile = w.cols < kXsTile ? w.cols : kXsTile;
         const size_t smem = sizeof(float) * static_cast<size_t>(tile);
-        const bool two = w.rows >= 4096;
-        int gblocks = blocks, gthreads = threads;
-        if (two) {
-            const int pairs = (w.rows + 1) / 2;
-            const int warps = threads / 32;
-            gblocks = (pairs + warps - 1) / warps;
-        }
+        // One row / warp: k-quant dequant is compute-bound; 2-row doubles that work.
         if (w.q == QuantKind::Q4_K) {
-            if (two) gemv_qk_2row_k<kQ4KBsz><<<gblocks, gthreads, smem>>>(w.data, x, y, w.rows, w.cols, add);
-            else gemv_qk_k<kQ4KBsz><<<gblocks, gthreads, smem>>>(w.data, x, y, w.rows, w.cols, add);
+            if (w.qk_soa) gemv_qk_k<kQ4KSoaBsz><<<blocks, threads, smem>>>(w.data, x, y, w.rows, w.cols, add);
+            else gemv_qk_k<kQ4KBsz><<<blocks, threads, smem>>>(w.data, x, y, w.rows, w.cols, add);
         } else if (w.q == QuantKind::Q5_K) {
-            if (two) gemv_qk_2row_k<kQ5KBsz><<<gblocks, gthreads, smem>>>(w.data, x, y, w.rows, w.cols, add);
-            else gemv_qk_k<kQ5KBsz><<<gblocks, gthreads, smem>>>(w.data, x, y, w.rows, w.cols, add);
+            if (w.qk_soa) gemv_qk_k<kQ5KSoaBsz><<<blocks, threads, smem>>>(w.data, x, y, w.rows, w.cols, add);
+            else gemv_qk_k<kQ5KBsz><<<blocks, threads, smem>>>(w.data, x, y, w.rows, w.cols, add);
         } else {
-            if (two) gemv_qk_2row_k<kQ6KBsz><<<gblocks, gthreads, smem>>>(w.data, x, y, w.rows, w.cols, add);
-            else gemv_qk_k<kQ6KBsz><<<gblocks, gthreads, smem>>>(w.data, x, y, w.rows, w.cols, add);
+            if (w.qk_soa) gemv_qk_k<kQ6KSoaBsz><<<blocks, threads, smem>>>(w.data, x, y, w.rows, w.cols, add);
+            else gemv_qk_k<kQ6KBsz><<<blocks, threads, smem>>>(w.data, x, y, w.rows, w.cols, add);
         }
         break;
     }
@@ -7949,6 +8042,86 @@ bool fp8_tc_selftest() {
     return f16_ok;
 }
 
+static void host_q4k_scale_min(const uint8_t* sc, int j, int& s, int& mn) {
+    if (j < 4) {
+        s = sc[j] & 63;
+        mn = sc[j + 4] & 63;
+    } else {
+        s = (sc[j + 4] & 0xF) | ((sc[j - 4] >> 6) << 4);
+        mn = (sc[j + 4] >> 4) | ((sc[j] >> 6) << 4);
+    }
+}
+
+// Pre-expand K-quant scales; keep 4/5/6-bit quants packed (not FP8).
+static void pack_q4k_soa(uint8_t* dst, const uint8_t* src, int rows, int cols) {
+    const int nb = cols / 256;
+    for (int r = 0; r < rows; ++r) {
+        for (int b = 0; b < nb; ++b) {
+            const uint8_t* blk = src + (static_cast<size_t>(r) * nb + b) * kQ4KBsz;
+            uint8_t* out = dst + (static_cast<size_t>(r) * nb + b) * kQ4KSoaBsz;
+            __half dh, dm;
+            std::memcpy(&dh, blk, 2);
+            std::memcpy(&dm, blk + 2, 2);
+            const float d = __half2float(dh);
+            const float minv = __half2float(dm);
+            const uint8_t* sc = blk + 4;
+            __half* ds = reinterpret_cast<__half*>(out);
+            __half* dmin = reinterpret_cast<__half*>(out + 16);
+            for (int j = 0; j < 8; ++j) {
+                int s = 0, mn = 0;
+                host_q4k_scale_min(sc, j, s, mn);
+                ds[j] = __float2half(d * static_cast<float>(s));
+                dmin[j] = __float2half(minv * static_cast<float>(mn));
+            }
+            std::memcpy(out + 32, blk + 16, 128);
+        }
+    }
+}
+
+static void pack_q5k_soa(uint8_t* dst, const uint8_t* src, int rows, int cols) {
+    const int nb = cols / 256;
+    for (int r = 0; r < rows; ++r) {
+        for (int b = 0; b < nb; ++b) {
+            const uint8_t* blk = src + (static_cast<size_t>(r) * nb + b) * kQ5KBsz;
+            uint8_t* out = dst + (static_cast<size_t>(r) * nb + b) * kQ5KSoaBsz;
+            __half dh, dm;
+            std::memcpy(&dh, blk, 2);
+            std::memcpy(&dm, blk + 2, 2);
+            const float d = __half2float(dh);
+            const float minv = __half2float(dm);
+            const uint8_t* sc = blk + 4;
+            __half* ds = reinterpret_cast<__half*>(out);
+            __half* dmin = reinterpret_cast<__half*>(out + 16);
+            for (int j = 0; j < 8; ++j) {
+                int s = 0, mn = 0;
+                host_q4k_scale_min(sc, j, s, mn);
+                ds[j] = __float2half(d * static_cast<float>(s));
+                dmin[j] = __float2half(minv * static_cast<float>(mn));
+            }
+            std::memcpy(out + 32, blk + 16, 32);  // qh
+            std::memcpy(out + 64, blk + 48, 128); // ql
+        }
+    }
+}
+
+static void pack_q6k_soa(uint8_t* dst, const uint8_t* src, int rows, int cols) {
+    const int nb = cols / 256;
+    for (int r = 0; r < rows; ++r) {
+        for (int b = 0; b < nb; ++b) {
+            const uint8_t* blk = src + (static_cast<size_t>(r) * nb + b) * kQ6KBsz;
+            uint8_t* out = dst + (static_cast<size_t>(r) * nb + b) * kQ6KSoaBsz;
+            const int8_t* sc = reinterpret_cast<const int8_t*>(blk + 192);
+            __half dh;
+            std::memcpy(&dh, blk + 208, 2);
+            const float d = __half2float(dh);
+            __half* ds = reinterpret_cast<__half*>(out);
+            for (int j = 0; j < 16; ++j) ds[j] = __float2half(d * static_cast<float>(sc[j]));
+            std::memcpy(out + 32, blk, 128);       // ql
+            std::memcpy(out + 160, blk + 128, 64); // qh
+        }
+    }
+}
+
 void kquant_gemv_selftest() {
     const int m = 64, n = 512;
     std::vector<float> x(n), y_cpu(m), y_gpu(m);
@@ -7974,12 +8147,18 @@ void kquant_gemv_selftest() {
             }
         }
         cpu_gemv(W.data(), x.data(), y_cpu.data(), m, n);
+        const int soa_bsz = q == QuantKind::Q4_K ? kQ4KSoaBsz : (q == QuantKind::Q5_K ? kQ5KSoaBsz : kQ6KSoaBsz);
+        const size_t soa_bytes = static_cast<size_t>(m) * (n / 256) * static_cast<size_t>(soa_bsz);
+        std::vector<uint8_t> Soa(soa_bytes);
+        if (q == QuantKind::Q4_K) pack_q4k_soa(Soa.data(), W.data(), m, n);
+        else if (q == QuantKind::Q5_K) pack_q5k_soa(Soa.data(), W.data(), m, n);
+        else pack_q6k_soa(Soa.data(), W.data(), m, n);
         uint8_t* dW = nullptr;
         float *dX = nullptr, *dY = nullptr;
-        CUDA_CHECK(cudaMalloc(&dW, bytes));
+        CUDA_CHECK(cudaMalloc(&dW, soa_bytes));
         CUDA_CHECK(cudaMalloc(&dX, sizeof(float) * n));
         CUDA_CHECK(cudaMalloc(&dY, sizeof(float) * m));
-        CUDA_CHECK(cudaMemcpy(dW, W.data(), bytes, cudaMemcpyHostToDevice));
+        CUDA_CHECK(cudaMemcpy(dW, Soa.data(), soa_bytes, cudaMemcpyHostToDevice));
         CUDA_CHECK(cudaMemcpy(dX, x.data(), sizeof(float) * n, cudaMemcpyHostToDevice));
         CUDA_CHECK(cudaMemset(dY, 0, sizeof(float) * m));
         GpuW tw;
@@ -7987,6 +8166,7 @@ void kquant_gemv_selftest() {
         tw.q = q;
         tw.rows = m;
         tw.cols = n;
+        tw.qk_soa = true;
         launch_gemv(tw, dX, dY, 0);
         CUDA_CHECK(cudaMemcpy(y_gpu.data(), dY, sizeof(float) * m, cudaMemcpyDeviceToHost));
         float maxe = 0.f, maxa = 0.f;
@@ -8125,12 +8305,16 @@ void launch_gemm_qk(const GpuW& w, const float* X, float* Y, int T, int add) {
     int blocks = 0, threads = 0;
     gemv_grid(w, blocks, threads);
     const size_t smem = sizeof(float) * static_cast<size_t>(T) * 256;
-    if (w.q == QuantKind::Q4_K)
-        gemm_qk_t_k<kQ4KBsz><<<blocks, threads, smem>>>(w.data, X, Y, w.rows, w.cols, T, add);
-    else if (w.q == QuantKind::Q5_K)
-        gemm_qk_t_k<kQ5KBsz><<<blocks, threads, smem>>>(w.data, X, Y, w.rows, w.cols, T, add);
-    else
-        gemm_qk_t_k<kQ6KBsz><<<blocks, threads, smem>>>(w.data, X, Y, w.rows, w.cols, T, add);
+    if (w.q == QuantKind::Q4_K) {
+        if (w.qk_soa) gemm_qk_t_k<kQ4KSoaBsz><<<blocks, threads, smem>>>(w.data, X, Y, w.rows, w.cols, T, add);
+        else gemm_qk_t_k<kQ4KBsz><<<blocks, threads, smem>>>(w.data, X, Y, w.rows, w.cols, T, add);
+    } else if (w.q == QuantKind::Q5_K) {
+        if (w.qk_soa) gemm_qk_t_k<kQ5KSoaBsz><<<blocks, threads, smem>>>(w.data, X, Y, w.rows, w.cols, T, add);
+        else gemm_qk_t_k<kQ5KBsz><<<blocks, threads, smem>>>(w.data, X, Y, w.rows, w.cols, T, add);
+    } else {
+        if (w.qk_soa) gemm_qk_t_k<kQ6KSoaBsz><<<blocks, threads, smem>>>(w.data, X, Y, w.rows, w.cols, T, add);
+        else gemm_qk_t_k<kQ6KBsz><<<blocks, threads, smem>>>(w.data, X, Y, w.rows, w.cols, T, add);
+    }
 }
 
 void launch_gemm_q8(const GpuW& w, const float* X, float* Y, int T) {
@@ -8449,6 +8633,12 @@ public:
             if (xe != cudaSuccess) cudaGetLastError();
             xe = cudaFuncSetAttribute(gemv_qk_2row_k<kQ6KBsz>, cudaFuncAttributeMaxDynamicSharedMemorySize, xs_bytes);
             if (xe != cudaSuccess) cudaGetLastError();
+            xe = cudaFuncSetAttribute(gemv_qk_k<kQ4KSoaBsz>, cudaFuncAttributeMaxDynamicSharedMemorySize, xs_bytes);
+            if (xe != cudaSuccess) cudaGetLastError();
+            xe = cudaFuncSetAttribute(gemv_qk_k<kQ5KSoaBsz>, cudaFuncAttributeMaxDynamicSharedMemorySize, xs_bytes);
+            if (xe != cudaSuccess) cudaGetLastError();
+            xe = cudaFuncSetAttribute(gemv_qk_k<kQ6KSoaBsz>, cudaFuncAttributeMaxDynamicSharedMemorySize, xs_bytes);
+            if (xe != cudaSuccess) cudaGetLastError();
         }
         if (cudaStreamCreateWithFlags(&bak_stream_, cudaStreamNonBlocking) != cudaSuccess) bak_stream_ = nullptr;
         g_bak_stream = bak_stream_;
@@ -8752,6 +8942,11 @@ private:
             CUDA_CHECK(cudaMemcpy(ps, scales.data(), sn * sizeof(uint16_t), cudaMemcpyHostToDevice));
             w.data = static_cast<const uint8_t*>(pq);
             w.scale = static_cast<const float*>(ps);
+            static int q8once = 0;
+            if (!q8once) {
+                q8once = 1;
+                std::fprintf(stderr, "native_q8=1 (packed SoA GEMV)\n");
+            }
             return w;
         }
         if (t.quant == QuantKind::Q4_K || t.quant == QuantKind::Q5_K || t.quant == QuantKind::Q6_K) {
@@ -8761,22 +8956,39 @@ private:
             const size_t need = static_cast<size_t>(rows) * static_cast<size_t>(cols / 256) * static_cast<size_t>(bsz);
             if (t.data.size() < need)
                 throw std::runtime_error("K-quant tensor short: " + t.ir_name);
-            // Native Q4/Q5/Q6 GEMV is opt-in. Default requant-to-FP8 is still
-            // faster on Ada (native Q4 decode ~22 tok/s vs ~31 after requant).
-            // RAPIDLLM_REQUANT_KQUANT=0 keeps packed K-quants.
+            // Default: keep packed K-quants and run native GEMV. Requant-to-FP8
+            // is opt-in via RAPIDLLM_REQUANT_KQUANT=1.
             const char* requant = std::getenv("RAPIDLLM_REQUANT_KQUANT");
-            if (requant && requant[0] == '0') {
-                void* p = alloc(need);
-                CUDA_CHECK(cudaMemcpy(p, t.data.data(), need, cudaMemcpyHostToDevice));
+            if (!(requant && requant[0] == '1')) {
+                const int soa_bsz = t.quant == QuantKind::Q4_K ? kQ4KSoaBsz
+                                                               : (t.quant == QuantKind::Q5_K ? kQ5KSoaBsz : kQ6KSoaBsz);
+                const size_t soa_n = static_cast<size_t>(rows) * static_cast<size_t>(cols / 256) *
+                                     static_cast<size_t>(soa_bsz);
+                std::vector<uint8_t> soa(soa_n);
+                if (t.quant == QuantKind::Q4_K) pack_q4k_soa(soa.data(), t.data.data(), rows, cols);
+                else if (t.quant == QuantKind::Q5_K) pack_q5k_soa(soa.data(), t.data.data(), rows, cols);
+                else pack_q6k_soa(soa.data(), t.data.data(), rows, cols);
+                void* p = alloc(soa_n);
+                CUDA_CHECK(cudaMemcpy(p, soa.data(), soa_n, cudaMemcpyHostToDevice));
                 w.q = t.quant;
                 w.data = static_cast<const uint8_t*>(p);
                 w.scale = nullptr;
-                static int once = 0;
-                if (!once) {
-                    once = 1;
-                    std::fprintf(stderr, "native_kquant=1 q=%d (no fp8 requant)\n", static_cast<int>(t.quant));
+                w.qk_soa = true;
+                static int seen[16] = {};
+                const int qi = static_cast<int>(t.quant);
+                if (qi >= 0 && qi < 16 && !seen[qi]) {
+                    seen[qi] = 1;
+                    const char* nm = t.quant == QuantKind::Q4_K ? "q4k"
+                                     : t.quant == QuantKind::Q5_K ? "q5k"
+                                                                  : "q6k";
+                    std::fprintf(stderr, "native_kquant=1 %s soa=1 (no fp8 requant)\n", nm);
                 }
                 return w;
+            }
+            static int ronce = 0;
+            if (!ronce) {
+                ronce = 1;
+                std::fprintf(stderr, "requant_fp8=1 q=%d (RAPIDLLM_REQUANT_KQUANT=1)\n", static_cast<int>(t.quant));
             }
             const int nblk = cols / 256;
             const size_t rowb = static_cast<size_t>(nblk) * static_cast<size_t>(bsz);

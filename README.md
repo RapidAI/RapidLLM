@@ -156,11 +156,11 @@ Same official pair as 3.6: prompt `1,2,3`, 16 new, `--spec off --fuse=on --devic
 
 | Weights | Size | Wall tok/s | Decode tok/s | Prefill s | Notes |
 | --- | ---: | ---: | ---: | ---: | --- |
-| Official FP8 | 30.9 GB | **31.67** | **32.05** | 0.037 | matches 3.6-27B keep (31.66 / 32.03) |
-| Unsloth Q4_K_M | 17.1 GB | **31.09** | 31.46 | 0.038 | CUDA requant → FP8 |
-| Unsloth Q5_K_M | 19.8 GB | **31.08** | 31.44 | 0.038 | CUDA requant → FP8 |
-| Unsloth Q6_K | 22.9 GB | **30.26** | 30.84 | 0.042 | CUDA requant → FP8 |
-| Unsloth Q8_0 | 29.0 GB | **26.26** | 27.43 | 0.062 | native Q8 GEMV (no tensor-core FP8) |
+| Official FP8 | 30.9 GB | **28.99** | **30.72** | 0.064 | T=1 FP8 GEMV (repeat 28.99) |
+| Unsloth Q4_K_M | 17.1 GB | **25.00** | 26.93 | 0.083 | native packed GEMV (`native_kquant=1`; repeat 24.67) |
+| Unsloth Q5_K_M | 19.8 GB | — | — | — | not re-run this pass |
+| Unsloth Q6_K | 22.9 GB | **22.98** | 23.65 | 0.062 | native packed GEMV (`native_kquant=1`; repeat 22.93) |
+| Unsloth Q8_0 | 29.0 GB | **34.77** | 35.58 | 0.038 | native Q8 SoA GEMV (`native_q8=1`; repeat 34.70) |
 
 ```bash
 rapidllm bench -m /path/to/Qwen3.8-27B-Q4_K_M.gguf \
@@ -182,11 +182,11 @@ Q4_K / Q5_K / Q6_K stay packed and use native CUDA GEMV. Q8_0 uses the native Q8
 | Qwen3.6-27B | Official FP8 | **31.67** | 32.04 | **19.36** | **1.635×** |
 | Qwen3.6-27B | Q6_K GGUF | **29.69** | 30.24 | 19.36 (FP8) | **1.533×** |
 | Qwen3.6-27B | Q8_0 GGUF | **26.23** | 27.40 | 19.36 (FP8) | **1.355×** |
-| Qwen3.8-27B | Official FP8 | **31.65** | 32.02 | **19.34** | **1.636×** |
-| Qwen3.8-27B | Q4_K_M GGUF | **31.08** | 31.46 | 19.34 (FP8) | **1.607×** |
-| Qwen3.8-27B | Q5_K_M GGUF | **31.08** | 31.45 | 19.34 (FP8) | **1.607×** |
-| Qwen3.8-27B | Q6_K GGUF | **30.27** | 30.84 | 19.34 (FP8) | **1.565×** |
-| Qwen3.8-27B | Q8_0 GGUF | **26.22** | 27.39 | 19.34 (FP8) | **1.356×** |
+| Qwen3.8-27B | Official FP8 | **28.99** | 30.72 | **19.34** | **1.499×** |
+| Qwen3.8-27B | Q4_K_M GGUF | **25.00** | 26.93 | 19.34 (FP8) | **1.293×** |
+| Qwen3.8-27B | Q5_K_M GGUF | — | — | 19.34 (FP8) | not re-run |
+| Qwen3.8-27B | Q6_K GGUF | **22.98** | 23.65 | 19.34 (FP8) | **1.188×** |
+| Qwen3.8-27B | Q8_0 GGUF | **34.77** | 35.58 | 19.34 (FP8) | **1.798×** |
 
 ```bash
 rapidllm bench -m /path/to/Qwen3.8-27B-FP8 \
@@ -236,29 +236,46 @@ Peak aggregate is **~94.5 tok/s** at batch 24–32. After batch 8 the weight sca
 
 ### 262k TurboQuant + continuous batch
 
-`--ctx 262144` with TurboQuant (`RAPIDLLM_KV_TQ=1` / `--kv-type q8k_tq3v`, auto when `--ctx>163840`) allocates on 48 GB: K q8 + V tq3 persist ~5.7–6.1 GiB/seq plus an 8k F16 scratch window. Full F16 at 262k is ~16–17 GiB/seq and does not fit. Same-box sweep below: `--device cuda --fuse=on --spec off --no-thinking --max-new 16 --prompt 1,2,3`, continuous batch (`--batch N`, one shared weight pass). `tok/s` is **aggregate**. Peak MiB is `cuda_mem_ready` after graphs.
+`--ctx 262144` with TurboQuant (`RAPIDLLM_KV_TQ=1` / `--kv-type q8k_tq3v`, auto when `--ctx>163840`) allocates on 48 GB: K q8 + V tq3 persist ~5.7–6.1 GiB/seq plus an 8k F16 scratch window. Full F16 at 262k is ~16–17 GiB/seq and does not fit. Re-measured 2026-08-15 on the same RTX 6000 Ada 48 GB box, concurrency swept until aggregate TPS stopped rising (batch 3 OOMs on every format). Flags: `--device cuda --fuse=on --spec off --no-thinking --max-new 16 --prompt 1,2,3 --kv-type q8k_tq3v`, continuous batch (`--batch N`, one shared weight pass). CUDA graphs are on (Q8 capture fails and falls back to eager). Q4/Q6 use the default requant-to-FP8 GEMV; Q8 stays packed. `--spec` is off because a repeating `1,2,3` prompt would let n-gram fake throughput. `tok/s` is **aggregate**. Peak MiB is `cuda_mem_ready` after graphs.
 
 | Weights | `--batch` | Wall tok/s | Decode tok/s | Per-seq decode | Peak MiB | Result |
 | --- | ---: | ---: | ---: | ---: | ---: | --- |
-| Official FP8 | 1 | 29.04 | 30.79 | 30.79 | 35925 | ok |
-| Official FP8 | **2** | **40.75** | **43.90** | 21.95 | 42325 | **max that fits** |
+| Official FP8 | 1 | 29.06 | 30.81 | 30.81 | 35925 | ok |
+| Official FP8 | **2** | **40.76** | **43.91** | 21.96 | 42325 | **max that fits** |
 | Official FP8 | 3 | — | — | — | 46857 | CUDA OOM at session |
-| Q4_K_M | 1 | 31.14 | 31.55 | 31.55 | 38991 | ok |
-| Q4_K_M | **2** | **49.08** | **52.20** | 26.10 | 45781 | ok |
-| Q4_K_M | 4 | — | — | — | — | OOM (SSH dropped) |
+| Q4_K_M | 1 | 31.15 | 31.56 | 31.56 | 38991 | ok |
+| Q4_K_M | **2** | **49.03** | **52.15** | 26.07 | 45781 | ok |
+| Q4_K_M | 3 | — | — | — | — | CUDA OOM at session |
 | Q6_K | 1 | 30.44 | 31.04 | 31.04 | 39761 | ok |
-| Q6_K | **2** | **46.71** | **49.83** | 24.91 | 46551 | ok |
-| Q8_0 | 1 | 34.84 | 35.68 | 35.68 | 40631 | ok (eager; graph capture failed) |
-| Q8_0 | **2** | **55.50** | **59.55** | 29.78 | 47421 | **highest aggregate TPS** |
+| Q6_K | **2** | **46.68** | **49.80** | 24.90 | 46551 | ok |
+| Q6_K | 3 | — | — | — | — | CUDA OOM at session |
+| Q8_0 | 1 | 34.88 | 35.71 | 35.71 | 40631 | ok (eager; graph capture failed) |
+| Q8_0 | **2** | **55.50** | **59.54** | 29.77 | 47421 | **highest aggregate TPS** |
+| Q8_0 | 3 | — | — | — | — | CUDA OOM at session |
 
-Fill-256 (still inside the 8k F16 window) at `--ctx 262144`:
+Per-format peak at 262k (short prompt, continuous batch):
+
+| Weights | Max `--batch` | Peak wall tok/s | Peak decode tok/s |
+| --- | ---: | ---: | ---: |
+| Official FP8 | 2 | **40.76** | 43.91 |
+| Q4_K_M | 2 | **49.03** | 52.15 |
+| Q6_K | 2 | **46.68** | 49.80 |
+| Q8_0 | 2 | **55.50** | 59.54 |
+
+Fill-256 (still inside the 8k F16 window) at `--ctx 262144`, same box and flags, earlier run. Q6/Q8 prefill stays on packed GEMM, so wall tok/s drops even when decode is fast:
 
 | Weights | `--batch` | Wall tok/s | Decode tok/s | Prefill s | Peak MiB |
 | --- | ---: | ---: | ---: | ---: | ---: |
 | Official FP8 | 1 | 26.99 | 30.36 | 0.066 | 35925 |
 | Official FP8 | 2 | 37.95 | 44.87 | 0.065 | 42325 |
+| Q4_K_M | 1 | 23.97 | 31.17 | 0.109 | 38991 |
+| Q4_K_M | 2 | 39.08 | 53.11 | 0.108 | 45781 |
+| Q6_K | 1 | 9.16 | 30.74 | 0.646 | 39761 |
+| Q6_K | 2 | 16.65 | 51.15 | 0.648 | 46551 |
+| Q8_0 | 1 | 2.65 | 35.31 | 2.817 | 40631 |
+| Q8_0 | 2 | 5.13 | 60.46 | 2.856 | 47421 |
 
-On this 48 GB card the 262k concurrency cap is **`--batch 2`**. Peak total TPS is **55.50 tok/s** (Q8_0, batch 2). Official FP8 peaks at **40.75 tok/s** (batch 2). Batch 3+ OOMs because persist KV scales linearly (~5.7–6.1 GiB/seq).
+On this 48 GB card the 262k concurrency cap is **`--batch 2`** for FP8 / Q4 / Q6 / Q8. Peak total TPS is **55.50 tok/s** (Q8_0, batch 2, 3-token prompt). Official FP8 peaks at **40.76 tok/s** (batch 2). Batch 3+ OOMs because persist KV scales linearly (~5.7–6.1 GiB/seq).
 
 ```bash
 # max window that allocates on 48 GB without TurboQuant
