@@ -446,6 +446,7 @@ void Session::prefill(const int32_t* ids, int n) {
             gpu_->set_vision_override(nullptr, 0, -1);
         gpu_->prefill(ids, n);
         gpu_->copy_logits(logits_.data());
+        gpu_->copy_last_hidden(last_hidden_.data());
         ctx_tokens_.assign(ids, ids + n);
         pos_ = gpu_->pos();
         return;
@@ -477,6 +478,7 @@ void Session::decode_token(int32_t token, float* logits) {
     if (gpu_) {
         gpu_->decode_token(token);
         gpu_->copy_logits(logits_.data());
+        gpu_->copy_last_hidden(last_hidden_.data());
         if (logits) std::memcpy(logits, logits_.data(), sizeof(float) * store_->model().vocab);
         ctx_tokens_.push_back(token);
         pos_ = gpu_->pos();
@@ -561,7 +563,16 @@ int Session::mtp_draft(int32_t first, int n, int32_t* out) {
     const int H = m.hidden;
     std::vector<float> h = last_hidden_;
     int32_t token = first;
-    mtp_k_.assign(static_cast<size_t>(n + 2) * 64, 0.f);
+    int nkv = 2, hd = 8;
+    for (const auto& L : m.layers) {
+        if (L.kind == LayerKind::GatedAttn) {
+            nkv = L.attn.n_kv;
+            hd = L.attn.head_dim;
+            break;
+        }
+    }
+    const int kn0 = nkv * hd;
+    mtp_k_.assign(static_cast<size_t>(n + 2) * static_cast<size_t>(std::max(kn0, 1)), 0.f);
     mtp_v_ = mtp_k_;
     const TensorDesc& emb = must("embed");
     const TensorDesc& fc = must("mtp.fc");
@@ -603,8 +614,19 @@ int Session::generate(const int32_t* ids, int n, int32_t* out, int cap, const Ge
     int produced = 0;
     const int want = std::min(cfg.max_new_tokens, cap);
     if (gpu_) {
-        SpecKind sk = cfg.spec == SpecKind::Off ? SpecKind::Off : SpecKind::Ngram;
-        if (cfg.spec != SpecKind::Off && draft_) sk = SpecKind::Draft;
+        SpecKind sk = SpecKind::Off;
+        if (cfg.spec != SpecKind::Off) {
+            if (draft_)
+                sk = SpecKind::Draft;
+            else
+                sk = resolve_spec(cfg.spec);
+        }
+        if (sk == SpecKind::Mtp)
+            std::fprintf(stderr, "spec_src=mtp\n");
+        else if (sk == SpecKind::Ngram)
+            std::fprintf(stderr, "spec_src=ngram\n");
+        else if (sk == SpecKind::Draft)
+            std::fprintf(stderr, "spec_src=draft\n");
         const int spec_n = std::max(0, cfg.spec_n);
         const auto t_d0 = std::chrono::steady_clock::now();
         int n_decode_fwd = 0;
@@ -639,6 +661,8 @@ int Session::generate(const int32_t* ids, int n, int32_t* out, int cap, const Ge
                 const int take = std::min(std::min(spec_n, want - produced), 7);
                 if (sk == SpecKind::Draft)
                     nd = draft_tokens(take, drafts);
+                else if (sk == SpecKind::Mtp)
+                    nd = mtp_draft(t0, take, drafts);
                 else
                     nd = ngram_draft(ctx_tokens_.data(), static_cast<int>(ctx_tokens_.size()), t0, take, drafts);
                 spec_stats_.proposed += nd;
@@ -646,6 +670,7 @@ int Session::generate(const int32_t* ids, int n, int32_t* out, int cap, const Ge
             }
             if (nd <= 0) {
                 gpu_->decode_token(t0);
+                gpu_->copy_last_hidden(last_hidden_.data());
                 pos_ = gpu_->pos();
                 continue;
             }
@@ -659,6 +684,7 @@ int Session::generate(const int32_t* ids, int n, int32_t* out, int cap, const Ge
                 ctx_tokens_.push_back(drafts[i]);
                 ++spec_stats_.accepted;
             }
+            gpu_->copy_last_hidden(last_hidden_.data());
             pos_ = gpu_->pos();
         }
         const auto t_d1 = std::chrono::steady_clock::now();

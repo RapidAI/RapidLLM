@@ -1,5 +1,6 @@
 #include "rapidllm/backend/device.h"
 #include "rapidllm/frontend/weight_store.h"
+#include "rapidllm/runtime/cuda_engine.h"
 #include "rapidllm/runtime/session.h"
 
 #include "frontend/json_mini.h"
@@ -112,6 +113,30 @@ int main() {
             return 1;
         }
         std::printf("draft_model accept=%d/%d\n", target.spec_stats().accepted, target.spec_stats().proposed);
+    }
+
+    if (cuda_gen::available()) {
+        auto devc = create_device(DeviceKind::CPU);
+        WeightStore storec = WeightStore::open(root / "tiny_hybrid", *devc, LoadOptions{});
+        Session sc(*devc, storec, 64, false, true, true);
+        if (!sc.uses_cuda()) {
+            std::fprintf(stderr, "test_spec CUDA session missing engine\n");
+            return 1;
+        }
+        GenerateConfig cc;
+        cc.max_new_tokens = n_new;
+        cc.greedy = true;
+        cc.spec = SpecKind::Mtp;
+        cc.spec_n = 3;
+        std::vector<int32_t> outc(static_cast<size_t>(n_new));
+        const int gc = sc.generate(prompt.data(), static_cast<int>(prompt.size()), outc.data(), n_new, cc);
+        outc.resize(static_cast<size_t>(gc));
+        dump("cuda_mtp", outc);
+        std::printf("cuda_mtp_proposed=%d\n", sc.spec_stats().proposed);
+        if (outc != want || sc.spec_stats().proposed <= 0) {
+            std::fprintf(stderr, "CUDA MTP generate failed greedy match or did not draft\n");
+            return 1;
+        }
     }
 
     std::printf("test_spec ok (greedy invariant + MTP draft match)\n");

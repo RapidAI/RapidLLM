@@ -8699,11 +8699,13 @@ public:
             CUDA_CHECK(cudaGraphLaunch(pf256_exec_, cudaStreamPerThread));
             pos_ = n;
             if (n > 0) CUDA_CHECK(cudaMemcpy(d_tok_, ids + (n - 1), 4, cudaMemcpyHostToDevice));
+            snap_last_residual(n);
         } else if (!use_vis && n >= 2 && n <= kPfGraphMax && pf_graph_execs_[n]) {
             CUDA_CHECK(cudaMemcpy(d_toks_, ids, sizeof(int) * n, cudaMemcpyHostToDevice));
             CUDA_CHECK(cudaGraphLaunch(pf_graph_execs_[n], cudaStreamPerThread));
             pos_ = n;
             if (n > 0) CUDA_CHECK(cudaMemcpy(d_tok_, ids + (n - 1), 4, cudaMemcpyHostToDevice));
+            snap_last_residual(n);
         } else if (!use_vis && (n <= 1 || pf_cap_ <= 1)) {
             for (int t = 0; t < n; ++t) decode_token(ids[t]);
         } else {
@@ -8755,6 +8757,12 @@ public:
         if (!host || n <= 0) return;
         const int take = n > kGenCap ? kGenCap : n;
         CUDA_CHECK(cudaMemcpy(host, d_gen_out_, sizeof(int) * take, cudaMemcpyDeviceToHost));
+    }
+
+    void copy_last_hidden(float* host) override {
+        if (!host || hidden_ <= 0 || !d_h_ || !d_final_norm_) return;
+        launch_rms(d_h_, d_final_norm_, d_xn_, hidden_, store_->model().rms_eps);
+        CUDA_CHECK(cudaMemcpy(host, d_xn_, sizeof(float) * static_cast<size_t>(hidden_), cudaMemcpyDeviceToHost));
     }
 
     void copy_logits(float* host) const override {
@@ -8845,10 +8853,19 @@ public:
                 CUDA_CHECK(cudaMemcpyAsync(d_S_bak_, d_S_, s_bytes_, cudaMemcpyDeviceToDevice, bak_stream_));
             if (conv_bytes_)
                 CUDA_CHECK(cudaMemcpyAsync(d_conv_bak_, d_conv_, conv_bytes_, cudaMemcpyDeviceToDevice, bak_stream_));
+            if (kv_bytes_ && d_k_bak_ && d_v_bak_) {
+                CUDA_CHECK(cudaMemcpyAsync(d_k_bak_, d_kcache_, kv_bytes_, cudaMemcpyDeviceToDevice, bak_stream_));
+                CUDA_CHECK(cudaMemcpyAsync(d_v_bak_, d_vcache_, kv_bytes_, cudaMemcpyDeviceToDevice, bak_stream_));
+            }
         } else {
             if (s_bytes_) CUDA_CHECK(cudaMemcpy(d_S_bak_, d_S_, s_bytes_, cudaMemcpyDeviceToDevice));
             if (conv_bytes_) CUDA_CHECK(cudaMemcpy(d_conv_bak_, d_conv_, conv_bytes_, cudaMemcpyDeviceToDevice));
+            if (kv_bytes_ && d_k_bak_ && d_v_bak_) {
+                CUDA_CHECK(cudaMemcpy(d_k_bak_, d_kcache_, kv_bytes_, cudaMemcpyDeviceToDevice));
+                CUDA_CHECK(cudaMemcpy(d_v_bak_, d_vcache_, kv_bytes_, cudaMemcpyDeviceToDevice));
+            }
         }
+        if (bak_stream_) CUDA_CHECK(cudaStreamSynchronize(bak_stream_));
         CUDA_CHECK(cudaMemcpy(d_toks_, toks, sizeof(int) * T, cudaMemcpyHostToDevice));
         CUDA_CHECK(cudaMemcpy(d_pos_, &pos0, 4, cudaMemcpyHostToDevice));
         if (T == 4 && spec_graph_exec_) {
@@ -8867,6 +8884,10 @@ public:
             if (bak_stream_) CUDA_CHECK(cudaStreamSynchronize(bak_stream_));
             if (s_bytes_) CUDA_CHECK(cudaMemcpy(d_S_, d_S_bak_, s_bytes_, cudaMemcpyDeviceToDevice));
             if (conv_bytes_) CUDA_CHECK(cudaMemcpy(d_conv_, d_conv_bak_, conv_bytes_, cudaMemcpyDeviceToDevice));
+            if (kv_bytes_ && d_k_bak_ && d_v_bak_) {
+                CUDA_CHECK(cudaMemcpy(d_kcache_, d_k_bak_, kv_bytes_, cudaMemcpyDeviceToDevice));
+                CUDA_CHECK(cudaMemcpy(d_vcache_, d_v_bak_, kv_bytes_, cudaMemcpyDeviceToDevice));
+            }
             CUDA_CHECK(cudaMemcpy(d_toks_, toks, sizeof(int) * k, cudaMemcpyHostToDevice));
             CUDA_CHECK(cudaMemcpy(d_pos_, &pos0, 4, cudaMemcpyHostToDevice));
             launch_spec_chunk(k);
@@ -9546,8 +9567,15 @@ private:
         launch_argmax_rows(T);
     }
 
+    void snap_last_residual(int last_T) {
+        if (last_T > 0 && d_h_ && d_h_seq_)
+            CUDA_CHECK(cudaMemcpy(d_h_, d_h_seq_ + static_cast<size_t>(last_T - 1) * hidden_,
+                                  sizeof(float) * hidden_, cudaMemcpyDeviceToDevice));
+    }
+
     void launch_prefill_tail(int last_T, int n) {
         if (last_T > 0) {
+            snap_last_residual(last_T);
             launch_rms(d_h_seq_ + static_cast<size_t>(last_T - 1) * hidden_, d_final_norm_, d_xn_, hidden_,
                        store_->model().rms_eps);
             launch_linear(lm_head_, d_xn_, d_logits_, 1);
@@ -10200,6 +10228,8 @@ private:
         d_S_bak_ = static_cast<uint16_t*>(alloc(s_bytes_));
         d_conv_bak_ = static_cast<float*>(alloc(conv_bytes_));
         d_kcache_ = static_cast<float*>(alloc(kv_bytes_));
+        d_k_bak_ = kv_bytes_ ? static_cast<float*>(alloc(kv_bytes_)) : nullptr;
+        d_v_bak_ = kv_bytes_ ? static_cast<float*>(alloc(kv_bytes_)) : nullptr;
         kvf_n_ = 0;
         d_kvf_ = nullptr;
         if (kv_f16_) {
@@ -10426,6 +10456,9 @@ private:
                              (tot_b - free_b) / (1024 * 1024), free_b / (1024 * 1024), max_batch_);
         }
         for (auto& [_, t] : store_->table().tensors) {
+            // Host MTP draft needs embed + lm_head + mtp.* after GPU upload.
+            if (t.ir_name == "embed" || t.ir_name == "lm_head" || t.ir_name.rfind("mtp.", 0) == 0)
+                continue;
             t.data.clear();
             t.data.shrink_to_fit();
             t.scale.clear();
@@ -10511,6 +10544,7 @@ private:
     float *d_gate_mlp_ = nullptr, *d_up_ = nullptr, *d_logits_ = nullptr;
     uint16_t *d_S_ = nullptr, *d_S_bak_ = nullptr;
     float *d_conv_ = nullptr, *d_kcache_ = nullptr, *d_vcache_ = nullptr;
+    float *d_k_bak_ = nullptr, *d_v_bak_ = nullptr;
     float *d_conv_bak_ = nullptr;
     float *d_amax_ = nullptr;
     int *d_tok_ = nullptr, *d_pos_ = nullptr, *d_pos_b_ = nullptr, *d_best_ = nullptr, *d_best_n_ = nullptr,

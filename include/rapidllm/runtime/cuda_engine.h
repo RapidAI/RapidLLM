@@ -29,6 +29,8 @@ public:
         (void)n;
     }
     virtual void copy_logits(float* host) const = 0;
+    // Last token residual after final RMS — same tensor Session::mtp_draft reads.
+    virtual void copy_last_hidden(float* /*host*/) {}
     virtual int32_t greedy() const = 0;
     virtual int pos() const = 0;
     virtual int vocab() const = 0;
