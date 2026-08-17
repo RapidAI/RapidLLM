@@ -1,6 +1,8 @@
 #include "rapidllm/runtime/cuda_engine.h"
 
 #include "rapidllm/ir/model_desc.h"
+#include "rapidllm/kernels/flashinfer_attn.h"
+#include "rapidllm/kernels/gemv_q6_t4.h"
 #include "rapidllm/kernels/ops.h"
 
 #include <cublas_v2.h>
@@ -20,6 +22,7 @@
 #include <cstring>
 #include <stdexcept>
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace rapidllm::cuda_gen {
@@ -33,6 +36,45 @@ namespace {
 
 __device__ __forceinline__ float silu_d(float x) { return x / (1.f + expf(-x)); }
 __device__ __forceinline__ float sigmoid_d(float x) { return 1.f / (1.f + expf(-x)); }
+
+// 0: HF grouped V (src = h / (nv/nk)). 1: llama.cpp tiled V (src = h % nk).
+__constant__ int c_gdn_v_tiled = 0;
+void set_gdn_v_tiled(int v) { CUDA_CHECK(cudaMemcpyToSymbol(c_gdn_v_tiled, &v, sizeof(int))); }
+
+__device__ __forceinline__ int gdn_src_h(int h, int nk, int nv) {
+    return c_gdn_v_tiled ? (h % nk) : (h / (nv / nk));
+}
+
+// One v-head per k-head owns the Q/K conv push (r==0).
+__device__ __forceinline__ bool gdn_qk_conv_owner(int h, int nk, int nv) {
+    return c_gdn_v_tiled ? (h < nk) : ((h % (nv / nk)) == 0);
+}
+
+// hd>=64: official Qwen rotate-half on first `rotary` dims (pair i with i+rotary/2).
+// else: pair-interleaved (tiny fixture contract).
+__device__ __forceinline__ void rope_apply(float* v, int rotary, float pos, float theta, int hd) {
+    const int pairs = rotary / 2;
+    if (pairs <= 0) return;
+    if (hd >= 64) {
+        for (int i = threadIdx.x; i < pairs; i += blockDim.x) {
+            const float freq = 1.f / powf(theta, static_cast<float>(i) / static_cast<float>(pairs));
+            const float ang = pos * freq;
+            const float c = cosf(ang), s = sinf(ang);
+            const float x0 = v[i], x1 = v[i + pairs];
+            v[i] = x0 * c - x1 * s;
+            v[i + pairs] = x0 * s + x1 * c;
+        }
+    } else {
+        for (int i = threadIdx.x; i < pairs; i += blockDim.x) {
+            const float freq = 1.f / powf(theta, static_cast<float>(i) / static_cast<float>(pairs));
+            const float ang = pos * freq;
+            const float c = cosf(ang), s = sinf(ang);
+            const float x0 = v[2 * i], x1 = v[2 * i + 1];
+            v[2 * i] = x0 * c - x1 * s;
+            v[2 * i + 1] = x0 * s + x1 * c;
+        }
+    }
+}
 __device__ __forceinline__ float softplus_d(float x) {
     return log1pf(expf(-fabsf(x))) + fmaxf(x, 0.f);
 }
@@ -294,6 +336,32 @@ __device__ void flash_attn_decode_f16_hd256(const float* qh, const __half* k_cac
     }
 }
 
+// Host-set: RAPIDLLM_NO_FLASH=1 falls back to smem-score / non-FI prefill.
+__device__ int d_use_flash = 1;
+
+bool flash_attn_on() {
+    const char* e = std::getenv("RAPIDLLM_NO_FLASH");
+    return !(e && e[0] == '1');
+}
+
+void set_flash_attn(int on) {
+    CUDA_CHECK(cudaMemcpyToSymbol(d_use_flash, &on, sizeof(on)));
+}
+
+size_t decode_attn_smem(int kctx, int hd, int kv_f16) {
+    if (flash_attn_on() && kv_f16 == 1 && hd == 256)
+        return sizeof(float) * static_cast<size_t>(std::max(hd, 1));
+    return kctx > 8192 ? sizeof(float) * static_cast<size_t>(hd)
+                       : sizeof(float) * (static_cast<size_t>(kctx) + static_cast<size_t>(hd));
+}
+
+bool flash_gqa_ok(int n_q, int n_kv, int hd, int kv_f16) {
+    if (!flash_attn_on() || kv_f16 != 1 || hd != 256 || n_kv <= 0 || n_q <= 0) return false;
+    if (n_q % n_kv != 0) return false;
+    const int g = n_q / n_kv;
+    return g >= 2 && g <= 8;
+}
+
 constexpr int kXsTile = 8192;
 // 32 KiB dynamic smem keeps 2 blocks/SM on Ada. 48 KiB dropped occupancy and lost ~3%.
 constexpr int kFp8XsCap = 8192;
@@ -459,6 +527,75 @@ __global__ void gemv_bf16_2row_k(const uint16_t* W, const float* x, float* y, in
     if (row1 < m) {
         acc1 = warp_sum(acc1);
         if (lane == 0) write_y(y, row1, acc1, add);
+    }
+}
+
+__device__ __forceinline__ float bf16_dot8(uint4 u, const float* x, int j) {
+    return bf16_to_f32(static_cast<uint16_t>(u.x)) * x[j] +
+           bf16_to_f32(static_cast<uint16_t>(u.x >> 16)) * x[j + 1] +
+           bf16_to_f32(static_cast<uint16_t>(u.y)) * x[j + 2] +
+           bf16_to_f32(static_cast<uint16_t>(u.y >> 16)) * x[j + 3] +
+           bf16_to_f32(static_cast<uint16_t>(u.z)) * x[j + 4] +
+           bf16_to_f32(static_cast<uint16_t>(u.z >> 16)) * x[j + 5] +
+           bf16_to_f32(static_cast<uint16_t>(u.w)) * x[j + 6] +
+           bf16_to_f32(static_cast<uint16_t>(u.w >> 16)) * x[j + 7];
+}
+
+// T=2 BF16: one W stream, both X tokens. Beats 2x T=1 GEMV and cublas n=2.
+__global__ void gemv_bf16_t2_k(const uint16_t* W, const float* X, float* Y, int m, int n, int add) {
+    extern __shared__ float xs[];
+    const int warps = blockDim.x / 32;
+    const int pair = blockIdx.x * warps + (threadIdx.x / 32);
+    const int row0 = pair * 2;
+    const int row1 = row0 + 1;
+    const int lane = threadIdx.x & 31;
+    const int tile = kXsTile;
+    float a00 = 0.f, a01 = 0.f, a10 = 0.f, a11 = 0.f;
+    for (int t0 = 0; t0 < n; t0 += tile) {
+        const int tn = n - t0 < tile ? n - t0 : tile;
+        for (int i = threadIdx.x; i < tn; i += blockDim.x) {
+            xs[i] = X[t0 + i];
+            xs[tile + i] = X[n + t0 + i];
+        }
+        __syncthreads();
+        if (row0 < m) {
+            const uint16_t* p0 = W + static_cast<size_t>(row0) * n + t0;
+            const uint16_t* p1 = row1 < m ? W + static_cast<size_t>(row1) * n + t0 : nullptr;
+            int j = lane * 8;
+            for (; j + 7 < tn; j += 256) {
+                const uint4 u0 = __ldcs(reinterpret_cast<const uint4*>(p0 + j));
+                a00 += bf16_dot8(u0, xs, j);
+                a01 += bf16_dot8(u0, xs + tile, j);
+                if (p1) {
+                    const uint4 u1 = __ldcs(reinterpret_cast<const uint4*>(p1 + j));
+                    a10 += bf16_dot8(u1, xs, j);
+                    a11 += bf16_dot8(u1, xs + tile, j);
+                }
+            }
+            for (int r = (tn & ~7) + lane; r < tn; r += 32) {
+                const float w0 = bf16_to_f32(p0[r]);
+                a00 += w0 * xs[r];
+                a01 += w0 * xs[tile + r];
+                if (p1) {
+                    const float w1 = bf16_to_f32(p1[r]);
+                    a10 += w1 * xs[r];
+                    a11 += w1 * xs[tile + r];
+                }
+            }
+        }
+        if (t0 + tile < n) __syncthreads();
+    }
+    if (row0 < m) {
+        a00 = warp_sum(a00);
+        if (lane == 0) write_y(Y, row0, a00, add);
+        a01 = warp_sum(a01);
+        if (lane == 0) write_y(Y + m, row0, a01, add);
+    }
+    if (row1 < m) {
+        a10 = warp_sum(a10);
+        if (lane == 0) write_y(Y, row1, a10, add);
+        a11 = warp_sum(a11);
+        if (lane == 0) write_y(Y + m, row1, a11, add);
     }
 }
 
@@ -664,6 +801,1423 @@ __device__ __forceinline__ float acc_q6k_row(const uint8_t* row, const float* xs
     return acc;
 }
 
+__global__ void quant_x_q8_k(const float* x, int8_t* xq, __half* xsc, int n) {
+    const int blk = blockIdx.x * blockDim.x + threadIdx.x;
+    const int nblk = n >> 5;
+    if (blk >= nblk) return;
+    const float* xb = x + (blk << 5);
+    float amax = 0.f;
+#pragma unroll
+    for (int i = 0; i < 32; ++i) amax = fmaxf(amax, fabsf(xb[i]));
+    const float s = amax * (1.f / 127.f);
+    const float inv = s > 0.f ? 1.f / s : 0.f;
+    xsc[blk] = __float2half(s);
+    int8_t* qb = xq + (blk << 5);
+#pragma unroll
+    for (int i = 0; i < 32; ++i) {
+        int q = __float2int_rn(xb[i] * inv);
+        q = q > 127 ? 127 : (q < -127 ? -127 : q);
+        qb[i] = static_cast<int8_t>(q);
+    }
+}
+
+// T rows of n; xq/xsc laid out [t][n] / [t][n/32].
+__global__ void quant_x_q8_n_k(const float* x, int8_t* xq, __half* xsc, int n, int T) {
+    const int nblk = n >> 5;
+    const int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    const int t = nblk > 0 ? idx / nblk : 0;
+    const int blk = nblk > 0 ? idx - t * nblk : 0;
+    if (t >= T || blk >= nblk) return;
+    const float* xb = x + static_cast<size_t>(t) * n + (blk << 5);
+    float amax = 0.f;
+#pragma unroll
+    for (int i = 0; i < 32; ++i) amax = fmaxf(amax, fabsf(xb[i]));
+    const float s = amax * (1.f / 127.f);
+    const float inv = s > 0.f ? 1.f / s : 0.f;
+    xsc[t * nblk + blk] = __float2half(s);
+    int8_t* qb = xq + static_cast<size_t>(t) * n + (blk << 5);
+#pragma unroll
+    for (int i = 0; i < 32; ++i) {
+        int q = __float2int_rn(xb[i] * inv);
+        q = q > 127 ? 127 : (q < -127 ? -127 : q);
+        qb[i] = static_cast<int8_t>(q);
+    }
+}
+
+// Integer Q4_K × Q8: 4 lanes / 32-wide group, 8 weights / lane, real __dp4a.
+// Same dequant as acc_q4k_soa_row: (ds*q - dm) * (xs*xq).
+__device__ __forceinline__ float acc_q4k_soa_q8(const uint8_t* row, const int8_t* xq, const __half* xsc, int nb,
+                                                int lane) {
+    const int group = lane >> 2;
+    const int sub = lane & 3;
+    const int gpair = group >> 1;
+    const int hi = group & 1;
+    float acc = 0.f;
+    for (int b = 0; b < nb; ++b) {
+        const uint8_t* blk = row + static_cast<size_t>(b) * kQ4KSoaBsz;
+        const __half* ds = reinterpret_cast<const __half*>(blk);
+        const __half* dm = reinterpret_cast<const __half*>(blk + 16);
+        const uint8_t* qs = blk + 32 + gpair * 32 + sub * 8;
+        const int8_t* xb = xq + b * 256 + group * 32 + sub * 8;
+        const uint2 q8 = *reinterpret_cast<const uint2*>(qs);
+        const int q0 = static_cast<int>(hi ? ((q8.x >> 4) & 0x0f0f0f0f) : (q8.x & 0x0f0f0f0f));
+        const int q1 = static_cast<int>(hi ? ((q8.y >> 4) & 0x0f0f0f0f) : (q8.y & 0x0f0f0f0f));
+        const int x0 = *reinterpret_cast<const int*>(xb);
+        const int x1 = *reinterpret_cast<const int*>(xb + 4);
+        int sumi = 0, sumx = 0;
+#if __CUDA_ARCH__ >= 610
+        sumi = __dp4a(q0, x0, 0);
+        sumi = __dp4a(q1, x1, sumi);
+        sumx = __dp4a(0x01010101, x0, 0);
+        sumx = __dp4a(0x01010101, x1, sumx);
+#else
+        const int8_t* qq = reinterpret_cast<const int8_t*>(&q0);
+        const int8_t* xx = reinterpret_cast<const int8_t*>(&x0);
+        for (int k = 0; k < 4; ++k) {
+            sumi += qq[k] * xx[k];
+            sumx += xx[k];
+        }
+        qq = reinterpret_cast<const int8_t*>(&q1);
+        xx = reinterpret_cast<const int8_t*>(&x1);
+        for (int k = 0; k < 4; ++k) {
+            sumi += qq[k] * xx[k];
+            sumx += xx[k];
+        }
+#endif
+        const float xs = __half2float(xsc[b * 8 + group]);
+        acc = fmaf(__half2float(ds[group]) * xs, static_cast<float>(sumi), acc);
+        acc = fmaf(-__half2float(dm[group]) * xs, static_cast<float>(sumx), acc);
+    }
+    return acc;
+}
+
+// One W stream, two Q8 x vectors (T=2).
+__device__ __forceinline__ void acc_q4k_soa_q8_2x(const uint8_t* row, const int8_t* xq0, const __half* sc0,
+                                                  const int8_t* xq1, const __half* sc1, int nb, int lane,
+                                                  float& a0, float& a1) {
+    const int group = lane >> 2;
+    const int sub = lane & 3;
+    const int gpair = group >> 1;
+    const int hi = group & 1;
+#pragma unroll 2
+    for (int b = 0; b < nb; ++b) {
+        const uint8_t* blk = row + static_cast<size_t>(b) * kQ4KSoaBsz;
+        const __half* ds = reinterpret_cast<const __half*>(blk);
+        const __half* dm = reinterpret_cast<const __half*>(blk + 16);
+        const uint8_t* qs = blk + 32 + gpair * 32 + sub * 8;
+        const uint2 q8 = *reinterpret_cast<const uint2*>(qs);
+        const int q0 = static_cast<int>(hi ? ((q8.x >> 4) & 0x0f0f0f0f) : (q8.x & 0x0f0f0f0f));
+        const int q1 = static_cast<int>(hi ? ((q8.y >> 4) & 0x0f0f0f0f) : (q8.y & 0x0f0f0f0f));
+        const float dsg = __half2float(ds[group]);
+        const float dmg = __half2float(dm[group]);
+        const int8_t* xb0 = xq0 + b * 256 + group * 32 + sub * 8;
+        const int8_t* xb1 = xq1 + b * 256 + group * 32 + sub * 8;
+        const int u0 = *reinterpret_cast<const int*>(xb0);
+        const int u1 = *reinterpret_cast<const int*>(xb0 + 4);
+        const int v0 = *reinterpret_cast<const int*>(xb1);
+        const int v1 = *reinterpret_cast<const int*>(xb1 + 4);
+        int s0 = 0, sx0 = 0, s1 = 0, sx1 = 0;
+#if __CUDA_ARCH__ >= 610
+        s0 = __dp4a(q0, u0, 0);
+        s0 = __dp4a(q1, u1, s0);
+        sx0 = __dp4a(0x01010101, u0, 0);
+        sx0 = __dp4a(0x01010101, u1, sx0);
+        s1 = __dp4a(q0, v0, 0);
+        s1 = __dp4a(q1, v1, s1);
+        sx1 = __dp4a(0x01010101, v0, 0);
+        sx1 = __dp4a(0x01010101, v1, sx1);
+#else
+        const int8_t* qq0 = reinterpret_cast<const int8_t*>(&q0);
+        const int8_t* qq1 = reinterpret_cast<const int8_t*>(&q1);
+        const int8_t* uu0 = reinterpret_cast<const int8_t*>(&u0);
+        const int8_t* uu1 = reinterpret_cast<const int8_t*>(&u1);
+        const int8_t* vv0 = reinterpret_cast<const int8_t*>(&v0);
+        const int8_t* vv1 = reinterpret_cast<const int8_t*>(&v1);
+        for (int k = 0; k < 4; ++k) {
+            s0 += qq0[k] * uu0[k];
+            s0 += qq1[k] * uu1[k];
+            sx0 += uu0[k] + uu1[k];
+            s1 += qq0[k] * vv0[k];
+            s1 += qq1[k] * vv1[k];
+            sx1 += vv0[k] + vv1[k];
+        }
+#endif
+        const float xs0 = __half2float(sc0[b * 8 + group]);
+        const float xs1 = __half2float(sc1[b * 8 + group]);
+        a0 = fmaf(dsg * xs0, static_cast<float>(s0), a0);
+        a0 = fmaf(-dmg * xs0, static_cast<float>(sx0), a0);
+        a1 = fmaf(dsg * xs1, static_cast<float>(s1), a1);
+        a1 = fmaf(-dmg * xs1, static_cast<float>(sx1), a1);
+    }
+}
+
+// One W stream, three Q8 x vectors (T=3 spec).
+__device__ __forceinline__ void acc_q4k_soa_q8_3x(const uint8_t* row, const int8_t* xq0, const __half* sc0,
+                                                  const int8_t* xq1, const __half* sc1, const int8_t* xq2,
+                                                  const __half* sc2, int nb, int lane, float& a0, float& a1,
+                                                  float& a2) {
+    const int group = lane >> 2;
+    const int sub = lane & 3;
+    const int gpair = group >> 1;
+    const int hi = group & 1;
+#pragma unroll 2
+    for (int b = 0; b < nb; ++b) {
+        const uint8_t* blk = row + static_cast<size_t>(b) * kQ4KSoaBsz;
+        const __half* ds = reinterpret_cast<const __half*>(blk);
+        const __half* dm = reinterpret_cast<const __half*>(blk + 16);
+        const uint8_t* qs = blk + 32 + gpair * 32 + sub * 8;
+        const uint2 q8 = __ldcs(reinterpret_cast<const uint2*>(qs));
+        const int q0 = static_cast<int>(hi ? ((q8.x >> 4) & 0x0f0f0f0f) : (q8.x & 0x0f0f0f0f));
+        const int q1 = static_cast<int>(hi ? ((q8.y >> 4) & 0x0f0f0f0f) : (q8.y & 0x0f0f0f0f));
+        const float dsg = __half2float(__ldg(ds + group));
+        const float dmg = __half2float(__ldg(dm + group));
+        const int off = b * 256 + group * 32 + sub * 8;
+        const int u0 = *reinterpret_cast<const int*>(xq0 + off);
+        const int u1 = *reinterpret_cast<const int*>(xq0 + off + 4);
+        const int v0 = *reinterpret_cast<const int*>(xq1 + off);
+        const int v1 = *reinterpret_cast<const int*>(xq1 + off + 4);
+        const int w0 = *reinterpret_cast<const int*>(xq2 + off);
+        const int w1 = *reinterpret_cast<const int*>(xq2 + off + 4);
+        int s0 = 0, sx0 = 0, s1 = 0, sx1 = 0, s2 = 0, sx2 = 0;
+#if __CUDA_ARCH__ >= 610
+        s0 = __dp4a(q0, u0, 0);
+        s0 = __dp4a(q1, u1, s0);
+        sx0 = __dp4a(0x01010101, u0, 0);
+        sx0 = __dp4a(0x01010101, u1, sx0);
+        s1 = __dp4a(q0, v0, 0);
+        s1 = __dp4a(q1, v1, s1);
+        sx1 = __dp4a(0x01010101, v0, 0);
+        sx1 = __dp4a(0x01010101, v1, sx1);
+        s2 = __dp4a(q0, w0, 0);
+        s2 = __dp4a(q1, w1, s2);
+        sx2 = __dp4a(0x01010101, w0, 0);
+        sx2 = __dp4a(0x01010101, w1, sx2);
+#else
+        const int8_t* qq0 = reinterpret_cast<const int8_t*>(&q0);
+        const int8_t* qq1 = reinterpret_cast<const int8_t*>(&q1);
+        const int8_t* uu0 = reinterpret_cast<const int8_t*>(&u0);
+        const int8_t* uu1 = reinterpret_cast<const int8_t*>(&u1);
+        const int8_t* vv0 = reinterpret_cast<const int8_t*>(&v0);
+        const int8_t* vv1 = reinterpret_cast<const int8_t*>(&v1);
+        const int8_t* ww0 = reinterpret_cast<const int8_t*>(&w0);
+        const int8_t* ww1 = reinterpret_cast<const int8_t*>(&w1);
+        for (int k = 0; k < 4; ++k) {
+            s0 += qq0[k] * uu0[k];
+            s0 += qq1[k] * uu1[k];
+            sx0 += uu0[k] + uu1[k];
+            s1 += qq0[k] * vv0[k];
+            s1 += qq1[k] * vv1[k];
+            sx1 += vv0[k] + vv1[k];
+            s2 += qq0[k] * ww0[k];
+            s2 += qq1[k] * ww1[k];
+            sx2 += ww0[k] + ww1[k];
+        }
+#endif
+        const float xs0 = __half2float(sc0[b * 8 + group]);
+        const float xs1 = __half2float(sc1[b * 8 + group]);
+        const float xs2 = __half2float(sc2[b * 8 + group]);
+        a0 = fmaf(dsg * xs0, static_cast<float>(s0), a0);
+        a0 = fmaf(-dmg * xs0, static_cast<float>(sx0), a0);
+        a1 = fmaf(dsg * xs1, static_cast<float>(s1), a1);
+        a1 = fmaf(-dmg * xs1, static_cast<float>(sx1), a1);
+        a2 = fmaf(dsg * xs2, static_cast<float>(s2), a2);
+        a2 = fmaf(-dmg * xs2, static_cast<float>(sx2), a2);
+    }
+}
+
+// One W stream, four Q8 x vectors (T=4 spec).
+__device__ __forceinline__ void acc_q4k_soa_q8_4x(const uint8_t* row, const int8_t* xq0, const __half* sc0,
+                                                  const int8_t* xq1, const __half* sc1, const int8_t* xq2,
+                                                  const __half* sc2, const int8_t* xq3, const __half* sc3, int nb,
+                                                  int lane, float& a0, float& a1, float& a2, float& a3) {
+    const int group = lane >> 2;
+    const int sub = lane & 3;
+    const int gpair = group >> 1;
+    const int hi = group & 1;
+#pragma unroll 2
+    for (int b = 0; b < nb; ++b) {
+        const uint8_t* blk = row + static_cast<size_t>(b) * kQ4KSoaBsz;
+        const __half* ds = reinterpret_cast<const __half*>(blk);
+        const __half* dm = reinterpret_cast<const __half*>(blk + 16);
+        const uint8_t* qs = blk + 32 + gpair * 32 + sub * 8;
+        const uint2 q8 = __ldcs(reinterpret_cast<const uint2*>(qs));
+        const int q0 = static_cast<int>(hi ? ((q8.x >> 4) & 0x0f0f0f0f) : (q8.x & 0x0f0f0f0f));
+        const int q1 = static_cast<int>(hi ? ((q8.y >> 4) & 0x0f0f0f0f) : (q8.y & 0x0f0f0f0f));
+        const float dsg = __half2float(__ldg(ds + group));
+        const float dmg = __half2float(__ldg(dm + group));
+        const int off = b * 256 + group * 32 + sub * 8;
+        const int u0 = *reinterpret_cast<const int*>(xq0 + off);
+        const int u1 = *reinterpret_cast<const int*>(xq0 + off + 4);
+        const int v0 = *reinterpret_cast<const int*>(xq1 + off);
+        const int v1 = *reinterpret_cast<const int*>(xq1 + off + 4);
+        const int w0i = *reinterpret_cast<const int*>(xq2 + off);
+        const int w1i = *reinterpret_cast<const int*>(xq2 + off + 4);
+        const int z0 = *reinterpret_cast<const int*>(xq3 + off);
+        const int z1 = *reinterpret_cast<const int*>(xq3 + off + 4);
+        int s0 = 0, sx0 = 0, s1 = 0, sx1 = 0, s2 = 0, sx2 = 0, s3 = 0, sx3 = 0;
+#if __CUDA_ARCH__ >= 610
+        s0 = __dp4a(q0, u0, 0);
+        s0 = __dp4a(q1, u1, s0);
+        sx0 = __dp4a(0x01010101, u0, 0);
+        sx0 = __dp4a(0x01010101, u1, sx0);
+        s1 = __dp4a(q0, v0, 0);
+        s1 = __dp4a(q1, v1, s1);
+        sx1 = __dp4a(0x01010101, v0, 0);
+        sx1 = __dp4a(0x01010101, v1, sx1);
+        s2 = __dp4a(q0, w0i, 0);
+        s2 = __dp4a(q1, w1i, s2);
+        sx2 = __dp4a(0x01010101, w0i, 0);
+        sx2 = __dp4a(0x01010101, w1i, sx2);
+        s3 = __dp4a(q0, z0, 0);
+        s3 = __dp4a(q1, z1, s3);
+        sx3 = __dp4a(0x01010101, z0, 0);
+        sx3 = __dp4a(0x01010101, z1, sx3);
+#else
+        const int8_t* qq0 = reinterpret_cast<const int8_t*>(&q0);
+        const int8_t* qq1 = reinterpret_cast<const int8_t*>(&q1);
+        const int8_t* uu0 = reinterpret_cast<const int8_t*>(&u0);
+        const int8_t* uu1 = reinterpret_cast<const int8_t*>(&u1);
+        const int8_t* vv0 = reinterpret_cast<const int8_t*>(&v0);
+        const int8_t* vv1 = reinterpret_cast<const int8_t*>(&v1);
+        const int8_t* ww0 = reinterpret_cast<const int8_t*>(&w0i);
+        const int8_t* ww1 = reinterpret_cast<const int8_t*>(&w1i);
+        const int8_t* zz0 = reinterpret_cast<const int8_t*>(&z0);
+        const int8_t* zz1 = reinterpret_cast<const int8_t*>(&z1);
+        for (int k = 0; k < 4; ++k) {
+            s0 += qq0[k] * uu0[k] + qq1[k] * uu1[k];
+            sx0 += uu0[k] + uu1[k];
+            s1 += qq0[k] * vv0[k] + qq1[k] * vv1[k];
+            sx1 += vv0[k] + vv1[k];
+            s2 += qq0[k] * ww0[k] + qq1[k] * ww1[k];
+            sx2 += ww0[k] + ww1[k];
+            s3 += qq0[k] * zz0[k] + qq1[k] * zz1[k];
+            sx3 += zz0[k] + zz1[k];
+        }
+#endif
+        const float xs0 = __half2float(sc0[b * 8 + group]);
+        const float xs1 = __half2float(sc1[b * 8 + group]);
+        const float xs2 = __half2float(sc2[b * 8 + group]);
+        const float xs3 = __half2float(sc3[b * 8 + group]);
+        a0 = fmaf(dsg * xs0, static_cast<float>(s0), a0);
+        a0 = fmaf(-dmg * xs0, static_cast<float>(sx0), a0);
+        a1 = fmaf(dsg * xs1, static_cast<float>(s1), a1);
+        a1 = fmaf(-dmg * xs1, static_cast<float>(sx1), a1);
+        a2 = fmaf(dsg * xs2, static_cast<float>(s2), a2);
+        a2 = fmaf(-dmg * xs2, static_cast<float>(sx2), a2);
+        a3 = fmaf(dsg * xs3, static_cast<float>(s3), a3);
+        a3 = fmaf(-dmg * xs3, static_cast<float>(sx3), a3);
+    }
+}
+
+// Q6_K × Q8: 16 groups of 16, 2 lanes/group, 8 weights/lane, __dp4a.
+// Matches acc_q6k_soa_row dequant (q-32)*ds.
+__device__ __forceinline__ void q6k_pack8(const uint8_t* ql, const uint8_t* qh, int qkind, int idx, int* q0,
+                                          int* q1) {
+    int8_t v[8];
+#pragma unroll
+    for (int i = 0; i < 8; ++i) {
+        const int qi = idx + i;
+        int t;
+        if (qkind == 0)
+            t = (ql[qi] & 0xF) | ((qh[qi] & 3) << 4);
+        else if (qkind == 1)
+            t = (ql[32 + qi] & 0xF) | (((qh[qi] >> 2) & 3) << 4);
+        else if (qkind == 2)
+            t = (ql[qi] >> 4) | (((qh[qi] >> 4) & 3) << 4);
+        else
+            t = (ql[32 + qi] >> 4) | (((qh[qi] >> 6) & 3) << 4);
+        v[i] = static_cast<int8_t>(t - 32);
+    }
+    *q0 = *reinterpret_cast<int*>(v);
+    *q1 = *reinterpret_cast<int*>(v + 4);
+}
+
+__device__ __forceinline__ float acc_q6k_soa_q8(const uint8_t* row, const int8_t* xq, const __half* xsc, int nb,
+                                                int lane) {
+    const int group = lane >> 1;
+    const int sub = lane & 1;
+    const int n128 = group >> 3;
+    const int g8 = group & 7;
+    const int qkind = g8 >> 1;
+    const int idx = (g8 & 1) * 16 + sub * 8;
+    const int xoff = group * 16 + sub * 8;
+    float acc = 0.f;
+    for (int b = 0; b < nb; ++b) {
+        const uint8_t* blk = row + static_cast<size_t>(b) * kQ6KSoaBsz;
+        const __half* ds = reinterpret_cast<const __half*>(blk);
+        const uint8_t* ql = blk + 32 + n128 * 64;
+        const uint8_t* qh = blk + 160 + n128 * 32;
+        int q0, q1;
+        q6k_pack8(ql, qh, qkind, idx, &q0, &q1);
+        const int8_t* xb = xq + b * 256 + xoff;
+        const int u0 = *reinterpret_cast<const int*>(xb);
+        const int u1 = *reinterpret_cast<const int*>(xb + 4);
+        int sumi = 0;
+#if __CUDA_ARCH__ >= 610
+        sumi = __dp4a(q0, u0, 0);
+        sumi = __dp4a(q1, u1, sumi);
+#else
+        const int8_t* qq0 = reinterpret_cast<const int8_t*>(&q0);
+        const int8_t* qq1 = reinterpret_cast<const int8_t*>(&q1);
+        const int8_t* xx0 = reinterpret_cast<const int8_t*>(&u0);
+        const int8_t* xx1 = reinterpret_cast<const int8_t*>(&u1);
+        for (int k = 0; k < 4; ++k) sumi += qq0[k] * xx0[k] + qq1[k] * xx1[k];
+#endif
+        const float xs = __half2float(xsc[b * 8 + (xoff >> 5)]);
+        acc = fmaf(__half2float(ds[group]) * xs, static_cast<float>(sumi), acc);
+    }
+    return acc;
+}
+
+__device__ __forceinline__ void acc_q6k_soa_q8_2x(const uint8_t* row, const int8_t* xq0, const __half* sc0,
+                                                  const int8_t* xq1, const __half* sc1, int nb, int lane,
+                                                  float& a0, float& a1) {
+    const int group = lane >> 1;
+    const int sub = lane & 1;
+    const int n128 = group >> 3;
+    const int g8 = group & 7;
+    const int qkind = g8 >> 1;
+    const int idx = (g8 & 1) * 16 + sub * 8;
+    const int xoff = group * 16 + sub * 8;
+    for (int b = 0; b < nb; ++b) {
+        const uint8_t* blk = row + static_cast<size_t>(b) * kQ6KSoaBsz;
+        const __half* ds = reinterpret_cast<const __half*>(blk);
+        const uint8_t* ql = blk + 32 + n128 * 64;
+        const uint8_t* qh = blk + 160 + n128 * 32;
+        int q0, q1;
+        q6k_pack8(ql, qh, qkind, idx, &q0, &q1);
+        const float dsg = __half2float(ds[group]);
+        const int8_t* xb0 = xq0 + b * 256 + xoff;
+        const int8_t* xb1 = xq1 + b * 256 + xoff;
+        const int u0 = *reinterpret_cast<const int*>(xb0);
+        const int u1 = *reinterpret_cast<const int*>(xb0 + 4);
+        const int v0 = *reinterpret_cast<const int*>(xb1);
+        const int v1 = *reinterpret_cast<const int*>(xb1 + 4);
+        int s0 = 0, s1 = 0;
+#if __CUDA_ARCH__ >= 610
+        s0 = __dp4a(q0, u0, 0);
+        s0 = __dp4a(q1, u1, s0);
+        s1 = __dp4a(q0, v0, 0);
+        s1 = __dp4a(q1, v1, s1);
+#else
+        const int8_t* qq0 = reinterpret_cast<const int8_t*>(&q0);
+        const int8_t* qq1 = reinterpret_cast<const int8_t*>(&q1);
+        const int8_t* uu0 = reinterpret_cast<const int8_t*>(&u0);
+        const int8_t* uu1 = reinterpret_cast<const int8_t*>(&u1);
+        const int8_t* vv0 = reinterpret_cast<const int8_t*>(&v0);
+        const int8_t* vv1 = reinterpret_cast<const int8_t*>(&v1);
+        for (int k = 0; k < 4; ++k) {
+            s0 += qq0[k] * uu0[k] + qq1[k] * uu1[k];
+            s1 += qq0[k] * vv0[k] + qq1[k] * vv1[k];
+        }
+#endif
+        const float xs0 = __half2float(sc0[b * 8 + (xoff >> 5)]);
+        const float xs1 = __half2float(sc1[b * 8 + (xoff >> 5)]);
+        a0 = fmaf(dsg * xs0, static_cast<float>(s0), a0);
+        a1 = fmaf(dsg * xs1, static_cast<float>(s1), a1);
+    }
+}
+
+__device__ __forceinline__ void acc_q6k_soa_q8_3x(const uint8_t* row, const int8_t* xq0, const __half* sc0,
+                                                  const int8_t* xq1, const __half* sc1, const int8_t* xq2,
+                                                  const __half* sc2, int nb, int lane, float& a0, float& a1,
+                                                  float& a2) {
+    const int group = lane >> 1;
+    const int sub = lane & 1;
+    const int n128 = group >> 3;
+    const int g8 = group & 7;
+    const int qkind = g8 >> 1;
+    const int idx = (g8 & 1) * 16 + sub * 8;
+    const int xoff = group * 16 + sub * 8;
+    for (int b = 0; b < nb; ++b) {
+        const uint8_t* blk = row + static_cast<size_t>(b) * kQ6KSoaBsz;
+        const __half* ds = reinterpret_cast<const __half*>(blk);
+        const uint8_t* ql = blk + 32 + n128 * 64;
+        const uint8_t* qh = blk + 160 + n128 * 32;
+        int q0, q1;
+        q6k_pack8(ql, qh, qkind, idx, &q0, &q1);
+        const float dsg = __half2float(__ldg(ds + group));
+        const int off = b * 256 + xoff;
+        const int u0 = *reinterpret_cast<const int*>(xq0 + off);
+        const int u1 = *reinterpret_cast<const int*>(xq0 + off + 4);
+        const int v0 = *reinterpret_cast<const int*>(xq1 + off);
+        const int v1 = *reinterpret_cast<const int*>(xq1 + off + 4);
+        const int w0 = *reinterpret_cast<const int*>(xq2 + off);
+        const int w1 = *reinterpret_cast<const int*>(xq2 + off + 4);
+        int s0 = 0, s1 = 0, s2 = 0;
+#if __CUDA_ARCH__ >= 610
+        s0 = __dp4a(q0, u0, 0);
+        s0 = __dp4a(q1, u1, s0);
+        s1 = __dp4a(q0, v0, 0);
+        s1 = __dp4a(q1, v1, s1);
+        s2 = __dp4a(q0, w0, 0);
+        s2 = __dp4a(q1, w1, s2);
+#else
+        const int8_t* qq0 = reinterpret_cast<const int8_t*>(&q0);
+        const int8_t* qq1 = reinterpret_cast<const int8_t*>(&q1);
+        const int8_t* uu0 = reinterpret_cast<const int8_t*>(&u0);
+        const int8_t* uu1 = reinterpret_cast<const int8_t*>(&u1);
+        const int8_t* vv0 = reinterpret_cast<const int8_t*>(&v0);
+        const int8_t* vv1 = reinterpret_cast<const int8_t*>(&v1);
+        const int8_t* ww0 = reinterpret_cast<const int8_t*>(&w0);
+        const int8_t* ww1 = reinterpret_cast<const int8_t*>(&w1);
+        for (int k = 0; k < 4; ++k) {
+            s0 += qq0[k] * uu0[k] + qq1[k] * uu1[k];
+            s1 += qq0[k] * vv0[k] + qq1[k] * vv1[k];
+            s2 += qq0[k] * ww0[k] + qq1[k] * ww1[k];
+        }
+#endif
+        const float xs0 = __half2float(sc0[b * 8 + (xoff >> 5)]);
+        const float xs1 = __half2float(sc1[b * 8 + (xoff >> 5)]);
+        const float xs2 = __half2float(sc2[b * 8 + (xoff >> 5)]);
+        a0 = fmaf(dsg * xs0, static_cast<float>(s0), a0);
+        a1 = fmaf(dsg * xs1, static_cast<float>(s1), a1);
+        a2 = fmaf(dsg * xs2, static_cast<float>(s2), a2);
+    }
+}
+
+__global__ void gemv_q6k_soa_q8_2row_k(const uint8_t* W, const int8_t* xq, const __half* xsc, float* y, int m, int n,
+                                       int add) {
+    const int warps = blockDim.x / 32;
+    const int pair = blockIdx.x * warps + (threadIdx.x / 32);
+    const int row0 = pair * 2;
+    const int row1 = row0 + 1;
+    const int lane = threadIdx.x & 31;
+    const int nb = n / 256;
+    float acc0 = 0.f, acc1 = 0.f;
+    if (row0 < m && nb > 0) {
+        const uint8_t* r0 = W + static_cast<size_t>(row0) * static_cast<size_t>(nb) * kQ6KSoaBsz;
+        acc0 = acc_q6k_soa_q8(r0, xq, xsc, nb, lane);
+        if (row1 < m) {
+            const uint8_t* r1 = W + static_cast<size_t>(row1) * static_cast<size_t>(nb) * kQ6KSoaBsz;
+            acc1 = acc_q6k_soa_q8(r1, xq, xsc, nb, lane);
+        }
+    }
+    if (row0 < m) {
+        acc0 = warp_sum(acc0);
+        if (lane == 0) write_y(y, row0, acc0, add);
+    }
+    if (row1 < m) {
+        acc1 = warp_sum(acc1);
+        if (lane == 0) write_y(y, row1, acc1, add);
+    }
+}
+
+__global__ void gemv_q6k_soa_q8_t2_2row_k(const uint8_t* W, const int8_t* xq, const __half* xsc, float* Y, int m,
+                                          int n, int add) {
+    const int warps = blockDim.x / 32;
+    const int pair = blockIdx.x * warps + (threadIdx.x / 32);
+    const int row0 = pair * 2;
+    const int row1 = row0 + 1;
+    const int lane = threadIdx.x & 31;
+    const int nb = n / 256;
+    const int8_t* xq0 = xq;
+    const int8_t* xq1 = xq + n;
+    const __half* sc0 = xsc;
+    const __half* sc1 = xsc + (n >> 5);
+    float a00 = 0.f, a01 = 0.f, a10 = 0.f, a11 = 0.f;
+    if (row0 < m && nb > 0) {
+        const uint8_t* r0 = W + static_cast<size_t>(row0) * static_cast<size_t>(nb) * kQ6KSoaBsz;
+        acc_q6k_soa_q8_2x(r0, xq0, sc0, xq1, sc1, nb, lane, a00, a01);
+        if (row1 < m) {
+            const uint8_t* r1 = W + static_cast<size_t>(row1) * static_cast<size_t>(nb) * kQ6KSoaBsz;
+            acc_q6k_soa_q8_2x(r1, xq0, sc0, xq1, sc1, nb, lane, a10, a11);
+        }
+    }
+    if (row0 < m) {
+        a00 = warp_sum(a00);
+        a01 = warp_sum(a01);
+        if (lane == 0) {
+            write_y(Y, row0, a00, add);
+            write_y(Y + m, row0, a01, add);
+        }
+    }
+    if (row1 < m) {
+        a10 = warp_sum(a10);
+        a11 = warp_sum(a11);
+        if (lane == 0) {
+            write_y(Y, row1, a10, add);
+            write_y(Y + m, row1, a11, add);
+        }
+    }
+}
+
+__global__ void __launch_bounds__(256, 2) gemv_q6k_soa_q8_t3_2row_k(const uint8_t* W, const int8_t* xq,
+                                                                    const __half* xsc, float* Y, int m, int n,
+                                                                    int add) {
+    const int warps = blockDim.x / 32;
+    const int pair = blockIdx.x * warps + (threadIdx.x / 32);
+    const int row0 = pair * 2;
+    const int row1 = row0 + 1;
+    const int lane = threadIdx.x & 31;
+    const int nb = n / 256;
+    const int nsc = n >> 5;
+    const int8_t* xq0 = xq;
+    const int8_t* xq1 = xq + n;
+    const int8_t* xq2 = xq + 2 * n;
+    const __half* sc0 = xsc;
+    const __half* sc1 = xsc + nsc;
+    const __half* sc2 = xsc + 2 * nsc;
+    float a00 = 0.f, a01 = 0.f, a02 = 0.f, a10 = 0.f, a11 = 0.f, a12 = 0.f;
+    if (row0 < m && nb > 0) {
+        const uint8_t* r0 = W + static_cast<size_t>(row0) * static_cast<size_t>(nb) * kQ6KSoaBsz;
+        acc_q6k_soa_q8_3x(r0, xq0, sc0, xq1, sc1, xq2, sc2, nb, lane, a00, a01, a02);
+        if (row1 < m) {
+            const uint8_t* r1 = W + static_cast<size_t>(row1) * static_cast<size_t>(nb) * kQ6KSoaBsz;
+            acc_q6k_soa_q8_3x(r1, xq0, sc0, xq1, sc1, xq2, sc2, nb, lane, a10, a11, a12);
+        }
+    }
+    if (row0 < m) {
+        a00 = warp_sum(a00);
+        a01 = warp_sum(a01);
+        a02 = warp_sum(a02);
+        if (lane == 0) {
+            write_y(Y, row0, a00, add);
+            write_y(Y + m, row0, a01, add);
+            write_y(Y + 2 * m, row0, a02, add);
+        }
+    }
+    if (row1 < m) {
+        a10 = warp_sum(a10);
+        a11 = warp_sum(a11);
+        a12 = warp_sum(a12);
+        if (lane == 0) {
+            write_y(Y, row1, a10, add);
+            write_y(Y + m, row1, a11, add);
+            write_y(Y + 2 * m, row1, a12, add);
+        }
+    }
+}
+
+__global__ void gemv_q4k_soa_q8_2row_k(const uint8_t* W, const int8_t* xq, const __half* xsc, float* y, int m, int n,
+                                       int add) {
+    const int warps = blockDim.x / 32;
+    const int pair = blockIdx.x * warps + (threadIdx.x / 32);
+    const int row0 = pair * 2;
+    const int row1 = row0 + 1;
+    const int lane = threadIdx.x & 31;
+    const int nb = n / 256;
+    float acc0 = 0.f, acc1 = 0.f;
+    if (row0 < m && nb > 0) {
+        const uint8_t* r0 = W + static_cast<size_t>(row0) * static_cast<size_t>(nb) * kQ4KSoaBsz;
+        acc0 = acc_q4k_soa_q8(r0, xq, xsc, nb, lane);
+        if (row1 < m) {
+            const uint8_t* r1 = W + static_cast<size_t>(row1) * static_cast<size_t>(nb) * kQ4KSoaBsz;
+            acc1 = acc_q4k_soa_q8(r1, xq, xsc, nb, lane);
+        }
+    }
+    if (row0 < m) {
+        acc0 = warp_sum(acc0);
+        if (lane == 0) write_y(y, row0, acc0, add);
+    }
+    if (row1 < m) {
+        acc1 = warp_sum(acc1);
+        if (lane == 0) write_y(y, row1, acc1, add);
+    }
+}
+
+// T=2 spec verify: one W read, two Q8 x vectors, two rows / warp. No float-x smem.
+__global__ void gemv_q4k_soa_q8_t2_2row_k(const uint8_t* W, const int8_t* xq, const __half* xsc, float* Y, int m,
+                                          int n, int add) {
+    const int warps = blockDim.x / 32;
+    const int pair = blockIdx.x * warps + (threadIdx.x / 32);
+    const int row0 = pair * 2;
+    const int row1 = row0 + 1;
+    const int lane = threadIdx.x & 31;
+    const int nb = n / 256;
+    const int8_t* xq0 = xq;
+    const int8_t* xq1 = xq + n;
+    const __half* sc0 = xsc;
+    const __half* sc1 = xsc + (n >> 5);
+    float a00 = 0.f, a01 = 0.f, a10 = 0.f, a11 = 0.f;
+    if (row0 < m && nb > 0) {
+        const uint8_t* r0 = W + static_cast<size_t>(row0) * static_cast<size_t>(nb) * kQ4KSoaBsz;
+        acc_q4k_soa_q8_2x(r0, xq0, sc0, xq1, sc1, nb, lane, a00, a01);
+        if (row1 < m) {
+            const uint8_t* r1 = W + static_cast<size_t>(row1) * static_cast<size_t>(nb) * kQ4KSoaBsz;
+            acc_q4k_soa_q8_2x(r1, xq0, sc0, xq1, sc1, nb, lane, a10, a11);
+        }
+    }
+    if (row0 < m) {
+        a00 = warp_sum(a00);
+        a01 = warp_sum(a01);
+        if (lane == 0) {
+            write_y(Y, row0, a00, add);
+            write_y(Y + m, row0, a01, add);
+        }
+    }
+    if (row1 < m) {
+        a10 = warp_sum(a10);
+        a11 = warp_sum(a11);
+        if (lane == 0) {
+            write_y(Y, row1, a10, add);
+            write_y(Y + m, row1, a11, add);
+        }
+    }
+}
+
+// T=3 spec: one W read, three Q8 x, two rows / warp.
+__global__ void __launch_bounds__(256, 2) gemv_q4k_soa_q8_t3_2row_k(const uint8_t* W, const int8_t* xq,
+                                                                    const __half* xsc, float* Y, int m,
+                                          int n, int add) {
+    const int warps = blockDim.x / 32;
+    const int pair = blockIdx.x * warps + (threadIdx.x / 32);
+    const int row0 = pair * 2;
+    const int row1 = row0 + 1;
+    const int lane = threadIdx.x & 31;
+    const int nb = n / 256;
+    const int nsc = n >> 5;
+    const int8_t* xq0 = xq;
+    const int8_t* xq1 = xq + n;
+    const int8_t* xq2 = xq + 2 * n;
+    const __half* sc0 = xsc;
+    const __half* sc1 = xsc + nsc;
+    const __half* sc2 = xsc + 2 * nsc;
+    float a00 = 0.f, a01 = 0.f, a02 = 0.f, a10 = 0.f, a11 = 0.f, a12 = 0.f;
+    if (row0 < m && nb > 0) {
+        const uint8_t* r0 = W + static_cast<size_t>(row0) * static_cast<size_t>(nb) * kQ4KSoaBsz;
+        const uint8_t* r1 = (row1 < m) ? (W + static_cast<size_t>(row1) * static_cast<size_t>(nb) * kQ4KSoaBsz)
+                                       : nullptr;
+        // One block of each row in flight — better HBM overlap than two full-row passes.
+        for (int b0 = 0; b0 < nb; ++b0) {
+            acc_q4k_soa_q8_3x(r0 + static_cast<size_t>(b0) * kQ4KSoaBsz, xq0 + b0 * 256, sc0 + b0 * 8,
+                              xq1 + b0 * 256, sc1 + b0 * 8, xq2 + b0 * 256, sc2 + b0 * 8, 1, lane, a00, a01,
+                              a02);
+            if (r1)
+                acc_q4k_soa_q8_3x(r1 + static_cast<size_t>(b0) * kQ4KSoaBsz, xq0 + b0 * 256, sc0 + b0 * 8,
+                                  xq1 + b0 * 256, sc1 + b0 * 8, xq2 + b0 * 256, sc2 + b0 * 8, 1, lane, a10,
+                                  a11, a12);
+        }
+    }
+    if (row0 < m) {
+        a00 = warp_sum(a00);
+        a01 = warp_sum(a01);
+        a02 = warp_sum(a02);
+        if (lane == 0) {
+            write_y(Y, row0, a00, add);
+            write_y(Y + m, row0, a01, add);
+            write_y(Y + 2 * m, row0, a02, add);
+        }
+    }
+    if (row1 < m) {
+        a10 = warp_sum(a10);
+        a11 = warp_sum(a11);
+        a12 = warp_sum(a12);
+        if (lane == 0) {
+            write_y(Y, row1, a10, add);
+            write_y(Y + m, row1, a11, add);
+            write_y(Y + 2 * m, row1, a12, add);
+        }
+    }
+}
+
+// wg+wu T=3: one x, two Q4 W streams, optional SwiGLU.
+__global__ void __launch_bounds__(256, 2) gemv_q4k_soa_q8_t3_dual_k(const uint8_t* W1, const uint8_t* W2,
+                                                                    const int8_t* xq, const __half* xsc, float* Y1,
+                                                                    float* Y2, int m, int n, int fuse_swiglu) {
+    const int warps = blockDim.x / 32;
+    const int pair = blockIdx.x * warps + (threadIdx.x / 32);
+    const int row0 = pair * 2;
+    const int row1 = row0 + 1;
+    const int lane = threadIdx.x & 31;
+    const int nb = n / 256;
+    const int nsc = n >> 5;
+    const int8_t* xq0 = xq;
+    const int8_t* xq1 = xq + n;
+    const int8_t* xq2 = xq + 2 * n;
+    const __half* sc0 = xsc;
+    const __half* sc1 = xsc + nsc;
+    const __half* sc2 = xsc + 2 * nsc;
+    float a00 = 0.f, a01 = 0.f, a02 = 0.f, b00 = 0.f, b01 = 0.f, b02 = 0.f;
+    float a10 = 0.f, a11 = 0.f, a12 = 0.f, b10 = 0.f, b11 = 0.f, b12 = 0.f;
+    if (row0 < m && nb > 0) {
+        const uint8_t* r0 = W1 + static_cast<size_t>(row0) * static_cast<size_t>(nb) * kQ4KSoaBsz;
+        const uint8_t* s0 = W2 + static_cast<size_t>(row0) * static_cast<size_t>(nb) * kQ4KSoaBsz;
+        const uint8_t* r1 = (row1 < m) ? (W1 + static_cast<size_t>(row1) * static_cast<size_t>(nb) * kQ4KSoaBsz)
+                                       : nullptr;
+        const uint8_t* s1 = (row1 < m) ? (W2 + static_cast<size_t>(row1) * static_cast<size_t>(nb) * kQ4KSoaBsz)
+                                       : nullptr;
+        for (int b0 = 0; b0 < nb; ++b0) {
+            acc_q4k_soa_q8_3x(r0 + static_cast<size_t>(b0) * kQ4KSoaBsz, xq0 + b0 * 256, sc0 + b0 * 8,
+                              xq1 + b0 * 256, sc1 + b0 * 8, xq2 + b0 * 256, sc2 + b0 * 8, 1, lane, a00, a01,
+                              a02);
+            acc_q4k_soa_q8_3x(s0 + static_cast<size_t>(b0) * kQ4KSoaBsz, xq0 + b0 * 256, sc0 + b0 * 8,
+                              xq1 + b0 * 256, sc1 + b0 * 8, xq2 + b0 * 256, sc2 + b0 * 8, 1, lane, b00, b01,
+                              b02);
+            if (r1)
+                acc_q4k_soa_q8_3x(r1 + static_cast<size_t>(b0) * kQ4KSoaBsz, xq0 + b0 * 256, sc0 + b0 * 8,
+                                  xq1 + b0 * 256, sc1 + b0 * 8, xq2 + b0 * 256, sc2 + b0 * 8, 1, lane, a10,
+                                  a11, a12);
+            if (s1)
+                acc_q4k_soa_q8_3x(s1 + static_cast<size_t>(b0) * kQ4KSoaBsz, xq0 + b0 * 256, sc0 + b0 * 8,
+                                  xq1 + b0 * 256, sc1 + b0 * 8, xq2 + b0 * 256, sc2 + b0 * 8, 1, lane, b10,
+                                  b11, b12);
+        }
+    }
+    auto emit = [&](float g, float u, float* yg, float* yu, int row) {
+        g = warp_sum(g);
+        u = warp_sum(u);
+        if (lane != 0) return;
+        if (fuse_swiglu) write_y(yg, row, silu_d(g) * u, 0);
+        else {
+            write_y(yg, row, g, 0);
+            if (yu) write_y(yu, row, u, 0);
+        }
+    };
+    if (row0 < m) {
+        emit(a00, b00, Y1, Y2, row0);
+        emit(a01, b01, Y1 + m, Y2 ? Y2 + m : nullptr, row0);
+        emit(a02, b02, Y1 + 2 * m, Y2 ? Y2 + 2 * m : nullptr, row0);
+    }
+    if (row1 < m) {
+        emit(a10, b10, Y1, Y2, row1);
+        emit(a11, b11, Y1 + m, Y2 ? Y2 + m : nullptr, row1);
+        emit(a12, b12, Y1 + 2 * m, Y2 ? Y2 + 2 * m : nullptr, row1);
+    }
+}
+
+// T=4 spec: one W read, four Q8 x, two rows / warp.
+__global__ void __launch_bounds__(256, 2) gemv_q4k_soa_q8_t4_2row_k(const uint8_t* W, const int8_t* xq,
+                                                                    const __half* xsc, float* Y, int m, int n,
+                                                                    int add) {
+    const int warps = blockDim.x / 32;
+    const int pair = blockIdx.x * warps + (threadIdx.x / 32);
+    const int row0 = pair * 2;
+    const int row1 = row0 + 1;
+    const int lane = threadIdx.x & 31;
+    const int nb = n / 256;
+    const int nsc = n >> 5;
+    const int8_t* xq0 = xq;
+    const int8_t* xq1 = xq + n;
+    const int8_t* xq2 = xq + 2 * n;
+    const int8_t* xq3 = xq + 3 * n;
+    const __half* sc0 = xsc;
+    const __half* sc1 = xsc + nsc;
+    const __half* sc2 = xsc + 2 * nsc;
+    const __half* sc3 = xsc + 3 * nsc;
+    float a00 = 0.f, a01 = 0.f, a02 = 0.f, a03 = 0.f, a10 = 0.f, a11 = 0.f, a12 = 0.f, a13 = 0.f;
+    if (row0 < m && nb > 0) {
+        const uint8_t* r0 = W + static_cast<size_t>(row0) * static_cast<size_t>(nb) * kQ4KSoaBsz;
+        acc_q4k_soa_q8_4x(r0, xq0, sc0, xq1, sc1, xq2, sc2, xq3, sc3, nb, lane, a00, a01, a02, a03);
+        if (row1 < m) {
+            const uint8_t* r1 = W + static_cast<size_t>(row1) * static_cast<size_t>(nb) * kQ4KSoaBsz;
+            acc_q4k_soa_q8_4x(r1, xq0, sc0, xq1, sc1, xq2, sc2, xq3, sc3, nb, lane, a10, a11, a12, a13);
+        }
+    }
+    if (row0 < m) {
+        a00 = warp_sum(a00);
+        a01 = warp_sum(a01);
+        a02 = warp_sum(a02);
+        a03 = warp_sum(a03);
+        if (lane == 0) {
+            write_y(Y, row0, a00, add);
+            write_y(Y + m, row0, a01, add);
+            write_y(Y + 2 * m, row0, a02, add);
+            write_y(Y + 3 * m, row0, a03, add);
+        }
+    }
+    if (row1 < m) {
+        a10 = warp_sum(a10);
+        a11 = warp_sum(a11);
+        a12 = warp_sum(a12);
+        a13 = warp_sum(a13);
+        if (lane == 0) {
+            write_y(Y, row1, a10, add);
+            write_y(Y + m, row1, a11, add);
+            write_y(Y + 2 * m, row1, a12, add);
+            write_y(Y + 3 * m, row1, a13, add);
+        }
+    }
+}
+
+// T=2, 4 rows / warp: x loaded once per Q4 block, 4 W rows. 256 thr / 3 blocks/SM.
+__global__ void __launch_bounds__(256, 3) gemv_q4k_soa_q8_t2_4row_k(const uint8_t* W, const int8_t* xq,
+                                                                    const __half* xsc, float* Y, int m, int n,
+                                                                    int add) {
+    const int warps = blockDim.x / 32;
+    const int pack = blockIdx.x * warps + (threadIdx.x / 32);
+    const int row0 = pack * 4;
+    const int lane = threadIdx.x & 31;
+    const int nb = n / 256;
+    if (row0 >= m || nb <= 0) return;
+    const int group = lane >> 2;
+    const int sub = lane & 3;
+    const int gpair = group >> 1;
+    const int hi = group & 1;
+    const int8_t* xq0 = xq;
+    const int8_t* xq1 = xq + n;
+    const __half* sc0 = xsc;
+    const __half* sc1 = xsc + (n >> 5);
+    float acc[8] = {0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f};
+    const uint8_t* r[4];
+#pragma unroll
+    for (int rr = 0; rr < 4; ++rr)
+        r[rr] = (row0 + rr < m) ? (W + static_cast<size_t>(row0 + rr) * static_cast<size_t>(nb) * kQ4KSoaBsz)
+                                : nullptr;
+    for (int b = 0; b < nb; ++b) {
+        const int8_t* xb0 = xq0 + b * 256 + group * 32 + sub * 8;
+        const int8_t* xb1 = xq1 + b * 256 + group * 32 + sub * 8;
+        const int u0 = *reinterpret_cast<const int*>(xb0);
+        const int u1 = *reinterpret_cast<const int*>(xb0 + 4);
+        const int v0 = *reinterpret_cast<const int*>(xb1);
+        const int v1 = *reinterpret_cast<const int*>(xb1 + 4);
+        const float xs0 = __half2float(sc0[b * 8 + group]);
+        const float xs1 = __half2float(sc1[b * 8 + group]);
+#pragma unroll
+        for (int rr = 0; rr < 4; ++rr) {
+            if (!r[rr]) continue;
+            const uint8_t* blk = r[rr] + static_cast<size_t>(b) * kQ4KSoaBsz;
+            const __half* ds = reinterpret_cast<const __half*>(blk);
+            const __half* dm = reinterpret_cast<const __half*>(blk + 16);
+            const uint8_t* qs = blk + 32 + gpair * 32 + sub * 8;
+            const uint2 q8 = *reinterpret_cast<const uint2*>(qs);
+            const int q0 = static_cast<int>(hi ? ((q8.x >> 4) & 0x0f0f0f0f) : (q8.x & 0x0f0f0f0f));
+            const int q1 = static_cast<int>(hi ? ((q8.y >> 4) & 0x0f0f0f0f) : (q8.y & 0x0f0f0f0f));
+            int s0 = 0, sx0 = 0, s1 = 0, sx1 = 0;
+#if __CUDA_ARCH__ >= 610
+            s0 = __dp4a(q0, u0, 0);
+            s0 = __dp4a(q1, u1, s0);
+            sx0 = __dp4a(0x01010101, u0, 0);
+            sx0 = __dp4a(0x01010101, u1, sx0);
+            s1 = __dp4a(q0, v0, 0);
+            s1 = __dp4a(q1, v1, s1);
+            sx1 = __dp4a(0x01010101, v0, 0);
+            sx1 = __dp4a(0x01010101, v1, sx1);
+#else
+            const int8_t* qq0 = reinterpret_cast<const int8_t*>(&q0);
+            const int8_t* qq1 = reinterpret_cast<const int8_t*>(&q1);
+            const int8_t* uu0 = reinterpret_cast<const int8_t*>(&u0);
+            const int8_t* uu1 = reinterpret_cast<const int8_t*>(&u1);
+            const int8_t* vv0 = reinterpret_cast<const int8_t*>(&v0);
+            const int8_t* vv1 = reinterpret_cast<const int8_t*>(&v1);
+            for (int k = 0; k < 4; ++k) {
+                s0 += qq0[k] * uu0[k];
+                s0 += qq1[k] * uu1[k];
+                sx0 += uu0[k] + uu1[k];
+                s1 += qq0[k] * vv0[k];
+                s1 += qq1[k] * vv1[k];
+                sx1 += vv0[k] + vv1[k];
+            }
+#endif
+            const float dsg = __half2float(ds[group]);
+            const float dmg = __half2float(dm[group]);
+            acc[rr * 2 + 0] = fmaf(dsg * xs0, static_cast<float>(s0), acc[rr * 2 + 0]);
+            acc[rr * 2 + 0] = fmaf(-dmg * xs0, static_cast<float>(sx0), acc[rr * 2 + 0]);
+            acc[rr * 2 + 1] = fmaf(dsg * xs1, static_cast<float>(s1), acc[rr * 2 + 1]);
+            acc[rr * 2 + 1] = fmaf(-dmg * xs1, static_cast<float>(sx1), acc[rr * 2 + 1]);
+        }
+    }
+#pragma unroll
+    for (int rr = 0; rr < 4; ++rr) {
+        const int row = row0 + rr;
+        if (row >= m) break;
+        const float t0 = warp_sum(acc[rr * 2 + 0]);
+        const float t1 = warp_sum(acc[rr * 2 + 1]);
+        if (lane == 0) {
+            write_y(Y, row, t0, add);
+            write_y(Y + m, row, t1, add);
+        }
+    }
+}
+
+// One W stream, two x vectors. x1 may be global (T=2 second token).
+__device__ __forceinline__ void acc_q4k_soa_2x(const uint8_t* row, const float* x0, const float* x1, int nb,
+                                               int lane, float& a0, float& a1) {
+    for (int b = 0; b < nb; ++b) {
+        const uint8_t* blk = row + static_cast<size_t>(b) * kQ4KSoaBsz;
+        const __half* ds = reinterpret_cast<const __half*>(blk);
+        const __half* dm = reinterpret_cast<const __half*>(blk + 16);
+        const uint8_t* q = blk + 32;
+        const float* b0 = x0 + b * 256;
+        const float* b1 = x1 + b * 256;
+        const uint32_t qpack = (static_cast<uint32_t>(__ldcs(q + lane))) |
+                               (static_cast<uint32_t>(__ldcs(q + 32 + lane)) << 8) |
+                               (static_cast<uint32_t>(__ldcs(q + 64 + lane)) << 16) |
+                               (static_cast<uint32_t>(__ldcs(q + 96 + lane)) << 24);
+#pragma unroll
+        for (int grp = 0; grp < 4; ++grp) {
+            const uint8_t qq = static_cast<uint8_t>(qpack >> (grp * 8));
+            const float w0 = __half2float(ds[grp * 2]) * static_cast<float>(qq & 15) - __half2float(dm[grp * 2]);
+            const float w1 = __half2float(ds[grp * 2 + 1]) * static_cast<float>(qq >> 4) - __half2float(dm[grp * 2 + 1]);
+            a0 = fmaf(w0, __ldg(b0 + lane), a0);
+            a0 = fmaf(w1, __ldg(b0 + 32 + lane), a0);
+            a1 = fmaf(w0, __ldg(b1 + lane), a1);
+            a1 = fmaf(w1, __ldg(b1 + 32 + lane), a1);
+            b0 += 64;
+            b1 += 64;
+        }
+    }
+}
+
+__device__ __forceinline__ void acc_q6k_soa_2x(const uint8_t* row, const float* x0, const float* x1, int nb,
+                                               int lane, float& a0, float& a1) {
+    const int is = lane / 16;
+    for (int b = 0; b < nb; ++b) {
+        const uint8_t* blk = row + static_cast<size_t>(b) * kQ6KSoaBsz;
+        const __half* ds = reinterpret_cast<const __half*>(blk);
+        const uint8_t* ql = blk + 32;
+        const uint8_t* qh = blk + 160;
+        const float* b0 = x0 + b * 256;
+        const float* b1 = x1 + b * 256;
+#pragma unroll
+        for (int n128 = 0; n128 < 2; ++n128) {
+            const int q1 = static_cast<int>((ql[lane] & 0xF) | (((qh[lane] >> 0) & 3) << 4)) - 32;
+            const int q2 = static_cast<int>((ql[lane + 32] & 0xF) | (((qh[lane] >> 2) & 3) << 4)) - 32;
+            const int q3 = static_cast<int>((ql[lane] >> 4) | (((qh[lane] >> 4) & 3) << 4)) - 32;
+            const int q4 = static_cast<int>((ql[lane + 32] >> 4) | (((qh[lane] >> 6) & 3) << 4)) - 32;
+            const float s1 = __half2float(ds[is]) * static_cast<float>(q1);
+            const float s2 = __half2float(ds[is + 2]) * static_cast<float>(q2);
+            const float s3 = __half2float(ds[is + 4]) * static_cast<float>(q3);
+            const float s4 = __half2float(ds[is + 6]) * static_cast<float>(q4);
+            a0 = fmaf(s1, __ldg(b0 + lane), a0);
+            a0 = fmaf(s2, __ldg(b0 + 32 + lane), a0);
+            a0 = fmaf(s3, __ldg(b0 + 64 + lane), a0);
+            a0 = fmaf(s4, __ldg(b0 + 96 + lane), a0);
+            a1 = fmaf(s1, __ldg(b1 + lane), a1);
+            a1 = fmaf(s2, __ldg(b1 + 32 + lane), a1);
+            a1 = fmaf(s3, __ldg(b1 + 64 + lane), a1);
+            a1 = fmaf(s4, __ldg(b1 + 96 + lane), a1);
+            ql += 64;
+            qh += 32;
+            ds += 8;
+            b0 += 128;
+            b1 += 128;
+        }
+    }
+}
+
+__device__ __forceinline__ void acc_q4k_soa_3x(const uint8_t* row, const float* x0, const float* x1, const float* x2,
+                                               int nb, int lane, float& a0, float& a1, float& a2) {
+    for (int b = 0; b < nb; ++b) {
+        const uint8_t* blk = row + static_cast<size_t>(b) * kQ4KSoaBsz;
+        const __half* ds = reinterpret_cast<const __half*>(blk);
+        const __half* dm = reinterpret_cast<const __half*>(blk + 16);
+        const uint8_t* q = blk + 32;
+        const float* b0 = x0 + b * 256;
+        const float* b1 = x1 + b * 256;
+        const float* b2 = x2 + b * 256;
+        const uint32_t qpack = (static_cast<uint32_t>(__ldcs(q + lane))) |
+                               (static_cast<uint32_t>(__ldcs(q + 32 + lane)) << 8) |
+                               (static_cast<uint32_t>(__ldcs(q + 64 + lane)) << 16) |
+                               (static_cast<uint32_t>(__ldcs(q + 96 + lane)) << 24);
+#pragma unroll
+        for (int grp = 0; grp < 4; ++grp) {
+            const uint8_t qq = static_cast<uint8_t>(qpack >> (grp * 8));
+            const float w0 = __half2float(ds[grp * 2]) * static_cast<float>(qq & 15) - __half2float(dm[grp * 2]);
+            const float w1 = __half2float(ds[grp * 2 + 1]) * static_cast<float>(qq >> 4) - __half2float(dm[grp * 2 + 1]);
+            a0 = fmaf(w0, __ldg(b0 + lane), a0);
+            a0 = fmaf(w1, __ldg(b0 + 32 + lane), a0);
+            a1 = fmaf(w0, __ldg(b1 + lane), a1);
+            a1 = fmaf(w1, __ldg(b1 + 32 + lane), a1);
+            a2 = fmaf(w0, __ldg(b2 + lane), a2);
+            a2 = fmaf(w1, __ldg(b2 + 32 + lane), a2);
+            b0 += 64;
+            b1 += 64;
+            b2 += 64;
+        }
+    }
+}
+
+__device__ __forceinline__ void acc_q6k_soa_3x(const uint8_t* row, const float* x0, const float* x1, const float* x2,
+                                               int nb, int lane, float& a0, float& a1, float& a2) {
+    const int is = lane / 16;
+    for (int b = 0; b < nb; ++b) {
+        const uint8_t* blk = row + static_cast<size_t>(b) * kQ6KSoaBsz;
+        const __half* ds = reinterpret_cast<const __half*>(blk);
+        const uint8_t* ql = blk + 32;
+        const uint8_t* qh = blk + 160;
+        const float* b0 = x0 + b * 256;
+        const float* b1 = x1 + b * 256;
+        const float* b2 = x2 + b * 256;
+#pragma unroll
+        for (int n128 = 0; n128 < 2; ++n128) {
+            const int q1 = static_cast<int>((ql[lane] & 0xF) | (((qh[lane] >> 0) & 3) << 4)) - 32;
+            const int q2 = static_cast<int>((ql[lane + 32] & 0xF) | (((qh[lane] >> 2) & 3) << 4)) - 32;
+            const int q3 = static_cast<int>((ql[lane] >> 4) | (((qh[lane] >> 4) & 3) << 4)) - 32;
+            const int q4 = static_cast<int>((ql[lane + 32] >> 4) | (((qh[lane] >> 6) & 3) << 4)) - 32;
+            const float s1 = __half2float(ds[is]) * static_cast<float>(q1);
+            const float s2 = __half2float(ds[is + 2]) * static_cast<float>(q2);
+            const float s3 = __half2float(ds[is + 4]) * static_cast<float>(q3);
+            const float s4 = __half2float(ds[is + 6]) * static_cast<float>(q4);
+            a0 = fmaf(s1, __ldg(b0 + lane), a0);
+            a0 = fmaf(s2, __ldg(b0 + 32 + lane), a0);
+            a0 = fmaf(s3, __ldg(b0 + 64 + lane), a0);
+            a0 = fmaf(s4, __ldg(b0 + 96 + lane), a0);
+            a1 = fmaf(s1, __ldg(b1 + lane), a1);
+            a1 = fmaf(s2, __ldg(b1 + 32 + lane), a1);
+            a1 = fmaf(s3, __ldg(b1 + 64 + lane), a1);
+            a1 = fmaf(s4, __ldg(b1 + 96 + lane), a1);
+            a2 = fmaf(s1, __ldg(b2 + lane), a2);
+            a2 = fmaf(s2, __ldg(b2 + 32 + lane), a2);
+            a2 = fmaf(s3, __ldg(b2 + 64 + lane), a2);
+            a2 = fmaf(s4, __ldg(b2 + 96 + lane), a2);
+            ql += 64;
+            qh += 32;
+            ds += 8;
+            b0 += 128;
+            b1 += 128;
+            b2 += 128;
+        }
+    }
+}
+
+// T=3 Q6 float: two rows interleaved so both W streams stay in flight.
+__global__ void __launch_bounds__(256, 2) gemv_q6k_soa_f32_t3_2row_k(const uint8_t* W, const float* X, float* Y,
+                                                                     int m, int n, int add) {
+    const int warps = blockDim.x / 32;
+    const int pair = blockIdx.x * warps + (threadIdx.x / 32);
+    const int row0 = pair * 2;
+    const int row1 = row0 + 1;
+    const int lane = threadIdx.x & 31;
+    const int nb = n / 256;
+    const int is = lane / 16;
+    float a00 = 0.f, a01 = 0.f, a02 = 0.f, a10 = 0.f, a11 = 0.f, a12 = 0.f;
+    const uint8_t* r0 = (row0 < m && nb > 0)
+                            ? (W + static_cast<size_t>(row0) * static_cast<size_t>(nb) * kQ6KSoaBsz)
+                            : nullptr;
+    const uint8_t* r1 = (row1 < m && nb > 0)
+                            ? (W + static_cast<size_t>(row1) * static_cast<size_t>(nb) * kQ6KSoaBsz)
+                            : nullptr;
+    const float* x0 = X;
+    const float* x1 = X + n;
+    const float* x2 = X + 2 * n;
+    for (int b = 0; b < nb; ++b) {
+        const float* b0 = x0 + b * 256;
+        const float* b1 = x1 + b * 256;
+        const float* b2 = x2 + b * 256;
+        const float x0a = __ldg(b0 + lane), x0b = __ldg(b0 + 32 + lane);
+        const float x0c = __ldg(b0 + 64 + lane), x0d = __ldg(b0 + 96 + lane);
+        const float x1a = __ldg(b1 + lane), x1b = __ldg(b1 + 32 + lane);
+        const float x1c = __ldg(b1 + 64 + lane), x1d = __ldg(b1 + 96 + lane);
+        const float x2a = __ldg(b2 + lane), x2b = __ldg(b2 + 32 + lane);
+        const float x2c = __ldg(b2 + 64 + lane), x2d = __ldg(b2 + 96 + lane);
+        auto acc_row = [&](const uint8_t* row, float& a0, float& a1, float& a2) {
+            const uint8_t* blk = row + static_cast<size_t>(b) * kQ6KSoaBsz;
+            const __half* ds = reinterpret_cast<const __half*>(blk);
+            const uint8_t* ql = blk + 32;
+            const uint8_t* qh = blk + 160;
+#pragma unroll
+            for (int n128 = 0; n128 < 2; ++n128) {
+                const uint8_t qlo = __ldcs(ql + lane);
+                const uint8_t qhi = __ldcs(qh + lane);
+                const uint8_t qlo2 = __ldcs(ql + 32 + lane);
+                const int q1 = static_cast<int>((qlo & 0xF) | (((qhi >> 0) & 3) << 4)) - 32;
+                const int q2 = static_cast<int>((qlo2 & 0xF) | (((qhi >> 2) & 3) << 4)) - 32;
+                const int q3 = static_cast<int>((qlo >> 4) | (((qhi >> 4) & 3) << 4)) - 32;
+                const int q4 = static_cast<int>((qlo2 >> 4) | (((qhi >> 6) & 3) << 4)) - 32;
+                const float s1 = __half2float(__ldg(ds + is)) * static_cast<float>(q1);
+                const float s2 = __half2float(__ldg(ds + is + 2)) * static_cast<float>(q2);
+                const float s3 = __half2float(__ldg(ds + is + 4)) * static_cast<float>(q3);
+                const float s4 = __half2float(__ldg(ds + is + 6)) * static_cast<float>(q4);
+                if (n128 == 0) {
+                    a0 = fmaf(s1, x0a, a0);
+                    a0 = fmaf(s2, x0b, a0);
+                    a0 = fmaf(s3, x0c, a0);
+                    a0 = fmaf(s4, x0d, a0);
+                    a1 = fmaf(s1, x1a, a1);
+                    a1 = fmaf(s2, x1b, a1);
+                    a1 = fmaf(s3, x1c, a1);
+                    a1 = fmaf(s4, x1d, a1);
+                    a2 = fmaf(s1, x2a, a2);
+                    a2 = fmaf(s2, x2b, a2);
+                    a2 = fmaf(s3, x2c, a2);
+                    a2 = fmaf(s4, x2d, a2);
+                } else {
+                    a0 = fmaf(s1, __ldg(b0 + 128 + lane), a0);
+                    a0 = fmaf(s2, __ldg(b0 + 160 + lane), a0);
+                    a0 = fmaf(s3, __ldg(b0 + 192 + lane), a0);
+                    a0 = fmaf(s4, __ldg(b0 + 224 + lane), a0);
+                    a1 = fmaf(s1, __ldg(b1 + 128 + lane), a1);
+                    a1 = fmaf(s2, __ldg(b1 + 160 + lane), a1);
+                    a1 = fmaf(s3, __ldg(b1 + 192 + lane), a1);
+                    a1 = fmaf(s4, __ldg(b1 + 224 + lane), a1);
+                    a2 = fmaf(s1, __ldg(b2 + 128 + lane), a2);
+                    a2 = fmaf(s2, __ldg(b2 + 160 + lane), a2);
+                    a2 = fmaf(s3, __ldg(b2 + 192 + lane), a2);
+                    a2 = fmaf(s4, __ldg(b2 + 224 + lane), a2);
+                }
+                ql += 64;
+                qh += 32;
+                ds += 8;
+            }
+        };
+        if (r0) acc_row(r0, a00, a01, a02);
+        if (r1) acc_row(r1, a10, a11, a12);
+    }
+    if (row0 < m) {
+        a00 = warp_sum(a00);
+        a01 = warp_sum(a01);
+        a02 = warp_sum(a02);
+        if (lane == 0) {
+            write_y(Y, row0, a00, add);
+            write_y(Y + m, row0, a01, add);
+            write_y(Y + 2 * m, row0, a02, add);
+        }
+    }
+    if (row1 < m) {
+        a10 = warp_sum(a10);
+        a11 = warp_sum(a11);
+        a12 = warp_sum(a12);
+        if (lane == 0) {
+            write_y(Y, row1, a10, add);
+            write_y(Y + m, row1, a11, add);
+            write_y(Y + 2 * m, row1, a12, add);
+        }
+    }
+}
+
+// Keep this unused sibling in the TU. Removing it changed nvcc codegen of
+// gemv_q6k_soa_f32_t3_2row_k enough to flip Q4 decode onto 4 5 0 31 46474.
+__global__ void __launch_bounds__(256, 2) gemv_q6k_soa_f32_t3_dual_k(const uint8_t* W1, const uint8_t* W2,
+                                                                     const float* X, float* Y1, float* Y2,
+                                                                     int m1, int m2, int n) {
+    const int warps = blockDim.x / 32;
+    const int pair = blockIdx.x * warps + (threadIdx.x / 32);
+    const int row0 = pair * 2;
+    const int row1 = row0 + 1;
+    const int lane = threadIdx.x & 31;
+    const int nb = n / 256;
+    const int is = lane / 16;
+    const int mmax = m1 > m2 ? m1 : m2;
+    if (row0 >= mmax || nb <= 0) return;
+    float a00 = 0.f, a01 = 0.f, a02 = 0.f, b00 = 0.f, b01 = 0.f, b02 = 0.f;
+    float a10 = 0.f, a11 = 0.f, a12 = 0.f, b10 = 0.f, b11 = 0.f, b12 = 0.f;
+    const uint8_t* r0a = (row0 < m1) ? (W1 + static_cast<size_t>(row0) * static_cast<size_t>(nb) * kQ6KSoaBsz)
+                                     : nullptr;
+    const uint8_t* r0b = (row0 < m2) ? (W2 + static_cast<size_t>(row0) * static_cast<size_t>(nb) * kQ6KSoaBsz)
+                                     : nullptr;
+    const uint8_t* r1a = (row1 < m1) ? (W1 + static_cast<size_t>(row1) * static_cast<size_t>(nb) * kQ6KSoaBsz)
+                                     : nullptr;
+    const uint8_t* r1b = (row1 < m2) ? (W2 + static_cast<size_t>(row1) * static_cast<size_t>(nb) * kQ6KSoaBsz)
+                                     : nullptr;
+    const float* x0 = X;
+    const float* x1 = X + n;
+    const float* x2 = X + 2 * n;
+    for (int b = 0; b < nb; ++b) {
+        const float* p0 = x0 + b * 256;
+        const float* p1 = x1 + b * 256;
+        const float* p2 = x2 + b * 256;
+        const float x0a = __ldg(p0 + lane), x0b = __ldg(p0 + 32 + lane);
+        const float x0c = __ldg(p0 + 64 + lane), x0d = __ldg(p0 + 96 + lane);
+        const float x1a = __ldg(p1 + lane), x1b = __ldg(p1 + 32 + lane);
+        const float x1c = __ldg(p1 + 64 + lane), x1d = __ldg(p1 + 96 + lane);
+        const float x2a = __ldg(p2 + lane), x2b = __ldg(p2 + 32 + lane);
+        const float x2c = __ldg(p2 + 64 + lane), x2d = __ldg(p2 + 96 + lane);
+        auto acc_row = [&](const uint8_t* row, float& a0, float& a1, float& a2) {
+            const uint8_t* blk = row + static_cast<size_t>(b) * kQ6KSoaBsz;
+            const __half* ds = reinterpret_cast<const __half*>(blk);
+            const uint8_t* ql = blk + 32;
+            const uint8_t* qh = blk + 160;
+#pragma unroll
+            for (int n128 = 0; n128 < 2; ++n128) {
+                const uint8_t qlo = __ldcs(ql + lane);
+                const uint8_t qhi = __ldcs(qh + lane);
+                const uint8_t qlo2 = __ldcs(ql + 32 + lane);
+                const int q1 = static_cast<int>((qlo & 0xF) | (((qhi >> 0) & 3) << 4)) - 32;
+                const int q2 = static_cast<int>((qlo2 & 0xF) | (((qhi >> 2) & 3) << 4)) - 32;
+                const int q3 = static_cast<int>((qlo >> 4) | (((qhi >> 4) & 3) << 4)) - 32;
+                const int q4 = static_cast<int>((qlo2 >> 4) | (((qhi >> 6) & 3) << 4)) - 32;
+                const float s1 = __half2float(__ldg(ds + is)) * static_cast<float>(q1);
+                const float s2 = __half2float(__ldg(ds + is + 2)) * static_cast<float>(q2);
+                const float s3 = __half2float(__ldg(ds + is + 4)) * static_cast<float>(q3);
+                const float s4 = __half2float(__ldg(ds + is + 6)) * static_cast<float>(q4);
+                if (n128 == 0) {
+                    a0 = fmaf(s1, x0a, a0);
+                    a0 = fmaf(s2, x0b, a0);
+                    a0 = fmaf(s3, x0c, a0);
+                    a0 = fmaf(s4, x0d, a0);
+                    a1 = fmaf(s1, x1a, a1);
+                    a1 = fmaf(s2, x1b, a1);
+                    a1 = fmaf(s3, x1c, a1);
+                    a1 = fmaf(s4, x1d, a1);
+                    a2 = fmaf(s1, x2a, a2);
+                    a2 = fmaf(s2, x2b, a2);
+                    a2 = fmaf(s3, x2c, a2);
+                    a2 = fmaf(s4, x2d, a2);
+                } else {
+                    a0 = fmaf(s1, __ldg(p0 + 128 + lane), a0);
+                    a0 = fmaf(s2, __ldg(p0 + 160 + lane), a0);
+                    a0 = fmaf(s3, __ldg(p0 + 192 + lane), a0);
+                    a0 = fmaf(s4, __ldg(p0 + 224 + lane), a0);
+                    a1 = fmaf(s1, __ldg(p1 + 128 + lane), a1);
+                    a1 = fmaf(s2, __ldg(p1 + 160 + lane), a1);
+                    a1 = fmaf(s3, __ldg(p1 + 192 + lane), a1);
+                    a1 = fmaf(s4, __ldg(p1 + 224 + lane), a1);
+                    a2 = fmaf(s1, __ldg(p2 + 128 + lane), a2);
+                    a2 = fmaf(s2, __ldg(p2 + 160 + lane), a2);
+                    a2 = fmaf(s3, __ldg(p2 + 192 + lane), a2);
+                    a2 = fmaf(s4, __ldg(p2 + 224 + lane), a2);
+                }
+                ql += 64;
+                qh += 32;
+                ds += 8;
+            }
+        };
+        if (r0a) acc_row(r0a, a00, a01, a02);
+        if (r0b) acc_row(r0b, b00, b01, b02);
+        if (r1a) acc_row(r1a, a10, a11, a12);
+        if (r1b) acc_row(r1b, b10, b11, b12);
+    }
+    auto emit3 = [&](float a0, float a1, float a2, float* Y, int m, int row) {
+        a0 = warp_sum(a0);
+        a1 = warp_sum(a1);
+        a2 = warp_sum(a2);
+        if (lane != 0) return;
+        write_y(Y, row, a0, 0);
+        write_y(Y + m, row, a1, 0);
+        write_y(Y + 2 * m, row, a2, 0);
+    };
+    if (row0 < m1) emit3(a00, a01, a02, Y1, m1, row0);
+    if (row0 < m2) emit3(b00, b01, b02, Y2, m2, row0);
+    if (row1 < m1) emit3(a10, a11, a12, Y1, m1, row1);
+    if (row1 < m2) emit3(b10, b11, b12, Y2, m2, row1);
+}
+
+__device__ __forceinline__ void acc_q6k_soa_4x(const uint8_t* row, const float* x0, const float* x1, const float* x2,
+                                               const float* x3, int nb, int lane, float& a0, float& a1, float& a2,
+                                               float& a3);
+
+__global__ void __launch_bounds__(256, 2) gemv_q6k_soa_f32_t4_2row_k(const uint8_t* W, const float* X, float* Y,
+                                                                     int m, int n, int add) {
+    const int warps = blockDim.x / 32;
+    const int pair = blockIdx.x * warps + (threadIdx.x / 32);
+    const int row0 = pair * 2;
+    const int row1 = row0 + 1;
+    const int lane = threadIdx.x & 31;
+    const int nb = n / 256;
+    const int is = lane / 16;
+    float a00 = 0.f, a01 = 0.f, a02 = 0.f, a03 = 0.f, a10 = 0.f, a11 = 0.f, a12 = 0.f, a13 = 0.f;
+    const uint8_t* r0 = (row0 < m && nb > 0)
+                            ? (W + static_cast<size_t>(row0) * static_cast<size_t>(nb) * kQ6KSoaBsz)
+                            : nullptr;
+    const uint8_t* r1 = (row1 < m && nb > 0)
+                            ? (W + static_cast<size_t>(row1) * static_cast<size_t>(nb) * kQ6KSoaBsz)
+                            : nullptr;
+    const float* x0 = X;
+    const float* x1 = X + n;
+    const float* x2 = X + 2 * n;
+    const float* x3 = X + 3 * n;
+    for (int b = 0; b < nb; ++b) {
+        if (r0)
+            acc_q6k_soa_4x(r0 + static_cast<size_t>(b) * kQ6KSoaBsz, x0 + b * 256, x1 + b * 256, x2 + b * 256,
+                           x3 + b * 256, 1, lane, a00, a01, a02, a03);
+        if (r1)
+            acc_q6k_soa_4x(r1 + static_cast<size_t>(b) * kQ6KSoaBsz, x0 + b * 256, x1 + b * 256, x2 + b * 256,
+                           x3 + b * 256, 1, lane, a10, a11, a12, a13);
+    }
+    if (row0 < m) {
+        a00 = warp_sum(a00);
+        a01 = warp_sum(a01);
+        a02 = warp_sum(a02);
+        a03 = warp_sum(a03);
+        if (lane == 0) {
+            write_y(Y, row0, a00, add);
+            write_y(Y + m, row0, a01, add);
+            write_y(Y + 2 * m, row0, a02, add);
+            write_y(Y + 3 * m, row0, a03, add);
+        }
+    }
+    if (row1 < m) {
+        a10 = warp_sum(a10);
+        a11 = warp_sum(a11);
+        a12 = warp_sum(a12);
+        a13 = warp_sum(a13);
+        if (lane == 0) {
+            write_y(Y, row1, a10, add);
+            write_y(Y + m, row1, a11, add);
+            write_y(Y + 2 * m, row1, a12, add);
+            write_y(Y + 3 * m, row1, a13, add);
+        }
+    }
+}
+
+__device__ __forceinline__ void acc_q4k_soa_4x(const uint8_t* row, const float* x0, const float* x1, const float* x2,
+                                               const float* x3, int nb, int lane, float& a0, float& a1, float& a2,
+                                               float& a3) {
+    for (int b = 0; b < nb; ++b) {
+        const uint8_t* blk = row + static_cast<size_t>(b) * kQ4KSoaBsz;
+        const __half* ds = reinterpret_cast<const __half*>(blk);
+        const __half* dm = reinterpret_cast<const __half*>(blk + 16);
+        const uint8_t* q = blk + 32;
+        const float* b0 = x0 + b * 256;
+        const float* b1 = x1 + b * 256;
+        const float* b2 = x2 + b * 256;
+        const float* b3 = x3 + b * 256;
+        const uint32_t qpack = (static_cast<uint32_t>(__ldcs(q + lane))) |
+                               (static_cast<uint32_t>(__ldcs(q + 32 + lane)) << 8) |
+                               (static_cast<uint32_t>(__ldcs(q + 64 + lane)) << 16) |
+                               (static_cast<uint32_t>(__ldcs(q + 96 + lane)) << 24);
+#pragma unroll
+        for (int grp = 0; grp < 4; ++grp) {
+            const uint8_t qq = static_cast<uint8_t>(qpack >> (grp * 8));
+            const float w0 = __half2float(ds[grp * 2]) * static_cast<float>(qq & 15) - __half2float(dm[grp * 2]);
+            const float w1 = __half2float(ds[grp * 2 + 1]) * static_cast<float>(qq >> 4) - __half2float(dm[grp * 2 + 1]);
+            a0 = fmaf(w0, __ldg(b0 + lane), a0);
+            a0 = fmaf(w1, __ldg(b0 + 32 + lane), a0);
+            a1 = fmaf(w0, __ldg(b1 + lane), a1);
+            a1 = fmaf(w1, __ldg(b1 + 32 + lane), a1);
+            a2 = fmaf(w0, __ldg(b2 + lane), a2);
+            a2 = fmaf(w1, __ldg(b2 + 32 + lane), a2);
+            a3 = fmaf(w0, __ldg(b3 + lane), a3);
+            a3 = fmaf(w1, __ldg(b3 + 32 + lane), a3);
+            b0 += 64;
+            b1 += 64;
+            b2 += 64;
+            b3 += 64;
+        }
+    }
+}
+
+__device__ __forceinline__ void acc_q6k_soa_4x(const uint8_t* row, const float* x0, const float* x1, const float* x2,
+                                               const float* x3, int nb, int lane, float& a0, float& a1, float& a2,
+                                               float& a3) {
+    const int is = lane / 16;
+    for (int b = 0; b < nb; ++b) {
+        const uint8_t* blk = row + static_cast<size_t>(b) * kQ6KSoaBsz;
+        const __half* ds = reinterpret_cast<const __half*>(blk);
+        const uint8_t* ql = blk + 32;
+        const uint8_t* qh = blk + 160;
+        const float* b0 = x0 + b * 256;
+        const float* b1 = x1 + b * 256;
+        const float* b2 = x2 + b * 256;
+        const float* b3 = x3 + b * 256;
+#pragma unroll
+        for (int n128 = 0; n128 < 2; ++n128) {
+            const int q1 = static_cast<int>((ql[lane] & 0xF) | (((qh[lane] >> 0) & 3) << 4)) - 32;
+            const int q2 = static_cast<int>((ql[lane + 32] & 0xF) | (((qh[lane] >> 2) & 3) << 4)) - 32;
+            const int q3 = static_cast<int>((ql[lane] >> 4) | (((qh[lane] >> 4) & 3) << 4)) - 32;
+            const int q4 = static_cast<int>((ql[lane + 32] >> 4) | (((qh[lane] >> 6) & 3) << 4)) - 32;
+            const float s1 = __half2float(ds[is]) * static_cast<float>(q1);
+            const float s2 = __half2float(ds[is + 2]) * static_cast<float>(q2);
+            const float s3 = __half2float(ds[is + 4]) * static_cast<float>(q3);
+            const float s4 = __half2float(ds[is + 6]) * static_cast<float>(q4);
+            a0 = fmaf(s1, __ldg(b0 + lane), a0);
+            a0 = fmaf(s2, __ldg(b0 + 32 + lane), a0);
+            a0 = fmaf(s3, __ldg(b0 + 64 + lane), a0);
+            a0 = fmaf(s4, __ldg(b0 + 96 + lane), a0);
+            a1 = fmaf(s1, __ldg(b1 + lane), a1);
+            a1 = fmaf(s2, __ldg(b1 + 32 + lane), a1);
+            a1 = fmaf(s3, __ldg(b1 + 64 + lane), a1);
+            a1 = fmaf(s4, __ldg(b1 + 96 + lane), a1);
+            a2 = fmaf(s1, __ldg(b2 + lane), a2);
+            a2 = fmaf(s2, __ldg(b2 + 32 + lane), a2);
+            a2 = fmaf(s3, __ldg(b2 + 64 + lane), a2);
+            a2 = fmaf(s4, __ldg(b2 + 96 + lane), a2);
+            a3 = fmaf(s1, __ldg(b3 + lane), a3);
+            a3 = fmaf(s2, __ldg(b3 + 32 + lane), a3);
+            a3 = fmaf(s3, __ldg(b3 + 64 + lane), a3);
+            a3 = fmaf(s4, __ldg(b3 + 96 + lane), a3);
+            ql += 64;
+            qh += 32;
+            ds += 8;
+            b0 += 128;
+            b1 += 128;
+            b2 += 128;
+            b3 += 128;
+        }
+    }
+}
+
 __device__ __forceinline__ float acc_q4k_soa_row(const uint8_t* row, const float* xs, int nb, int lane) {
     float acc = 0.f;
     for (int b = 0; b < nb; ++b) {
@@ -823,6 +2377,228 @@ __global__ void gemv_qk_2row_k(const uint8_t* W, const float* x, float* y, int m
     }
 }
 
+// T=2 spec verify: one W read, two x vectors, two rows per warp.
+// x0 in smem at T=1 tile (32 KiB, 2-block/SM). x1 via __ldg so 5120/6144
+// are one pass — the old 256-col dual-smem tile paid ~20 syncs per GEMV.
+template <int Bsz>
+__global__ void gemv_qk_t2_2row_k(const uint8_t* W, const float* X, float* Y, int m, int n, int add) {
+    extern __shared__ float xs[];
+    const int warps = blockDim.x / 32;
+    const int pair = blockIdx.x * warps + (threadIdx.x / 32);
+    const int row0 = pair * 2;
+    const int row1 = row0 + 1;
+    const int lane = threadIdx.x & 31;
+    const int tile = n < kXsTile ? n : kXsTile;
+    const int nb_all = n / 256;
+    float a00 = 0.f, a01 = 0.f, a10 = 0.f, a11 = 0.f;
+    for (int t0 = 0; t0 < n; t0 += tile) {
+        const int tn = n - t0 < tile ? n - t0 : tile;
+        const int nb = tn / 256;
+        // SOA 2x paths ldg both x; skip the 20–32 KiB tile so more blocks fit.
+        const bool soa2 = (Bsz == kQ4KSoaBsz || Bsz == kQ6KSoaBsz);
+        if (!soa2) {
+            load_x_tile(xs, X + t0, tn);
+            __syncthreads();
+        }
+        const float* x0p = soa2 ? (X + t0) : xs;
+        const float* x1 = X + n + t0;
+        if (row0 < m && nb > 0) {
+            const uint8_t* r0 = W + (static_cast<size_t>(row0) * nb_all + static_cast<size_t>(t0 / 256)) * Bsz;
+            if (Bsz == kQ4KSoaBsz)
+                acc_q4k_soa_2x(r0, x0p, x1, nb, lane, a00, a01);
+            else if (Bsz == kQ6KSoaBsz)
+                acc_q6k_soa_2x(r0, x0p, x1, nb, lane, a00, a01);
+            else if (Bsz == kQ4KBsz) {
+                a00 += acc_q4k_row(r0, xs, nb, lane);
+                a01 += acc_q4k_row(r0, x1, nb, lane);
+            } else if (Bsz == kQ6KBsz) {
+                a00 += acc_q6k_row(r0, xs, nb, lane);
+                a01 += acc_q6k_row(r0, x1, nb, lane);
+            } else if (Bsz == kQ5KBsz) {
+                a00 += acc_q5k_row(r0, xs, nb, lane);
+                a01 += acc_q5k_row(r0, x1, nb, lane);
+            } else {
+                a00 += acc_q5k_soa_row(r0, xs, nb, lane);
+                a01 += acc_q5k_soa_row(r0, x1, nb, lane);
+            }
+            if (row1 < m) {
+                const uint8_t* r1 = W + (static_cast<size_t>(row1) * nb_all + static_cast<size_t>(t0 / 256)) * Bsz;
+                if (Bsz == kQ4KSoaBsz)
+                    acc_q4k_soa_2x(r1, x0p, x1, nb, lane, a10, a11);
+                else if (Bsz == kQ6KSoaBsz)
+                    acc_q6k_soa_2x(r1, x0p, x1, nb, lane, a10, a11);
+                else if (Bsz == kQ4KBsz) {
+                    a10 += acc_q4k_row(r1, xs, nb, lane);
+                    a11 += acc_q4k_row(r1, x1, nb, lane);
+                } else if (Bsz == kQ6KBsz) {
+                    a10 += acc_q6k_row(r1, xs, nb, lane);
+                    a11 += acc_q6k_row(r1, x1, nb, lane);
+                } else if (Bsz == kQ5KBsz) {
+                    a10 += acc_q5k_row(r1, xs, nb, lane);
+                    a11 += acc_q5k_row(r1, x1, nb, lane);
+                } else {
+                    a10 += acc_q5k_soa_row(r1, xs, nb, lane);
+                    a11 += acc_q5k_soa_row(r1, x1, nb, lane);
+                }
+            }
+        }
+        if (t0 + tile < n) __syncthreads();
+    }
+    if (row0 < m) {
+        a00 = warp_sum(a00);
+        a01 = warp_sum(a01);
+        if (lane == 0) {
+            write_y(Y, row0, a00, add);
+            write_y(Y + m, row0, a01, add);
+        }
+    }
+    if (row1 < m) {
+        a10 = warp_sum(a10);
+        a11 = warp_sum(a11);
+        if (lane == 0) {
+            write_y(Y, row1, a10, add);
+            write_y(Y + m, row1, a11, add);
+        }
+    }
+}
+
+// T=3 prefill: x0 in smem, x1/x2 from L2, one W stream, two rows / warp.
+template <int Bsz>
+__global__ void gemv_qk_t3_2row_k(const uint8_t* W, const float* X, float* Y, int m, int n, int add) {
+    extern __shared__ float xs[];
+    const int warps = blockDim.x / 32;
+    const int pair = blockIdx.x * warps + (threadIdx.x / 32);
+    const int row0 = pair * 2;
+    const int row1 = row0 + 1;
+    const int lane = threadIdx.x & 31;
+    const int tile = n < kXsTile ? n : kXsTile;
+    const int nb_all = n / 256;
+    float a00 = 0.f, a01 = 0.f, a02 = 0.f, a10 = 0.f, a11 = 0.f, a12 = 0.f;
+    for (int t0 = 0; t0 < n; t0 += tile) {
+        const int tn = n - t0 < tile ? n - t0 : tile;
+        const int nb = tn / 256;
+        const bool soa3 = (Bsz == kQ4KSoaBsz || Bsz == kQ6KSoaBsz);
+        if (!soa3) {
+            load_x_tile(xs, X + t0, tn);
+            __syncthreads();
+        }
+        const float* x0p = soa3 ? (X + t0) : xs;
+        const float* x1 = X + n + t0;
+        const float* x2 = X + 2 * n + t0;
+        if (row0 < m && nb > 0) {
+            const uint8_t* r0 = W + (static_cast<size_t>(row0) * nb_all + static_cast<size_t>(t0 / 256)) * Bsz;
+            if (Bsz == kQ4KSoaBsz)
+                acc_q4k_soa_3x(r0, x0p, x1, x2, nb, lane, a00, a01, a02);
+            else if (Bsz == kQ6KSoaBsz)
+                acc_q6k_soa_3x(r0, x0p, x1, x2, nb, lane, a00, a01, a02);
+            else {
+                a00 += acc_q4k_soa_row(r0, xs, nb, lane);
+                a01 += acc_q4k_soa_row(r0, x1, nb, lane);
+                a02 += acc_q4k_soa_row(r0, x2, nb, lane);
+            }
+            if (row1 < m) {
+                const uint8_t* r1 = W + (static_cast<size_t>(row1) * nb_all + static_cast<size_t>(t0 / 256)) * Bsz;
+                if (Bsz == kQ4KSoaBsz)
+                    acc_q4k_soa_3x(r1, x0p, x1, x2, nb, lane, a10, a11, a12);
+                else if (Bsz == kQ6KSoaBsz)
+                    acc_q6k_soa_3x(r1, x0p, x1, x2, nb, lane, a10, a11, a12);
+                else {
+                    a10 += acc_q4k_soa_row(r1, xs, nb, lane);
+                    a11 += acc_q4k_soa_row(r1, x1, nb, lane);
+                    a12 += acc_q4k_soa_row(r1, x2, nb, lane);
+                }
+            }
+        }
+        if (t0 + tile < n) __syncthreads();
+    }
+    if (row0 < m) {
+        a00 = warp_sum(a00);
+        a01 = warp_sum(a01);
+        a02 = warp_sum(a02);
+        if (lane == 0) {
+            write_y(Y, row0, a00, add);
+            write_y(Y + m, row0, a01, add);
+            write_y(Y + 2 * m, row0, a02, add);
+        }
+    }
+    if (row1 < m) {
+        a10 = warp_sum(a10);
+        a11 = warp_sum(a11);
+        a12 = warp_sum(a12);
+        if (lane == 0) {
+            write_y(Y, row1, a10, add);
+            write_y(Y + m, row1, a11, add);
+            write_y(Y + 2 * m, row1, a12, add);
+        }
+    }
+}
+
+// T=4 spec: one W stream, four x via __ldg, two rows / warp. Avoids 4× GEMV.
+template <int Bsz>
+__global__ void gemv_qk_t4_2row_k(const uint8_t* W, const float* X, float* Y, int m, int n, int add) {
+    extern __shared__ float xs[];
+    const int warps = blockDim.x / 32;
+    const int pair = blockIdx.x * warps + (threadIdx.x / 32);
+    const int row0 = pair * 2;
+    const int row1 = row0 + 1;
+    const int lane = threadIdx.x & 31;
+    const int tile = n < kXsTile ? n : kXsTile;
+    const int nb_all = n / 256;
+    float a00 = 0.f, a01 = 0.f, a02 = 0.f, a03 = 0.f, a10 = 0.f, a11 = 0.f, a12 = 0.f, a13 = 0.f;
+    for (int t0 = 0; t0 < n; t0 += tile) {
+        const int tn = n - t0 < tile ? n - t0 : tile;
+        const int nb = tn / 256;
+        const bool soa4 = (Bsz == kQ4KSoaBsz || Bsz == kQ6KSoaBsz);
+        if (!soa4) {
+            load_x_tile(xs, X + t0, tn);
+            __syncthreads();
+        }
+        const float* x0p = soa4 ? (X + t0) : xs;
+        const float* x1 = X + n + t0;
+        const float* x2 = X + 2 * n + t0;
+        const float* x3 = X + 3 * n + t0;
+        if (row0 < m && nb > 0) {
+            const uint8_t* r0 = W + (static_cast<size_t>(row0) * nb_all + static_cast<size_t>(t0 / 256)) * Bsz;
+            if (Bsz == kQ4KSoaBsz)
+                acc_q4k_soa_4x(r0, x0p, x1, x2, x3, nb, lane, a00, a01, a02, a03);
+            else if (Bsz == kQ6KSoaBsz)
+                acc_q6k_soa_4x(r0, x0p, x1, x2, x3, nb, lane, a00, a01, a02, a03);
+            if (row1 < m) {
+                const uint8_t* r1 = W + (static_cast<size_t>(row1) * nb_all + static_cast<size_t>(t0 / 256)) * Bsz;
+                if (Bsz == kQ4KSoaBsz)
+                    acc_q4k_soa_4x(r1, x0p, x1, x2, x3, nb, lane, a10, a11, a12, a13);
+                else if (Bsz == kQ6KSoaBsz)
+                    acc_q6k_soa_4x(r1, x0p, x1, x2, x3, nb, lane, a10, a11, a12, a13);
+            }
+        }
+        if (t0 + tile < n) __syncthreads();
+    }
+    if (row0 < m) {
+        a00 = warp_sum(a00);
+        a01 = warp_sum(a01);
+        a02 = warp_sum(a02);
+        a03 = warp_sum(a03);
+        if (lane == 0) {
+            write_y(Y, row0, a00, add);
+            write_y(Y + m, row0, a01, add);
+            write_y(Y + 2 * m, row0, a02, add);
+            write_y(Y + 3 * m, row0, a03, add);
+        }
+    }
+    if (row1 < m) {
+        a10 = warp_sum(a10);
+        a11 = warp_sum(a11);
+        a12 = warp_sum(a12);
+        a13 = warp_sum(a13);
+        if (lane == 0) {
+            write_y(Y, row1, a10, add);
+            write_y(Y + m, row1, a11, add);
+            write_y(Y + 2 * m, row1, a12, add);
+            write_y(Y + 3 * m, row1, a13, add);
+        }
+    }
+}
+
 // Prefill Q4/Q5/Q6: reuse each superblock across TT tokens. TT <= 16, tile=256.
 template <int Bsz>
 __global__ void gemm_qk_t_k(const uint8_t* W, const float* X, float* Y, int m, int n, int T, int add) {
@@ -864,9 +2640,9 @@ __global__ void gemm_qk_t_k(const uint8_t* W, const float* X, float* Y, int m, i
     }
 }
 
-// Batched Q8 GEMM: X [T, n], Y [T, m], stream each weight row once. T <= 4.
-__global__ void gemm_q8_soa_k(const int8_t* Q, const __half* scales, const float* X, float* Y, int m,
-                              int n, int T, int tile) {
+// Batched Q8 GEMM: X [T, n], Y [T, m]. T<=4 keeps acc in regs (hot path).
+__global__ void gemm_q8_soa_k(const int8_t* Q, const __half* scales, const float* X, float* Y, int m, int n,
+                              int T, int tile, int add) {
     extern __shared__ float xs[];
     const int warps = blockDim.x / 32;
     const int row = blockIdx.x * warps + (threadIdx.x / 32);
@@ -900,18 +2676,62 @@ __global__ void gemm_q8_soa_k(const int8_t* Q, const __half* scales, const float
     }
     if (row < m) {
         float a0 = warp_sum(acc0);
-        if (lane == 0) Y[row] = a0;
+        if (lane == 0) write_y(Y, row, a0, add);
         if (T > 1) {
             float a1 = warp_sum(acc1);
-            if (lane == 0) Y[m + row] = a1;
+            if (lane == 0) write_y(Y + m, row, a1, add);
         }
         if (T > 2) {
             float a2 = warp_sum(acc2);
-            if (lane == 0) Y[2 * m + row] = a2;
+            if (lane == 0) write_y(Y + 2 * m, row, a2, add);
         }
         if (T > 3) {
             float a3 = warp_sum(acc3);
-            if (lane == 0) Y[3 * m + row] = a3;
+            if (lane == 0) write_y(Y + 3 * m, row, a3, add);
+        }
+    }
+}
+
+// T=5..32: one HBM pass over W. Acc stays in local memory (#pragma unroll 1)
+// so occupancy does not collapse the way a 16/32-reg template did.
+__global__ void gemm_q8_soa_wide_k(const int8_t* Q, const __half* scales, const float* X, float* Y, int m,
+                                   int n, int T, int tile, int add) {
+    extern __shared__ float xs[];
+    const int warps = blockDim.x / 32;
+    const int row = blockIdx.x * warps + (threadIdx.x / 32);
+    const int lane = threadIdx.x & 31;
+    const int nb = n / 32;
+    const int tstride = (tile / 32) * kXsPad;
+    float acc[32];
+#pragma unroll 1
+    for (int t = 0; t < T; ++t) acc[t] = 0.f;
+    const int8_t* rowq = row < m ? Q + static_cast<size_t>(row) * n : nullptr;
+    const __half* rows = row < m ? scales + static_cast<size_t>(row) * nb : nullptr;
+    for (int k0 = 0; k0 < n; k0 += tile) {
+        const int kn = n - k0 < tile ? n - k0 : tile;
+        for (int i = threadIdx.x; i < T * kn; i += blockDim.x) {
+            const int t = i / kn;
+            const int j = i - t * kn;
+            xs[static_cast<size_t>(t) * tstride + (j >> 5) * kXsPad + (j & 31)] =
+                X[static_cast<size_t>(t) * n + k0 + j];
+        }
+        __syncthreads();
+        if (rowq) {
+            const int bn = kn / 32;
+            for (int b = lane; b < bn; b += 32) {
+                const float d = __half2float(__ldcs(rows + k0 / 32 + b));
+                const int8_t* q = rowq + k0 + b * 32;
+#pragma unroll 1
+                for (int t = 0; t < T; ++t) acc[t] += d * q8_dot32(q, xs + t * tstride + xs_off(b));
+            }
+        }
+        __syncthreads();
+    }
+    if (row < m) {
+#pragma unroll 1
+        for (int t = 0; t < T; ++t) {
+            const float a = warp_sum(acc[t]);
+            if (lane == 0) write_y(Y + static_cast<size_t>(t) * m, row, a, add);
         }
     }
 }
@@ -2533,6 +4353,57 @@ __global__ void swiglu_k(const float* gate, const float* up, float* y, int n) {
     for (int i = i4; i < n; ++i) y[i] = silu_d(gate[i]) * up[i];
 }
 
+// HF Qwen3_5RMSNormGated: last dim = head_v_dim (gnorm weight). Tiny (n<256) stays full-vector.
+__global__ void gated_rms_heads_k(const float* x, const float* z, const float* gamma, float* y, int n, int T,
+                                  float eps, int hd) {
+    const int t = static_cast<int>(blockIdx.y);
+    const int h = static_cast<int>(blockIdx.x);
+    if (t >= T || hd <= 0) return;
+    const int nhead = n / hd;
+    if (h >= nhead) return;
+    const float* xt = x + static_cast<size_t>(t) * n + static_cast<size_t>(h) * hd;
+    const float* zt = z + static_cast<size_t>(t) * n + static_cast<size_t>(h) * hd;
+    float* yt = y + static_cast<size_t>(t) * n + static_cast<size_t>(h) * hd;
+    __shared__ float buf[128];
+    float ss = 0.f;
+    for (int i = threadIdx.x; i < hd; i += blockDim.x) ss += xt[i] * xt[i];
+    buf[threadIdx.x] = ss;
+    __syncthreads();
+    for (int s = static_cast<int>(blockDim.x) / 2; s > 0; s >>= 1) {
+        if (threadIdx.x < s) buf[threadIdx.x] += buf[threadIdx.x + s];
+        __syncthreads();
+    }
+    const float inv = rsqrtf(buf[0] / static_cast<float>(hd) + eps);
+    for (int i = threadIdx.x; i < hd; i += blockDim.x) {
+        const float g = gamma ? gamma[i] : 1.f;
+        yt[i] = g * (xt[i] * inv) * silu_d(zt[i]);
+    }
+}
+
+__global__ void gated_rms_k(const float* x, const float* z, const float* gamma, float* y, int n, float eps,
+                            int gamma_n);
+__global__ void gated_rms_batch_k(const float* x, const float* z, const float* gamma, float* y, int n, int T,
+                                  float eps, int gamma_n);
+
+void launch_gated_rms_vec(const float* x, const float* z, const float* gamma, float* y, int n, int T, float eps,
+                          int gamma_n) {
+    if (T <= 0 || n <= 0) return;
+    if (gamma_n <= 0) gamma_n = n;
+    if (gamma_n < n && (n % gamma_n) == 0 && n >= 256) {
+        static int once = 0;
+        if (!once) {
+            std::fprintf(stderr, "gdn_rms per_head=1 gnorm_n=%d zdim=%d T=%d\n", gamma_n, n, T);
+            once = 1;
+        }
+        gated_rms_heads_k<<<dim3(n / gamma_n, T), 128>>>(x, z, gamma, y, n, T, eps, gamma_n);
+        return;
+    }
+    if (T == 1)
+        gated_rms_k<<<1, 256>>>(x, z, gamma, y, n, eps, gamma_n);
+    else
+        gated_rms_batch_k<<<T, 256>>>(x, z, gamma, y, n, T, eps, gamma_n);
+}
+
 __global__ void gated_rms_k(const float* x, const float* z, const float* gamma, float* y, int n, float eps,
                             int gamma_n) {
     __shared__ float buf[256];
@@ -2573,6 +4444,21 @@ __device__ __forceinline__ void conv1d_push(const float* x_t, float* state, int 
     }
     for (int p = 0; p < k - 1; ++p) st[p] = st[p + 1];
     st[k - 1] = x_t[c];
+}
+
+// Per-channel conv snapshot. T=2 used to let head 0 copy the whole buffer
+// while other heads were still pushing t=0 — that race broke Q4 restore.
+__device__ __forceinline__ void conv_st_copy_ch(float* dst, const float* src, int c, int k) {
+    const float* s = src + c * k;
+    float* d = dst + c * k;
+    if (k == 4) {
+        d[0] = s[0];
+        d[1] = s[1];
+        d[2] = s[2];
+        d[3] = s[3];
+        return;
+    }
+    for (int p = 0; p < k; ++p) d[p] = s[p];
 }
 
 __global__ void conv1d_upd_k(const float* x_t, const float* w, float* state, float* y, int dim, int k) {
@@ -2665,8 +4551,7 @@ __global__ void expand_qkv_k(const float* mix, float* qh, float* kh, float* vh, 
     const int h = blockIdx.x;
     if (h >= nv) return;
     const int qdim = nk * dk;
-    const int rep = nv / nk;
-    const int src = h / rep;
+    const int src = gdn_src_h(h, nk, nv);
     const float* Q = mix;
     const float* K = mix + qdim;
     const float* V = mix + 2 * qdim;
@@ -2768,8 +4653,7 @@ __global__ void gdn_prefill_steps_k(const float* mix_seq, const float* aa_seq, c
     const bool s_smem = (dk * dv <= 16384);
     float* Shs = sm + 2 * dk;
     const int qdim = nk * dk;
-    const int rep = nv / nk;
-    const int src = h / rep;
+    const int src = gdn_src_h(h, nk, nv);
     const bool fuse_conv = (T == 1 && qkv_raw && conv_w && conv_st && conv_k > 0);
     uint16_t* Sh = S + static_cast<size_t>(h) * dk * dv;
     __shared__ float qbuf[128], kbuf[128], qinv, kinv, beta_h, glog_h;
@@ -2926,7 +4810,7 @@ __global__ void gdn_prefill_steps_k(const float* mix_seq, const float* aa_seq, c
         __syncthreads();
     }
     if (fuse_conv) {
-        if (h % rep == 0) {
+        if (gdn_qk_conv_owner(h, nk, nv)) {
             for (int i = threadIdx.x; i < dk; i += blockDim.x) {
                 conv1d_push(qkv_raw, conv_st, src * dk + i, conv_k);
                 conv1d_push(qkv_raw, conv_st, qdim + src * dk + i, conv_k);
@@ -3003,7 +4887,7 @@ __global__ void gdn_prefill_split2_k(const float* mix_seq, const float* aa_seq, 
 #pragma unroll
     for (int i = 0; i < HALF; ++i) scol[i] = bf16_to_f32(Sh[(i0 + i) * DV + j0 + j]);
     const int qdim = nk * DK;
-    const int src_h = h / (nv / nk);
+    const int src_h = gdn_src_h(h, nk, nv);
     for (int t = 0; t < T; ++t) {
         const float* mix = mix_seq + static_cast<size_t>(t) * qkv_dim;
         const float* Q = mix + src_h * DK;
@@ -3068,7 +4952,7 @@ __global__ void gdn_prefill_split_k(const float* mix_seq, const float* aa_seq, c
 #pragma unroll
     for (int i = 0; i < HALF; ++i) scol[i] = bf16_to_f32(Sh[(i0 + i) * DV + j0 + j]);
     const int qdim = nk * DK;
-    const int src_h = h / (nv / nk);
+    const int src_h = gdn_src_h(h, nk, nv);
     auto load_qk = [&](int t, float* qd, float* kd) {
         const float* mix = mix_seq + static_cast<size_t>(t) * qkv_dim;
         const float* Q = mix + src_h * DK;
@@ -3240,18 +5124,28 @@ __global__ void __launch_bounds__(256, 1) gdn_decode_t1_k(const float* aa, const
                                                           const float* A_log, const float* dt_bias, float* o,
                                                           int nk, int nv, const float* qkv_raw,
                                                           const float* conv_w, float* conv_st,
-                                                          const uint8_t* pf, int pf_bytes) {
+                                                          const uint8_t* pf, int pf_bytes, int qkv_stride,
+                                                          int ab_stride, int S_elems, int conv_elems,
+                                                          int o_stride) {
     constexpr int dk = 128, dv = 128;
     const int h = blockIdx.x;
+    const int bid = blockIdx.y;
     if (h >= nv) return;
+    if (qkv_stride) qkv_raw += static_cast<size_t>(bid) * qkv_stride;
+    if (ab_stride) {
+        aa += static_cast<size_t>(bid) * ab_stride;
+        bb += static_cast<size_t>(bid) * ab_stride;
+    }
+    if (S_elems) S += static_cast<size_t>(bid) * S_elems;
+    if (conv_elems) conv_st += static_cast<size_t>(bid) * conv_elems;
+    if (o_stride) o += static_cast<size_t>(bid) * o_stride;
     extern __shared__ float sm[];
     float* q = sm;
     float* k = sm + dk;
     float* Sp = sm + 2 * dk;
     uint16_t* Sh = S + static_cast<size_t>(h) * dk * dv;
     const int qdim = nk * dk;
-    const int rep = nv / nk;
-    const int src = h / rep;
+    const int src = gdn_src_h(h, nk, nv);
     __shared__ float qbuf[8], kbuf[8], qinv, kinv, beta_h, glog_h;
 
     gdn_s_load_f32(Sp, Sh, dk * dv);
@@ -3339,11 +5233,261 @@ __global__ void __launch_bounds__(256, 1) gdn_decode_t1_k(const float* aa, const
         conv1d_push(qkv_raw, conv_st, 2 * qdim + h * dv + j, 4);
     }
     __syncthreads();
-    if (h % rep == 0) {
+    if (gdn_qk_conv_owner(h, nk, nv)) {
         for (int i = threadIdx.x; i < dk; i += blockDim.x) {
             conv1d_push(qkv_raw, conv_st, src * dk + i, 4);
             conv1d_push(qkv_raw, conv_st, qdim + src * dk + i, 4);
         }
+    }
+    gdn_s_store_bf16(Sh, Sp, dk * dv);
+}
+
+// T=2/3 spec: keep S in smem across tokens. One launch, one HBM S load/store.
+template <int NT>
+__global__ void __launch_bounds__(256, 1) gdn_decode_tn_k(const float* aa, const float* bb, uint16_t* S,
+                                                          const float* A_log, const float* dt_bias, float* o,
+                                                          int nk, int nv, const float* qkv_raw,
+                                                          const float* conv_w, float* conv_st,
+                                                          uint16_t* S_bak, float* conv_bak, int qkv_dim) {
+    constexpr int dk = 128, dv = 128;
+    const int h = blockIdx.x;
+    if (h >= nv) return;
+    extern __shared__ float sm[];
+    float* q = sm;
+    float* k = sm + dk;
+    float* Sp = sm + 2 * dk;
+    uint16_t* Sh = S + static_cast<size_t>(h) * dk * dv;
+    const int qdim = nk * dk;
+    const int src = gdn_src_h(h, nk, nv);
+    __shared__ float qbuf[8], kbuf[8], qinv, kinv, beta_h, glog_h;
+    gdn_s_load_f32(Sp, Sh, dk * dv);
+    for (int t = 0; t < NT; ++t) {
+        const float* qkv = qkv_raw + static_cast<size_t>(t) * qkv_dim;
+        const float* aat = aa + static_cast<size_t>(t) * nv;
+        const float* bbt = bb + static_cast<size_t>(t) * nv;
+        float* ot = o + static_cast<size_t>(t) * nv * dv;
+        float qss = 0.f, kss = 0.f;
+        for (int i = threadIdx.x; i < dk; i += blockDim.x) {
+            const float qi = conv1d_mix(qkv, conv_w, conv_st, src * dk + i, 4);
+            const float ki = conv1d_mix(qkv, conv_w, conv_st, qdim + src * dk + i, 4);
+            q[i] = qi;
+            k[i] = ki;
+            qss += qi * qi;
+            kss += ki * ki;
+        }
+        qss = warp_sum(qss);
+        kss = warp_sum(kss);
+        if ((threadIdx.x & 31) == 0) {
+            qbuf[threadIdx.x >> 5] = qss;
+            kbuf[threadIdx.x >> 5] = kss;
+        }
+        if (threadIdx.x == 0) {
+            beta_h = sigmoid_d(bbt[h]);
+            glog_h = -expf(A_log[h]) * softplus_d(aat[h] + dt_bias[h]);
+        }
+        __syncthreads();
+        if (threadIdx.x == 0) {
+            const int nw = blockDim.x >> 5;
+            float qt = 0.f, kt = 0.f;
+            for (int w = 0; w < nw; ++w) {
+                qt += qbuf[w];
+                kt += kbuf[w];
+            }
+            qinv = rsqrtf(qt + 1e-6f) * rsqrtf(static_cast<float>(dk));
+            kinv = rsqrtf(kt + 1e-6f);
+        }
+        __syncthreads();
+        for (int i = threadIdx.x; i < dk; i += blockDim.x) {
+            q[i] *= qinv;
+            k[i] *= kinv;
+        }
+        __syncthreads();
+        const float g = expf(glog_h);
+        const float b = beta_h;
+        const int j = threadIdx.x;
+        if (j < dv) {
+            float kvj = 0.f;
+#pragma unroll 4
+            for (int i = 0; i < dk; i += 4) {
+                const float s0 = Sp[(i + 0) * dv + j] * g;
+                const float s1 = Sp[(i + 1) * dv + j] * g;
+                const float s2 = Sp[(i + 2) * dv + j] * g;
+                const float s3 = Sp[(i + 3) * dv + j] * g;
+                Sp[(i + 0) * dv + j] = s0;
+                Sp[(i + 1) * dv + j] = s1;
+                Sp[(i + 2) * dv + j] = s2;
+                Sp[(i + 3) * dv + j] = s3;
+                kvj += s0 * k[i] + s1 * k[i + 1] + s2 * k[i + 2] + s3 * k[i + 3];
+            }
+            const float vj = conv1d_mix(qkv, conv_w, conv_st, 2 * qdim + h * dv + j, 4);
+            const float del = (vj - kvj) * b;
+            float oj = 0.f;
+#pragma unroll 4
+            for (int i = 0; i < dk; i += 4) {
+                const float s0 = Sp[(i + 0) * dv + j] + k[i] * del;
+                const float s1 = Sp[(i + 1) * dv + j] + k[i + 1] * del;
+                const float s2 = Sp[(i + 2) * dv + j] + k[i + 2] * del;
+                const float s3 = Sp[(i + 3) * dv + j] + k[i + 3] * del;
+                Sp[(i + 0) * dv + j] = s0;
+                Sp[(i + 1) * dv + j] = s1;
+                Sp[(i + 2) * dv + j] = s2;
+                Sp[(i + 3) * dv + j] = s3;
+                oj += s0 * q[i] + s1 * q[i + 1] + s2 * q[i + 2] + s3 * q[i + 3];
+            }
+            ot[h * dv + j] = oj;
+            conv1d_push(qkv, conv_st, 2 * qdim + h * dv + j, 4);
+        }
+        __syncthreads();
+        if (gdn_qk_conv_owner(h, nk, nv)) {
+            for (int i = threadIdx.x; i < dk; i += blockDim.x) {
+                conv1d_push(qkv, conv_st, src * dk + i, 4);
+                conv1d_push(qkv, conv_st, qdim + src * dk + i, 4);
+            }
+        }
+        __syncthreads();
+        if (t == 0 && S_bak && conv_bak) {
+            uint16_t* Sb = S_bak + static_cast<size_t>(h) * dk * dv;
+            gdn_s_store_bf16(Sb, Sp, dk * dv);
+            if (gdn_qk_conv_owner(h, nk, nv)) {
+                for (int i = threadIdx.x; i < dk; i += blockDim.x) {
+                    conv_st_copy_ch(conv_bak, conv_st, src * dk + i, 4);
+                    conv_st_copy_ch(conv_bak, conv_st, qdim + src * dk + i, 4);
+                }
+            }
+            for (int i = threadIdx.x; i < dv; i += blockDim.x)
+                conv_st_copy_ch(conv_bak, conv_st, 2 * qdim + h * dv + i, 4);
+        }
+        __syncthreads();
+    }
+    gdn_s_store_bf16(Sh, Sp, dk * dv);
+}
+
+// T=4 GDN with a second snap after t=1 so a d0-hit / d1-miss can restore
+// persist S/conv without replaying T=2 (replay dirties rejected KV slots).
+__global__ void __launch_bounds__(256, 1) gdn_decode_t4_mid_k(const float* aa, const float* bb, uint16_t* S,
+                                                             const float* A_log, const float* dt_bias, float* o,
+                                                             int nk, int nv, const float* qkv_raw,
+                                                             const float* conv_w, float* conv_st,
+                                                             uint16_t* S_bak, float* conv_bak, uint16_t* S_mid,
+                                                             float* conv_mid, int qkv_dim) {
+    constexpr int dk = 128, dv = 128;
+    const int h = blockIdx.x;
+    if (h >= nv) return;
+    extern __shared__ float sm[];
+    float* q = sm;
+    float* k = sm + dk;
+    float* Sp = sm + 2 * dk;
+    uint16_t* Sh = S + static_cast<size_t>(h) * dk * dv;
+    const int qdim = nk * dk;
+    const int src = gdn_src_h(h, nk, nv);
+    __shared__ float qbuf[8], kbuf[8], qinv, kinv, beta_h, glog_h;
+    gdn_s_load_f32(Sp, Sh, dk * dv);
+    for (int t = 0; t < 4; ++t) {
+        const float* qkv = qkv_raw + static_cast<size_t>(t) * qkv_dim;
+        const float* aat = aa + static_cast<size_t>(t) * nv;
+        const float* bbt = bb + static_cast<size_t>(t) * nv;
+        float* ot = o + static_cast<size_t>(t) * nv * dv;
+        float qss = 0.f, kss = 0.f;
+        for (int i = threadIdx.x; i < dk; i += blockDim.x) {
+            const float qi = conv1d_mix(qkv, conv_w, conv_st, src * dk + i, 4);
+            const float ki = conv1d_mix(qkv, conv_w, conv_st, qdim + src * dk + i, 4);
+            q[i] = qi;
+            k[i] = ki;
+            qss += qi * qi;
+            kss += ki * ki;
+        }
+        qss = warp_sum(qss);
+        kss = warp_sum(kss);
+        if ((threadIdx.x & 31) == 0) {
+            qbuf[threadIdx.x >> 5] = qss;
+            kbuf[threadIdx.x >> 5] = kss;
+        }
+        if (threadIdx.x == 0) {
+            beta_h = sigmoid_d(bbt[h]);
+            glog_h = -expf(A_log[h]) * softplus_d(aat[h] + dt_bias[h]);
+        }
+        __syncthreads();
+        if (threadIdx.x == 0) {
+            const int nw = blockDim.x >> 5;
+            float qt = 0.f, kt = 0.f;
+            for (int w = 0; w < nw; ++w) {
+                qt += qbuf[w];
+                kt += kbuf[w];
+            }
+            qinv = rsqrtf(qt + 1e-6f) * rsqrtf(static_cast<float>(dk));
+            kinv = rsqrtf(kt + 1e-6f);
+        }
+        __syncthreads();
+        for (int i = threadIdx.x; i < dk; i += blockDim.x) {
+            q[i] *= qinv;
+            k[i] *= kinv;
+        }
+        __syncthreads();
+        const float g = expf(glog_h);
+        const float b = beta_h;
+        const int j = threadIdx.x;
+        if (j < dv) {
+            float kvj = 0.f;
+#pragma unroll 4
+            for (int i = 0; i < dk; i += 4) {
+                const float s0 = Sp[(i + 0) * dv + j] * g;
+                const float s1 = Sp[(i + 1) * dv + j] * g;
+                const float s2 = Sp[(i + 2) * dv + j] * g;
+                const float s3 = Sp[(i + 3) * dv + j] * g;
+                Sp[(i + 0) * dv + j] = s0;
+                Sp[(i + 1) * dv + j] = s1;
+                Sp[(i + 2) * dv + j] = s2;
+                Sp[(i + 3) * dv + j] = s3;
+                kvj += s0 * k[i] + s1 * k[i + 1] + s2 * k[i + 2] + s3 * k[i + 3];
+            }
+            const float vj = conv1d_mix(qkv, conv_w, conv_st, 2 * qdim + h * dv + j, 4);
+            const float del = (vj - kvj) * b;
+            float oj = 0.f;
+#pragma unroll 4
+            for (int i = 0; i < dk; i += 4) {
+                const float s0 = Sp[(i + 0) * dv + j] + k[i] * del;
+                const float s1 = Sp[(i + 1) * dv + j] + k[i + 1] * del;
+                const float s2 = Sp[(i + 2) * dv + j] + k[i + 2] * del;
+                const float s3 = Sp[(i + 3) * dv + j] + k[i + 3] * del;
+                Sp[(i + 0) * dv + j] = s0;
+                Sp[(i + 1) * dv + j] = s1;
+                Sp[(i + 2) * dv + j] = s2;
+                Sp[(i + 3) * dv + j] = s3;
+                oj += s0 * q[i] + s1 * q[i + 1] + s2 * q[i + 2] + s3 * q[i + 3];
+            }
+            ot[h * dv + j] = oj;
+            conv1d_push(qkv, conv_st, 2 * qdim + h * dv + j, 4);
+        }
+        __syncthreads();
+        if (gdn_qk_conv_owner(h, nk, nv)) {
+            for (int i = threadIdx.x; i < dk; i += blockDim.x) {
+                conv1d_push(qkv, conv_st, src * dk + i, 4);
+                conv1d_push(qkv, conv_st, qdim + src * dk + i, 4);
+            }
+        }
+        __syncthreads();
+        uint16_t* Sdst = nullptr;
+        float* Cdst = nullptr;
+        if (t == 0 && S_bak && conv_bak) {
+            Sdst = S_bak;
+            Cdst = conv_bak;
+        } else if (t == 1 && S_mid && conv_mid) {
+            Sdst = S_mid;
+            Cdst = conv_mid;
+        }
+        if (Sdst && Cdst) {
+            uint16_t* Sb = Sdst + static_cast<size_t>(h) * dk * dv;
+            gdn_s_store_bf16(Sb, Sp, dk * dv);
+            if (gdn_qk_conv_owner(h, nk, nv)) {
+                for (int i = threadIdx.x; i < dk; i += blockDim.x) {
+                    conv_st_copy_ch(Cdst, conv_st, src * dk + i, 4);
+                    conv_st_copy_ch(Cdst, conv_st, qdim + src * dk + i, 4);
+                }
+            }
+            for (int i = threadIdx.x; i < dv; i += blockDim.x)
+                conv_st_copy_ch(Cdst, conv_st, 2 * qdim + h * dv + i, 4);
+        }
+        __syncthreads();
     }
     gdn_s_store_bf16(Sh, Sp, dk * dv);
 }
@@ -3452,6 +5596,17 @@ __global__ void split_qg_k(const float* qg, float* q, float* gate, int qn) {
         q[i] = qg[i];
         gate[i] = qg[qn + i];
     }
+}
+
+__global__ void split_qg_perhead_k(const float* qg, float* q, float* gate, int n_q, int hd) {
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    const int qn = n_q * hd;
+    if (i >= qn) return;
+    const int h = i / hd;
+    const int d = i - h * hd;
+    const int base = h * hd * 2;
+    q[i] = qg[base + d];
+    gate[i] = qg[base + hd + d];
 }
 
 __global__ void head_rms_k(float* x, const float* gamma, int n_heads, int hd, float eps) {
@@ -3599,6 +5754,70 @@ __global__ void attn_decode_k(const float* q, const float* k_cache, const float*
     }
 }
 
+// Official 27B GQA-6 (24Q/4KV hd=256 F16): one block per KV head, Flash attend.
+// FlashInfer cannot dispatch group=6; this is the legal Flash path.
+__global__ void qk_attn_decode_gqa_k(float* q, const float* k, const float* v, const float* q_norm,
+                                     const float* k_norm, float* k_cache, float* v_cache, float* o,
+                                     const int* pos, int n_q, int n_kv, int hd, int rotary, float theta,
+                                     float eps, int ctx) {
+    const int hkv = blockIdx.x;
+    if (hkv >= n_kv || hd != 256 || n_kv <= 0 || n_q % n_kv != 0) return;
+    const int g = n_q / n_kv;
+    // 2D grid (n_kv, g) runs one Q head per block. 1D grid keeps the old serial loop.
+    const int qi0 = (gridDim.y > 1) ? static_cast<int>(blockIdx.y) : 0;
+    const int qi1 = (gridDim.y > 1) ? qi0 + 1 : g;
+    if (qi0 >= g) return;
+    const int p = *pos;
+    const int Tend = (p + 1) < ctx ? (p + 1) : ctx;
+    const int kn = n_kv * hd;
+    extern __shared__ float sm[];
+    float* khloc = sm;
+    __shared__ float inv, wss[8];
+    auto rms_rope = [&](float* x, const float* gamma) {
+        float ss = 0.f;
+        for (int i = threadIdx.x; i < hd; i += blockDim.x) ss += x[i] * x[i];
+        ss = warp_sum(ss);
+        if ((threadIdx.x & 31) == 0) wss[threadIdx.x >> 5] = ss;
+        __syncthreads();
+        if (threadIdx.x == 0) {
+            float tot = 0.f;
+            const int nw = blockDim.x >> 5;
+            for (int w = 0; w < nw && w < 8; ++w) tot += wss[w];
+            inv = rsqrtf(tot / static_cast<float>(hd) + eps);
+        }
+        __syncthreads();
+        for (int i = threadIdx.x; i < hd; i += blockDim.x) {
+            const float gn = gamma ? (1.f + gamma[i]) : 1.f;
+            x[i] *= inv * gn;
+        }
+        __syncthreads();
+        rope_apply(x, rotary, static_cast<float>(p), theta, hd);
+        __syncthreads();
+    };
+    const float* ksrc = k + hkv * hd;
+    for (int i = threadIdx.x; i < hd; i += blockDim.x) khloc[i] = ksrc[i];
+    __syncthreads();
+    rms_rope(khloc, k_norm);
+    __half* kc = reinterpret_cast<__half*>(k_cache) + static_cast<size_t>(p) * kn + hkv * hd;
+    __half* vc = reinterpret_cast<__half*>(v_cache) + static_cast<size_t>(p) * kn + hkv * hd;
+    const float* vs = v + hkv * hd;
+    for (int i = threadIdx.x; i < hd; i += blockDim.x) {
+        kc[i] = __float2half(khloc[i]);
+        vc[i] = __float2half(vs[i]);
+    }
+    __syncthreads();
+    const float scale = rsqrtf(static_cast<float>(hd));
+    for (int qi = qi0; qi < qi1; ++qi) {
+        const int hq = hkv * g + qi;
+        float* qh = q + hq * hd;
+        rms_rope(qh, q_norm);
+        flash_attn_decode_f16_hd256(qh, reinterpret_cast<const __half*>(k_cache),
+                                    reinterpret_cast<const __half*>(v_cache), o + hq * hd, Tend, kn,
+                                    hkv, scale);
+        __syncthreads();
+    }
+}
+
 // T=1: per-q-head RMS+RoPE, GQA replica writes K/V into cache from a local k copy (no
 // in-place k race), then decode attn. Grid = n_q, 128 threads (4-warp RMS reduce).
 // Not the failed 128-thread + in-kernel RoPE table (that used warp_sum as block sum).
@@ -3607,7 +5826,30 @@ __global__ void qk_attn_decode_k(float* q, const float* k, const float* v, const
                                  const float* k_norm, float* k_cache, float* v_cache, float* o,
                                  const int* pos, int n_q, int n_kv, int hd, int rotary, float theta,
                                  float eps, int ctx, int kv_f16, int8_t* k_q8, __half* k_sc, uint8_t* v_qs,
-                                 __half* v_sc) {
+                                 __half* v_sc, int q_bstride, int kv_bstride, int cache_bstride) {
+    const int b = static_cast<int>(blockIdx.y);
+    if (b) {
+        if (q_bstride) {
+            q += static_cast<size_t>(b) * q_bstride;
+            o += static_cast<size_t>(b) * q_bstride;
+        }
+        if (kv_bstride) {
+            k += static_cast<size_t>(b) * kv_bstride;
+            v += static_cast<size_t>(b) * kv_bstride;
+        }
+        pos += b;
+        if (cache_bstride && k_cache && v_cache) {
+            if (kv_f16 == 1) {
+                k_cache = reinterpret_cast<float*>(reinterpret_cast<__half*>(k_cache) +
+                                                   static_cast<size_t>(b) * cache_bstride);
+                v_cache = reinterpret_cast<float*>(reinterpret_cast<__half*>(v_cache) +
+                                                   static_cast<size_t>(b) * cache_bstride);
+            } else {
+                k_cache += static_cast<size_t>(b) * cache_bstride;
+                v_cache += static_cast<size_t>(b) * cache_bstride;
+            }
+        }
+    }
     const int hq = blockIdx.x;
     if (hq >= n_q || n_kv <= 0 || hd <= 0 || ctx <= 0) return;
     const int p = *pos;
@@ -3619,10 +5861,13 @@ __global__ void qk_attn_decode_k(float* q, const float* k, const float* v, const
     const int hkv = hq / rep;
     extern __shared__ float sm[];
     float* scores = sm;
-    float* khloc = sm + (ctx > 8192 ? 0 : ctx);
+    const bool use_flash = (kv_f16 == 1 && hd == 256 && d_use_flash);
+    // Flash attend does not use scores[T]. khloc must sit at sm[0] so a
+    // 1 KiB launch (no scores) stays in-bounds — ctx<=8k used to put it at sm[ctx].
+    float* khloc = sm + ((ctx > 8192 || use_flash) ? 0 : ctx);
 
     float* qh = q + hq * hd;
-    __shared__ float inv, wss[4];
+    __shared__ float inv, wss[8];
     const bool f4 = (hd == 128 && (ctx & 3) == 0);
     float ss = 0.f;
     if (f4) {
@@ -3640,7 +5885,7 @@ __global__ void qk_attn_decode_k(float* q, const float* k, const float* v, const
     if (threadIdx.x == 0) {
         float tot = wss[0];
         const int nw = blockDim.x >> 5;
-        for (int w = 1; w < nw && w < 4; ++w) tot += wss[w];
+        for (int w = 1; w < nw && w < 8; ++w) tot += wss[w];
         inv = rsqrtf(tot / static_cast<float>(hd) + eps);
     }
     __syncthreads();
@@ -3663,14 +5908,7 @@ __global__ void qk_attn_decode_k(float* q, const float* k, const float* v, const
         }
     }
     __syncthreads();
-    for (int i = threadIdx.x; i < pairs; i += blockDim.x) {
-        const float freq = 1.f / powf(theta, static_cast<float>(i) / static_cast<float>(pairs));
-        const float ang = pf * freq;
-        const float c = cosf(ang), s = sinf(ang);
-        const float x0 = qh[2 * i], x1 = qh[2 * i + 1];
-        qh[2 * i] = x0 * c - x1 * s;
-        qh[2 * i + 1] = x0 * s + x1 * c;
-    }
+    rope_apply(qh, rotary, pf, theta, hd);
 
     const float* ksrc = k + hkv * hd;
     if (f4) {
@@ -3697,7 +5935,7 @@ __global__ void qk_attn_decode_k(float* q, const float* k, const float* v, const
     if (threadIdx.x == 0) {
         float tot = wss[0];
         const int nw = blockDim.x >> 5;
-        for (int w = 1; w < nw && w < 4; ++w) tot += wss[w];
+        for (int w = 1; w < nw && w < 8; ++w) tot += wss[w];
         inv = rsqrtf(tot / static_cast<float>(hd) + eps);
     }
     __syncthreads();
@@ -3720,14 +5958,7 @@ __global__ void qk_attn_decode_k(float* q, const float* k, const float* v, const
         }
     }
     __syncthreads();
-    for (int i = threadIdx.x; i < pairs; i += blockDim.x) {
-        const float freq = 1.f / powf(theta, static_cast<float>(i) / static_cast<float>(pairs));
-        const float ang = pf * freq;
-        const float c = cosf(ang), s = sinf(ang);
-        const float x0 = khloc[2 * i], x1 = khloc[2 * i + 1];
-        khloc[2 * i] = x0 * c - x1 * s;
-        khloc[2 * i + 1] = x0 * s + x1 * c;
-    }
+    rope_apply(khloc, rotary, pf, theta, hd);
     __syncthreads();
     const float* vs = v + hkv * hd;
     // F16 store first: the tq pack below reuses khloc for V's FWHT.
@@ -3769,7 +6000,7 @@ __global__ void qk_attn_decode_k(float* q, const float* k, const float* v, const
         if (threadIdx.x == 0) {
             float m = wss[0];
             const int nw = blockDim.x >> 5;
-            for (int w = 1; w < nw && w < 4; ++w) m = fmaxf(m, wss[w]);
+            for (int w = 1; w < nw && w < 8; ++w) m = fmaxf(m, wss[w]);
             wss[0] = m / 127.f + 1e-8f;
             k_sc[static_cast<size_t>(p) * n_kv + hkv] = __float2half(wss[0]);
         }
@@ -3810,7 +6041,7 @@ __global__ void qk_attn_decode_k(float* q, const float* k, const float* v, const
     if (kv_f16 == 3) {
         return;
     }
-    if (kv_f16 == 1 && hd == 256 && ctx > 8192) {
+    if (use_flash) {
         flash_attn_decode_f16_hd256(qh, reinterpret_cast<const __half*>(k_cache),
                                     reinterpret_cast<const __half*>(v_cache), oh, Tend, kn, hkv, scale);
         return;
@@ -3847,7 +6078,7 @@ __global__ void qk_attn_decode_k(float* q, const float* k, const float* v, const
             if (threadIdx.x == 0) {
                 float tot = wss[0];
                 const int nw = blockDim.x >> 5;
-                for (int w = 1; w < nw && w < 4; ++w) tot += wss[w];
+                for (int w = 1; w < nw && w < 8; ++w) tot += wss[w];
                 const float s = tot * scale;
                 float& om = wss[0];
                 float& ol = wss[1];
@@ -3897,18 +6128,27 @@ __global__ void qk_attn_decode_k(float* q, const float* k, const float* v, const
             oh[threadIdx.x] = acc / den;
         }
     } else {
+        // Short-ctx smem scores. Official 27B stores F16 KV (hd=256);
+        // reading those halves as float* is the same garbage path as the
+        // old T<32 prefill cast (decode residual ~1e13 after one token).
         for (int t = threadIdx.x; t < Tend; t += blockDim.x) {
             float dot = 0.f;
-            const float* kh = k_cache + static_cast<size_t>(t) * kn + hkv * hd;
-            if (f4) {
-#pragma unroll
-                for (int d = 0; d < 32; ++d) {
-                    const float4 qv = reinterpret_cast<const float4*>(qh)[d];
-                    const float4 kv = reinterpret_cast<const float4*>(kh)[d];
-                    dot += qv.x * kv.x + qv.y * kv.y + qv.z * kv.z + qv.w * kv.w;
-                }
+            if (kv_f16 == 1) {
+                const __half* kh = reinterpret_cast<const __half*>(k_cache) +
+                                   static_cast<size_t>(t) * kn + hkv * hd;
+                for (int d = 0; d < hd; ++d) dot += qh[d] * __half2float(kh[d]);
             } else {
-                for (int d = 0; d < hd; ++d) dot += qh[d] * kh[d];
+                const float* kh = k_cache + static_cast<size_t>(t) * kn + hkv * hd;
+                if (f4) {
+#pragma unroll
+                    for (int d = 0; d < 32; ++d) {
+                        const float4 qv = reinterpret_cast<const float4*>(qh)[d];
+                        const float4 kv = reinterpret_cast<const float4*>(kh)[d];
+                        dot += qv.x * kv.x + qv.y * kv.y + qv.z * kv.z + qv.w * kv.w;
+                    }
+                } else {
+                    for (int d = 0; d < hd; ++d) dot += qh[d] * kh[d];
+                }
             }
             scores[t] = dot * scale;
         }
@@ -3929,8 +6169,14 @@ __global__ void qk_attn_decode_k(float* q, const float* k, const float* v, const
         for (int d = threadIdx.x; d < hd; d += blockDim.x) {
             float acc = 0.f;
             for (int t = 0; t < Tend; ++t) {
-                const float* vh = v_cache + static_cast<size_t>(t) * kn + hkv * hd;
-                acc += (scores[t] / sumv) * vh[d];
+                if (kv_f16 == 1) {
+                    const __half* vh = reinterpret_cast<const __half*>(v_cache) +
+                                       static_cast<size_t>(t) * kn + hkv * hd;
+                    acc += (scores[t] / sumv) * __half2float(vh[d]);
+                } else {
+                    const float* vh = v_cache + static_cast<size_t>(t) * kn + hkv * hd;
+                    acc += (scores[t] / sumv) * vh[d];
+                }
             }
             oh[d] = acc;
         }
@@ -3959,6 +6205,11 @@ __global__ void embed_bf16_k(const uint16_t* E, const int* tok, float* x, int H)
 
 __global__ void inc_pos_k(int* pos) {
     if (threadIdx.x == 0 && blockIdx.x == 0) ++(*pos);
+}
+
+__global__ void inc_pos_n_k(int* pos, int n) {
+    const int i = static_cast<int>(blockIdx.x * blockDim.x + threadIdx.x);
+    if (i < n) ++pos[i];
 }
 
 __global__ void set_pos_k(int* pos, int v) {
@@ -4155,6 +6406,23 @@ __global__ void f32_to_f16_k(const float* x, __half* y, int n) {
     if (i < n) y[i] = __float2half(x[i]);
 }
 
+// Q8 SoA tile → row-major F16. Wout is [mr, n]; source rows start at row0.
+__global__ void dequant_q8_soa_f16_k(const int8_t* Q, const __half* scales, __half* W, int n, int row0,
+                                     int mr) {
+    const size_t i4 = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    const size_t n4 = static_cast<size_t>(mr) * static_cast<size_t>(n >> 2);
+    if (i4 >= n4) return;
+    const int col = static_cast<int>((i4 << 2) % static_cast<size_t>(n));
+    const int r = static_cast<int>((i4 << 2) / static_cast<size_t>(n));
+    const int row = row0 + r;
+    const float d = __half2float(__ldg(scales + static_cast<size_t>(row) * static_cast<size_t>(n >> 5) +
+                                      static_cast<size_t>(col >> 5)));
+    const char4 q = *reinterpret_cast<const char4*>(Q + static_cast<size_t>(row) * n + col);
+    __half2* dst = reinterpret_cast<__half2*>(W + (i4 << 2));
+    dst[0] = __floats2half2_rn(d * static_cast<float>(q.x), d * static_cast<float>(q.y));
+    dst[1] = __floats2half2_rn(d * static_cast<float>(q.z), d * static_cast<float>(q.w));
+}
+
 // One 128×128 scale tile per block. 1024 threads → 4 rows/warp. FP8→half via HW cvt.
 __global__ void dequant_fp8_kmaj_row_k(const uint8_t* W, const float* scale, __half* out, int m, int n) {
     const int row0 = blockIdx.x * 128;
@@ -4240,6 +6508,30 @@ __device__ __forceinline__ float e4_dot16_rm(uint4 p, const float* x) {
     return fp8x4_dot(p.x, x) + fp8x4_dot(p.y, x + 4) + fp8x4_dot(p.z, x + 8) + fp8x4_dot(p.w, x + 12);
 }
 
+// Same as e4_dot16_rm but x lives in global / L2 (second T=2 token).
+__device__ __forceinline__ float fp8x4_dot_v(uint32_t p, float4 xv) {
+#if __CUDA_ARCH__ >= 890
+    unsigned h01, h23;
+    const unsigned short lo = static_cast<unsigned short>(p);
+    const unsigned short hi = static_cast<unsigned short>(p >> 16);
+    asm volatile("cvt.rn.f16x2.e4m3x2 %0, %1;" : "=r"(h01) : "h"(lo));
+    asm volatile("cvt.rn.f16x2.e4m3x2 %0, %1;" : "=r"(h23) : "h"(hi));
+    const float2 f0 = __half22float2(*reinterpret_cast<const __half2*>(&h01));
+    const float2 f1 = __half22float2(*reinterpret_cast<const __half2*>(&h23));
+    return f0.x * xv.x + f0.y * xv.y + f1.x * xv.z + f1.y * xv.w;
+#else
+    return fp8e4_to_f32(static_cast<uint8_t>(p)) * xv.x + fp8e4_to_f32(static_cast<uint8_t>(p >> 8)) * xv.y +
+           fp8e4_to_f32(static_cast<uint8_t>(p >> 16)) * xv.z + fp8e4_to_f32(static_cast<uint8_t>(p >> 24)) * xv.w;
+#endif
+}
+
+__device__ __forceinline__ float e4_dot16_rm_ldg(uint4 p, const float* x) {
+    return fp8x4_dot_v(p.x, __ldg(reinterpret_cast<const float4*>(x))) +
+           fp8x4_dot_v(p.y, __ldg(reinterpret_cast<const float4*>(x + 4))) +
+           fp8x4_dot_v(p.z, __ldg(reinterpret_cast<const float4*>(x + 8))) +
+           fp8x4_dot_v(p.w, __ldg(reinterpret_cast<const float4*>(x + 12)));
+}
+
 // Row-major e4 (scales already absorbed). T=1 path; k-major GEMV kernels unchanged.
 __global__ void __launch_bounds__(512, 2) gemv_fp8_rm_2row_k(const uint8_t* W, const float* x, float* y, int m,
                                                              int n, int add) {
@@ -4272,6 +6564,170 @@ __global__ void __launch_bounds__(512, 2) gemv_fp8_rm_2row_k(const uint8_t* W, c
     if (row1 < m) {
         acc1 = warp_sum(acc1);
         if (lane == 0) write_y(y, row1, acc1, add);
+    }
+}
+
+// T=2 row-major e4 (scales absorbed): one W stream, both X tokens.
+// cublasLt n=2 is ~0.5ms on 10240x5120 vs ~0.07ms T=1 GEMV — do not use Lt here.
+// x0 stays in smem (T=1 32KiB budget, 2-block/SM). x1 is __ldg from L2 so
+// tile stays kFp8XsCap: 5120/6144 are one pass; 10240/17408 lose 1–2 tile syncs
+// vs the old kFp8XsCap/2 dual-smem split.
+__global__ void __launch_bounds__(512, 2) gemv_fp8_rm_t2_k(const uint8_t* W, const float* X, float* Y, int m,
+                                                          int n, int add) {
+    extern __shared__ float xs[];
+    const int warps = blockDim.x / 32;
+    const int pair = blockIdx.x * warps + (threadIdx.x / 32);
+    const int row0 = pair * 2;
+    const int row1 = row0 + 1;
+    const int lane = threadIdx.x & 31;
+    const int tile = n <= kFp8XsCap ? n : kFp8XsCap;
+    float a00 = 0.f, a01 = 0.f, a10 = 0.f, a11 = 0.f;
+    for (int t0 = 0; t0 < n; t0 += tile) {
+        const int tn = n - t0 < tile ? n - t0 : tile;
+        load_x_tile(xs, X + t0, tn);
+        __syncthreads();
+        const float* x1 = X + n + t0;
+        if (row0 < m) {
+            const uint8_t* w0 = W + static_cast<size_t>(row0) * n + t0;
+            const uint8_t* w1 = (row1 < m) ? W + static_cast<size_t>(row1) * n + t0 : nullptr;
+            for (int j = lane * 16; j + 15 < tn; j += 512) {
+                const uint4 p0 = *reinterpret_cast<const uint4*>(w0 + j);
+                a00 += e4_dot16_rm(p0, xs + j);
+                a01 += e4_dot16_rm_ldg(p0, x1 + j);
+                if (w1) {
+                    const uint4 p1 = *reinterpret_cast<const uint4*>(w1 + j);
+                    a10 += e4_dot16_rm(p1, xs + j);
+                    a11 += e4_dot16_rm_ldg(p1, x1 + j);
+                }
+            }
+        }
+        if (t0 + tile < n) __syncthreads();
+    }
+    if (row0 < m) {
+        a00 = warp_sum(a00);
+        if (lane == 0) write_y(Y, row0, a00, add);
+        a01 = warp_sum(a01);
+        if (lane == 0) write_y(Y + m, row0, a01, add);
+    }
+    if (row1 < m) {
+        a10 = warp_sum(a10);
+        if (lane == 0) write_y(Y, row1, a10, add);
+        a11 = warp_sum(a11);
+        if (lane == 0) write_y(Y + m, row1, a11, add);
+    }
+}
+
+// T=3 prefill: x0 in smem, x1/x2 via __ldg. Same 32KiB / 2-block budget as T=1.
+// Three sequential T=1 GEMVs reread ~27GiB; this is one W stream.
+__global__ void __launch_bounds__(512, 2) gemv_fp8_rm_t3_k(const uint8_t* W, const float* X, float* Y, int m,
+                                                          int n, int add) {
+    extern __shared__ float xs[];
+    const int warps = blockDim.x / 32;
+    const int pair = blockIdx.x * warps + (threadIdx.x / 32);
+    const int row0 = pair * 2;
+    const int row1 = row0 + 1;
+    const int lane = threadIdx.x & 31;
+    const int tile = n <= kFp8XsCap ? n : kFp8XsCap;
+    float a00 = 0.f, a01 = 0.f, a02 = 0.f, a10 = 0.f, a11 = 0.f, a12 = 0.f;
+    for (int t0 = 0; t0 < n; t0 += tile) {
+        const int tn = n - t0 < tile ? n - t0 : tile;
+        load_x_tile(xs, X + t0, tn);
+        __syncthreads();
+        const float* x1 = X + n + t0;
+        const float* x2 = X + 2 * n + t0;
+        if (row0 < m) {
+            const uint8_t* w0 = W + static_cast<size_t>(row0) * n + t0;
+            const uint8_t* w1 = (row1 < m) ? W + static_cast<size_t>(row1) * n + t0 : nullptr;
+            for (int j = lane * 16; j + 15 < tn; j += 512) {
+                const uint4 p0 = *reinterpret_cast<const uint4*>(w0 + j);
+                a00 += e4_dot16_rm(p0, xs + j);
+                a01 += e4_dot16_rm_ldg(p0, x1 + j);
+                a02 += e4_dot16_rm_ldg(p0, x2 + j);
+                if (w1) {
+                    const uint4 p1 = *reinterpret_cast<const uint4*>(w1 + j);
+                    a10 += e4_dot16_rm(p1, xs + j);
+                    a11 += e4_dot16_rm_ldg(p1, x1 + j);
+                    a12 += e4_dot16_rm_ldg(p1, x2 + j);
+                }
+            }
+        }
+        if (t0 + tile < n) __syncthreads();
+    }
+    if (row0 < m) {
+        a00 = warp_sum(a00);
+        if (lane == 0) write_y(Y, row0, a00, add);
+        a01 = warp_sum(a01);
+        if (lane == 0) write_y(Y + m, row0, a01, add);
+        a02 = warp_sum(a02);
+        if (lane == 0) write_y(Y + 2 * m, row0, a02, add);
+    }
+    if (row1 < m) {
+        a10 = warp_sum(a10);
+        if (lane == 0) write_y(Y, row1, a10, add);
+        a11 = warp_sum(a11);
+        if (lane == 0) write_y(Y + m, row1, a11, add);
+        a12 = warp_sum(a12);
+        if (lane == 0) write_y(Y + 2 * m, row1, a12, add);
+    }
+}
+
+// T=4 spec: x0 in smem, x1/x2/x3 via __ldg. One W stream vs four T=1 GEMVs.
+__global__ void __launch_bounds__(512, 2) gemv_fp8_rm_t4_k(const uint8_t* W, const float* X, float* Y, int m,
+                                                          int n, int add) {
+    extern __shared__ float xs[];
+    const int warps = blockDim.x / 32;
+    const int pair = blockIdx.x * warps + (threadIdx.x / 32);
+    const int row0 = pair * 2;
+    const int row1 = row0 + 1;
+    const int lane = threadIdx.x & 31;
+    const int tile = n <= kFp8XsCap ? n : kFp8XsCap;
+    float a00 = 0.f, a01 = 0.f, a02 = 0.f, a03 = 0.f, a10 = 0.f, a11 = 0.f, a12 = 0.f, a13 = 0.f;
+    for (int t0 = 0; t0 < n; t0 += tile) {
+        const int tn = n - t0 < tile ? n - t0 : tile;
+        load_x_tile(xs, X + t0, tn);
+        __syncthreads();
+        const float* x1 = X + n + t0;
+        const float* x2 = X + 2 * n + t0;
+        const float* x3 = X + 3 * n + t0;
+        if (row0 < m) {
+            const uint8_t* w0 = W + static_cast<size_t>(row0) * n + t0;
+            const uint8_t* w1 = (row1 < m) ? W + static_cast<size_t>(row1) * n + t0 : nullptr;
+            for (int j = lane * 16; j + 15 < tn; j += 512) {
+                const uint4 p0 = *reinterpret_cast<const uint4*>(w0 + j);
+                a00 += e4_dot16_rm(p0, xs + j);
+                a01 += e4_dot16_rm_ldg(p0, x1 + j);
+                a02 += e4_dot16_rm_ldg(p0, x2 + j);
+                a03 += e4_dot16_rm_ldg(p0, x3 + j);
+                if (w1) {
+                    const uint4 p1 = *reinterpret_cast<const uint4*>(w1 + j);
+                    a10 += e4_dot16_rm(p1, xs + j);
+                    a11 += e4_dot16_rm_ldg(p1, x1 + j);
+                    a12 += e4_dot16_rm_ldg(p1, x2 + j);
+                    a13 += e4_dot16_rm_ldg(p1, x3 + j);
+                }
+            }
+        }
+        if (t0 + tile < n) __syncthreads();
+    }
+    if (row0 < m) {
+        a00 = warp_sum(a00);
+        if (lane == 0) write_y(Y, row0, a00, add);
+        a01 = warp_sum(a01);
+        if (lane == 0) write_y(Y + m, row0, a01, add);
+        a02 = warp_sum(a02);
+        if (lane == 0) write_y(Y + 2 * m, row0, a02, add);
+        a03 = warp_sum(a03);
+        if (lane == 0) write_y(Y + 3 * m, row0, a03, add);
+    }
+    if (row1 < m) {
+        a10 = warp_sum(a10);
+        if (lane == 0) write_y(Y, row1, a10, add);
+        a11 = warp_sum(a11);
+        if (lane == 0) write_y(Y + m, row1, a11, add);
+        a12 = warp_sum(a12);
+        if (lane == 0) write_y(Y + 2 * m, row1, a12, add);
+        a13 = warp_sum(a13);
+        if (lane == 0) write_y(Y + 3 * m, row1, a13, add);
     }
 }
 
@@ -4436,6 +6892,104 @@ __global__ void __launch_bounds__(256, 2) gemm_fp8_shared_tc_k(const uint8_t* W,
 #else
     (void)W;
     (void)scale;
+    (void)X;
+    (void)Y;
+    (void)m;
+    (void)n;
+    (void)T;
+    (void)add;
+#endif
+}
+
+// Q8 SoA → smem F16 tile × X panel, tensor-core MMA. One HBM pass over W per
+// T-panel (BN=8/16/32/64). T=4 scalar GEMM rereads W B/4 times and plateaus.
+template <int BN>
+__global__ void __launch_bounds__(256, 2) gemm_q8_soa_tc_k(const int8_t* Q, const __half* scales,
+                                                           const float* X, float* Y, int m, int n, int T,
+                                                           int add) {
+#if __CUDA_ARCH__ >= 800
+    constexpr int BM = 128, BK = 128, WLD = 136, XLD = 136, NG = BN / 8;
+    const int row_base = blockIdx.x * BM;
+    const int t0 = blockIdx.y * BN;
+    const int tt = T - t0 < BN ? T - t0 : BN;
+    const int warp = threadIdx.x >> 5;
+    const int lane = threadIdx.x & 31;
+    const int wrow = row_base + warp * 16;
+    extern __shared__ char raw[];
+    __half* Wf = reinterpret_cast<__half*>(raw);
+    __half* Xf = Wf + BM * WLD;
+    float acc[NG][4];
+#pragma unroll
+    for (int g = 0; g < NG; ++g) acc[g][0] = acc[g][1] = acc[g][2] = acc[g][3] = 0.f;
+    const int nb = n >> 5;
+    for (int k0 = 0; k0 < n; k0 += BK) {
+        const int b0 = k0 >> 5;
+#pragma unroll
+        for (int r = 0; r < 16; ++r) {
+            const int row = wrow + r;
+            const int col = lane << 2;
+            const float s =
+                (row < m) ? __half2float(__ldg(scales + static_cast<size_t>(row) * nb + b0 + (lane >> 3)))
+                          : 0.f;
+            int qi = 0;
+            if (row < m)
+                qi = __ldcs(reinterpret_cast<const int*>(Q + static_cast<size_t>(row) * n + k0 + col));
+            const signed char* b = reinterpret_cast<const signed char*>(&qi);
+            __half* dst = Wf + (warp * 16 + r) * WLD + col;
+            dst[0] = __float2half(s * static_cast<float>(b[0]));
+            dst[1] = __float2half(s * static_cast<float>(b[1]));
+            dst[2] = __float2half(s * static_cast<float>(b[2]));
+            dst[3] = __float2half(s * static_cast<float>(b[3]));
+        }
+        for (int i = threadIdx.x * 4; i < tt * BK; i += 1024) {
+            const int t = i >> 7;
+            const int c = i & 127;
+            const float4 v = *reinterpret_cast<const float4*>(X + static_cast<size_t>(t0 + t) * n + k0 + c);
+            Xf[t * XLD + c + 0] = __float2half(v.x);
+            Xf[t * XLD + c + 1] = __float2half(v.y);
+            Xf[t * XLD + c + 2] = __float2half(v.z);
+            Xf[t * XLD + c + 3] = __float2half(v.w);
+        }
+        for (int t = tt; t < BN; ++t) {
+            for (int c = threadIdx.x; c < BK; c += 256) Xf[t * XLD + c] = __half(0);
+        }
+        __syncthreads();
+#pragma unroll
+        for (int kt = 0; kt < 8; ++kt) {
+            uint32_t a[4];
+            ldmatrix_x4(a, Wf + (warp * 16 + (lane & 15)) * WLD + kt * 16 + ((lane >> 4) << 3));
+#pragma unroll
+            for (int g = 0; g < NG; ++g) {
+                if (g * 8 >= tt) continue;
+                uint32_t bv[2];
+                ldmatrix_x2(bv, Xf + (g * 8 + (lane & 7)) * XLD + kt * 16 + ((lane >> 3) << 3));
+                mma_m16n8k16_f16(acc[g], a, bv);
+            }
+        }
+        __syncthreads();
+    }
+    if (wrow < m) {
+        const int r0 = lane >> 2;
+        const int c0 = (lane & 3) << 1;
+#pragma unroll
+        for (int g = 0; g < NG; ++g) {
+            const int tok = g * 8 + c0;
+            if (tok < tt) {
+                if (wrow + r0 < m) write_y(Y + static_cast<size_t>(t0 + tok) * m, wrow + r0, acc[g][0], add);
+                if (wrow + r0 + 8 < m)
+                    write_y(Y + static_cast<size_t>(t0 + tok) * m, wrow + r0 + 8, acc[g][2], add);
+            }
+            if (tok + 1 < tt) {
+                if (wrow + r0 < m)
+                    write_y(Y + static_cast<size_t>(t0 + tok + 1) * m, wrow + r0, acc[g][1], add);
+                if (wrow + r0 + 8 < m)
+                    write_y(Y + static_cast<size_t>(t0 + tok + 1) * m, wrow + r0 + 8, acc[g][3], add);
+            }
+        }
+    }
+#else
+    (void)Q;
+    (void)scales;
     (void)X;
     (void)Y;
     (void)m;
@@ -5551,12 +8105,27 @@ __global__ void f32_to_bf16_k(const float* x, uint16_t* y, int n) {
     if (i < n) y[i] = static_cast<uint16_t>(__float_as_uint(x[i]) >> 16);
 }
 
-__global__ void split_qg_batch_k(const float* qg, float* q, float* gate, int qn, int T) {
+__global__ void bf16_to_f32_k(const uint16_t* x, float* y, int n) {
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) y[i] = bf16_to_f32(x[i]);
+}
+
+__global__ void split_qg_batch_k(const float* qg, float* q, float* gate, int n_q, int hd, int T) {
     const int t = blockIdx.y;
     const int i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (t < T && i < qn) {
-        q[static_cast<size_t>(t) * qn + i] = qg[static_cast<size_t>(t) * qn * 2 + i];
-        gate[static_cast<size_t>(t) * qn + i] = qg[static_cast<size_t>(t) * qn * 2 + qn + i];
+    const int qn = n_q * hd;
+    if (t >= T || i >= qn) return;
+    const size_t to = static_cast<size_t>(t) * qn;
+    const size_t ti = static_cast<size_t>(t) * qn * 2;
+    if (hd >= 64) {
+        const int h = i / hd;
+        const int d = i - h * hd;
+        const int base = h * hd * 2;
+        q[to + i] = qg[ti + base + d];
+        gate[to + i] = qg[ti + base + hd + d];
+    } else {
+        q[to + i] = qg[ti + i];
+        gate[to + i] = qg[ti + qn + i];
     }
 }
 
@@ -5587,15 +8156,7 @@ __global__ void rope_batch_k(float* q, float* k, int n_q, int n_kv, int head_dim
     if (h >= n_heads) return;
     float* v = (which == 0 ? q : k) + (static_cast<size_t>(t) * n_heads + h) * head_dim;
     const float p = static_cast<float>(pos0 + t);
-    const int pairs = rotary_dim / 2;
-    for (int i = threadIdx.x; i < pairs; i += blockDim.x) {
-        const float freq = 1.f / powf(theta, static_cast<float>(i) / static_cast<float>(pairs));
-        const float ang = p * freq;
-        const float c = cosf(ang), s = sinf(ang);
-        const float x0 = v[2 * i], x1 = v[2 * i + 1];
-        v[2 * i] = x0 * c - x1 * s;
-        v[2 * i + 1] = x0 * s + x1 * c;
-    }
+    rope_apply(v, rotary_dim, p, theta, head_dim);
 }
 
 __global__ void store_kv_batch_k(float* cache, const float* src, int pos0, int T, int kn) {
@@ -5875,6 +8436,9 @@ __global__ void attn_prefill_tq_gqa_k(const float* q, float* o, int pos0, int T,
     if (tid < 8) {
         smi[tid] = -1e30f;
         sli[tid] = 0.f;
+        saa[tid] = 1.f;
+        spp[tid] = 0.f;
+        for (int w = 0; w < 8; ++w) red[w][tid] = 0.f;
     }
     __syncthreads();
     for (int t = 0; t < Tend; ++t) {
@@ -6319,7 +8883,115 @@ __global__ void attn_softmax_causal_k(float* s, int rows, int cols, int pos0, in
     for (int i = valid + threadIdx.x; i < cols; i += blockDim.x) rowp[i] = 0.f;
 }
 
+__global__ void attn_pack_kv_f_tile_k(const __half* cache, float* out, int s0, int bc, int tend, int n_kv,
+                                      int hd) {
+    const int n = n_kv * bc * hd;
+    const int i = (blockIdx.x * blockDim.x + threadIdx.x) * 4;
+    if (i >= n) return;
+    const int d = i - (i / hd) * hd;
+    const int sl = (i / hd) % bc;
+    const int hkv = (i / hd) / bc;
+    const int s = s0 + sl;
+    if (s >= tend || hkv >= n_kv) {
+        for (int k = 0; k < 4 && i + k < n; ++k) out[i + k] = 0.f;
+        return;
+    }
+    const __half* src = cache + (static_cast<size_t>(s) * n_kv + hkv) * hd + d;
+    if (d + 3 < hd) {
+        const float2 a = __half22float2(*reinterpret_cast<const __half2*>(src));
+        const float2 b = __half22float2(*reinterpret_cast<const __half2*>(src + 2));
+        *reinterpret_cast<float4*>(out + i) = make_float4(a.x, a.y, b.x, b.y);
+    } else {
+        for (int k = 0; k < 4 && i + k < n; ++k) out[i + k] = __half2float(src[k]);
+    }
+}
+
+__global__ void attn_fa_init_k(float* O, float* mi, float* li, int n_rows, int hd) {
+    const int n = n_rows * hd;
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) O[i] = 0.f;
+    if (i < n_rows) {
+        mi[i] = -1e30f;
+        li[i] = 0.f;
+    }
+}
+
+// Online-softmax tile: S[row, 0:bc] -> P, scale O by exp(mi-m2), update mi/li.
+__global__ void attn_fa_update_k(float* S, float* O, float* mi, float* li, int rows, int bc, int hd, int s0,
+                                 int pos0, int rep, int qrows) {
+    const int row = blockIdx.x;
+    if (row >= rows) return;
+    const int local = qrows > 0 ? row - (row / qrows) * qrows : row;
+    const int rdiv = rep > 0 ? rep : 1;
+    const int t = local / rdiv;
+    const int qpos = pos0 + t;
+    int valid = qpos + 1 - s0;
+    if (valid < 0) valid = 0;
+    if (valid > bc) valid = bc;
+    float* Sp = S + static_cast<size_t>(row) * bc;
+    float* Op = O + static_cast<size_t>(row) * hd;
+    if (valid <= 0) {
+        for (int i = threadIdx.x; i < bc; i += blockDim.x) Sp[i] = 0.f;
+        return;
+    }
+    float mx = -1e30f;
+    for (int i = threadIdx.x; i < valid; i += blockDim.x) mx = fmaxf(mx, Sp[i]);
+    for (int off = 16; off > 0; off >>= 1) mx = fmaxf(mx, __shfl_xor_sync(0xffffffff, mx, off));
+    __shared__ float red[8];
+    const int lane = threadIdx.x & 31;
+    const int wid = threadIdx.x >> 5;
+    if (lane == 0) red[wid] = mx;
+    __syncthreads();
+    if (threadIdx.x == 0) {
+        float m = red[0];
+        const int nw = (blockDim.x + 31) >> 5;
+        for (int w = 1; w < nw && w < 8; ++w) m = fmaxf(m, red[w]);
+        red[0] = fmaxf(m, mi[row]);
+    }
+    __syncthreads();
+    mx = red[0];
+    const float alpha = __expf(mi[row] - mx);
+    for (int d = threadIdx.x; d < hd; d += blockDim.x) Op[d] *= alpha;
+    float sum = 0.f;
+    for (int i = threadIdx.x; i < valid; i += blockDim.x) {
+        const float e = __expf(Sp[i] - mx);
+        Sp[i] = e;
+        sum += e;
+    }
+    for (int i = valid + threadIdx.x; i < bc; i += blockDim.x) Sp[i] = 0.f;
+    for (int off = 16; off > 0; off >>= 1) sum += __shfl_xor_sync(0xffffffff, sum, off);
+    if (lane == 0) red[wid] = sum;
+    __syncthreads();
+    if (threadIdx.x == 0) {
+        float z = red[0];
+        const int nw = (blockDim.x + 31) >> 5;
+        for (int w = 1; w < nw && w < 8; ++w) z += red[w];
+        li[row] = alpha * li[row] + z;
+        mi[row] = mx;
+    }
+}
+
+__global__ void attn_fa_finalize_k(float* O, const float* li, int n_rows, int hd) {
+    const int n = n_rows * hd;
+    const int i = (blockIdx.x * blockDim.x + threadIdx.x) * 4;
+    if (i >= n) return;
+    const int row = i / hd;
+    const float inv = li[row] > 0.f ? 1.f / li[row] : 0.f;
+    if ((i - row * hd) + 3 < hd) {
+        float4 v = *reinterpret_cast<float4*>(O + i);
+        v.x *= inv;
+        v.y *= inv;
+        v.z *= inv;
+        v.w *= inv;
+        *reinterpret_cast<float4*>(O + i) = v;
+    } else {
+        for (int k = 0; k < 4 && i + k < n; ++k) O[i + k] *= inv;
+    }
+}
+
 extern cublasHandle_t g_blas;
+// Shared-Q / tiled GEMM: pack Q once per KV group, consume K/V in Bc tiles,
+// online softmax (no full T×tend score matrix). Leftover T=1 k-major unused.
 bool launch_attn_gqa_gemm(const float* q, const __half* kc, const __half* vc, float* o, float* scores,
                           size_t scores_f, float* scratch, size_t scratch_f, int pos0, int T, int n_q,
                           int n_kv, int hd) {
@@ -6328,83 +9000,128 @@ bool launch_attn_gqa_gemm(const float* q, const __half* kc, const __half* vc, fl
     const int rep = n_q / n_kv;
     const int tend = pos0 + T;
     if (rep < 2 || tend <= 0) return false;
+    auto scratch_need = [&](int rows, int bc) -> size_t {
+        return static_cast<size_t>(n_kv) * rows * hd * 2 + static_cast<size_t>(n_kv) * bc * hd * 2 +
+               static_cast<size_t>(n_kv) * rows * 2 + 32;
+    };
     int ts = T;
-    while (ts > 0 &&
-           static_cast<size_t>(n_kv) * static_cast<size_t>(ts) * static_cast<size_t>(rep) *
-                   static_cast<size_t>(tend) >
-               scores_f)
+    int Bc = 256;
+    while (ts >= 1) {
+        const int rows = ts * rep;
+        const size_t scn = static_cast<size_t>(n_kv) * rows * static_cast<size_t>(Bc);
+        if (scn <= scores_f && scratch_need(rows, Bc) <= scratch_f) break;
+        if (Bc > 64) {
+            Bc /= 2;
+            continue;
+        }
         ts /= 2;
+        Bc = 256;
+    }
     if (ts < 1) return false;
-    const size_t kn1 = static_cast<size_t>(tend) * hd;
-    const size_t kn = kn1 * n_kv;
-    const size_t qn_ts = static_cast<size_t>(ts) * rep * hd * n_kv;
-    const size_t need = qn_ts + 16 + kn + 16 + kn + 16 + qn_ts + 16;
-    if (need > scratch_f) return false;
-    float* qf = scratch;
-    float* kf = scratch + qn_ts + 16;
-    float* vf = kf + kn + 16;
-    float* of = vf + kn + 16;
     const float alpha = 0.0625f;
-    const float beta = 0.f;
+    const float beta0 = 0.f;
     const float one = 1.f;
-    const float zero = 0.f;
     cublasSetStream(g_blas, cudaStreamPerThread);
-    const int kbl = (static_cast<int>(kn) / 4 + 255) / 256;
-    attn_pack_kv_f_all_k<<<kbl, 256>>>(kc, kf, tend, n_kv, hd);
-    attn_pack_kv_f_all_k<<<kbl, 256>>>(vc, vf, tend, n_kv, hd);
-    const int sth = tend >= 256 ? 256 : 128;
-    const long long stride_k = static_cast<long long>(kn1);
-    const bool batched = n_kv > 1;
     for (int t0 = 0; t0 < T; t0 += ts) {
         const int nt = T - t0 < ts ? T - t0 : ts;
         const int rows = nt * rep;
-        const int qn = rows * hd * n_kv;
-        const int qbl = (qn / 4 + 255) / 256;
+        const size_t qn = static_cast<size_t>(n_kv) * rows * hd;
+        float* qf = scratch;
+        float* of = qf + qn;
+        float* kf = of + qn;
+        float* vf = kf + static_cast<size_t>(n_kv) * Bc * hd;
+        float* mi = vf + static_cast<size_t>(n_kv) * Bc * hd;
+        float* li = mi + static_cast<size_t>(n_kv) * rows;
+        const int qbl = (static_cast<int>(qn) / 4 + 255) / 256;
         attn_pack_q_f_all_k<<<qbl, 256>>>(q, qf, nt, t0, n_q, hd, n_kv, rep);
+        const int n_rows = n_kv * rows;
+        attn_fa_init_k<<<(n_rows * hd + 255) / 256, 256>>>(of, mi, li, n_rows, hd);
         const long long stride_q = static_cast<long long>(rows) * hd;
-        const long long stride_s = static_cast<long long>(rows) * tend;
-        bool ok = false;
-        if (batched &&
-            cublasGemmStridedBatchedEx(g_blas, CUBLAS_OP_T, CUBLAS_OP_N, tend, rows, hd, &alpha, kf,
-                                       CUDA_R_32F, hd, stride_k, qf, CUDA_R_32F, hd, stride_q, &beta, scores,
-                                       CUDA_R_32F, tend, stride_s, n_kv, CUBLAS_COMPUTE_32F_FAST_TF32,
-                                       CUBLAS_GEMM_DEFAULT_TENSOR_OP) == CUBLAS_STATUS_SUCCESS)
-            ok = true;
-        if (!ok) {
-            for (int h = 0; h < n_kv; ++h) {
-                if (cublasGemmEx(g_blas, CUBLAS_OP_T, CUBLAS_OP_N, tend, rows, hd, &alpha, kf + h * kn1,
-                                 CUDA_R_32F, hd, qf + h * stride_q, CUDA_R_32F, hd, &beta,
-                                 scores + h * stride_s, CUDA_R_32F, tend, CUBLAS_COMPUTE_32F_FAST_TF32,
-                                 CUBLAS_GEMM_DEFAULT_TENSOR_OP) != CUBLAS_STATUS_SUCCESS &&
-                    cublasSgemm(g_blas, CUBLAS_OP_T, CUBLAS_OP_N, tend, rows, hd, &alpha, kf + h * kn1, hd,
-                                qf + h * stride_q, hd, &beta, scores + h * stride_s, tend) !=
+        for (int s0 = 0; s0 < tend; s0 += Bc) {
+            const int bc = tend - s0 < Bc ? tend - s0 : Bc;
+            const int kn = n_kv * bc * hd;
+            const int kbl = (kn / 4 + 255) / 256;
+            attn_pack_kv_f_tile_k<<<kbl, 256>>>(kc, kf, s0, bc, tend, n_kv, hd);
+            attn_pack_kv_f_tile_k<<<kbl, 256>>>(vc, vf, s0, bc, tend, n_kv, hd);
+            const long long stride_k = static_cast<long long>(bc) * hd;
+            const long long stride_s = static_cast<long long>(rows) * bc;
+            bool ok = n_kv > 1 &&
+                      cublasGemmStridedBatchedEx(g_blas, CUBLAS_OP_T, CUBLAS_OP_N, bc, rows, hd, &alpha, kf,
+                                                 CUDA_R_32F, hd, stride_k, qf, CUDA_R_32F, hd, stride_q,
+                                                 &beta0, scores, CUDA_R_32F, bc, stride_s, n_kv,
+                                                 CUBLAS_COMPUTE_32F_FAST_TF32,
+                                                 CUBLAS_GEMM_DEFAULT_TENSOR_OP) == CUBLAS_STATUS_SUCCESS;
+            if (!ok) {
+                for (int h = 0; h < n_kv; ++h) {
+                    if (cublasSgemm(g_blas, CUBLAS_OP_T, CUBLAS_OP_N, bc, rows, hd, &alpha,
+                                    kf + h * stride_k, hd, qf + h * stride_q, hd, &beta0,
+                                    scores + h * stride_s, bc) != CUBLAS_STATUS_SUCCESS)
+                        return false;
+                }
+            }
+            attn_fa_update_k<<<n_rows, bc >= 256 ? 256 : 128>>>(scores, of, mi, li, n_rows, bc, hd, s0,
+                                                                pos0 + t0, rep, rows);
+            ok = n_kv > 1 &&
+                 cublasGemmStridedBatchedEx(g_blas, CUBLAS_OP_N, CUBLAS_OP_N, hd, rows, bc, &one, vf,
+                                            CUDA_R_32F, hd, stride_k, scores, CUDA_R_32F, bc, stride_s, &one,
+                                            of, CUDA_R_32F, hd, stride_q, n_kv, CUBLAS_COMPUTE_32F_FAST_TF32,
+                                            CUBLAS_GEMM_DEFAULT_TENSOR_OP) == CUBLAS_STATUS_SUCCESS;
+            if (!ok) {
+                for (int h = 0; h < n_kv; ++h) {
+                    if (cublasSgemm(g_blas, CUBLAS_OP_N, CUBLAS_OP_N, hd, rows, bc, &one, vf + h * stride_k,
+                                    hd, scores + h * stride_s, bc, &one, of + h * stride_q, hd) !=
                         CUBLAS_STATUS_SUCCESS)
-                    return false;
+                        return false;
+                }
             }
         }
-        attn_softmax_causal_k<<<n_kv * rows, sth>>>(scores, n_kv * rows, tend, pos0 + t0, rep, rows);
-        ok = false;
-        if (batched &&
-            cublasGemmStridedBatchedEx(g_blas, CUBLAS_OP_N, CUBLAS_OP_N, hd, rows, tend, &one, vf, CUDA_R_32F,
-                                       hd, stride_k, scores, CUDA_R_32F, tend, stride_s, &zero, of,
-                                       CUDA_R_32F, hd, stride_q, n_kv, CUBLAS_COMPUTE_32F_FAST_TF32,
-                                       CUBLAS_GEMM_DEFAULT_TENSOR_OP) == CUBLAS_STATUS_SUCCESS)
-            ok = true;
-        if (!ok) {
-            for (int h = 0; h < n_kv; ++h) {
-                if (cublasGemmEx(g_blas, CUBLAS_OP_N, CUBLAS_OP_N, hd, rows, tend, &one, vf + h * kn1,
-                                 CUDA_R_32F, hd, scores + h * stride_s, CUDA_R_32F, tend, &zero,
-                                 of + h * stride_q, CUDA_R_32F, hd, CUBLAS_COMPUTE_32F_FAST_TF32,
-                                 CUBLAS_GEMM_DEFAULT_TENSOR_OP) != CUBLAS_STATUS_SUCCESS &&
-                    cublasSgemm(g_blas, CUBLAS_OP_N, CUBLAS_OP_N, hd, rows, tend, &one, vf + h * kn1, hd,
-                                scores + h * stride_s, tend, &zero, of + h * stride_q, hd) !=
-                        CUBLAS_STATUS_SUCCESS)
-                    return false;
-            }
-        }
+        attn_fa_finalize_k<<<qbl, 256>>>(of, li, n_rows, hd);
         attn_unpack_o_all_k<<<qbl, 256>>>(of, o, nt, t0, n_q, hd, n_kv, rep);
     }
     return true;
+}
+
+__global__ void attn_prefill_h_k(const float* q, const __half* k_cache, const __half* v_cache, float* o,
+                                 int pos0, int T, int n_q, int n_kv, int head_dim) {
+    const int hq = blockIdx.x;
+    const int t = blockIdx.y;
+    if (hq >= n_q || t >= T) return;
+    const int pos = pos0 + t;
+    const int Tend = pos + 1;
+    const int rep = n_q / n_kv;
+    const int hkv = hq / rep;
+    const float scale = rsqrtf(static_cast<float>(head_dim));
+    const float* qh = q + (static_cast<size_t>(t) * n_q + hq) * head_dim;
+    float* oh = o + (static_cast<size_t>(t) * n_q + hq) * head_dim;
+    extern __shared__ float scores[];
+    for (int s = threadIdx.x; s < Tend; s += blockDim.x) {
+        float dot = 0.f;
+        const __half* kh = k_cache + static_cast<size_t>(s) * n_kv * head_dim + hkv * head_dim;
+        for (int d = 0; d < head_dim; ++d) dot += qh[d] * __half2float(kh[d]);
+        scores[s] = dot * scale;
+    }
+    __syncthreads();
+    __shared__ float mx, sumv;
+    if (threadIdx.x == 0) {
+        float mm = -1e30f;
+        for (int s = 0; s < Tend; ++s) mm = fmaxf(mm, scores[s]);
+        mx = mm;
+        float z = 0.f;
+        for (int s = 0; s < Tend; ++s) {
+            scores[s] = expf(scores[s] - mx);
+            z += scores[s];
+        }
+        sumv = z > 0.f ? z : 1.f;
+    }
+    __syncthreads();
+    for (int d = threadIdx.x; d < head_dim; d += blockDim.x) {
+        float acc = 0.f;
+        for (int s = 0; s < Tend; ++s) {
+            const __half* vh = v_cache + static_cast<size_t>(s) * n_kv * head_dim + hkv * head_dim;
+            acc += (scores[s] / sumv) * __half2float(vh[d]);
+        }
+        oh[d] = acc;
+    }
 }
 
 __global__ void attn_prefill_k(const float* q, const float* k_cache, const float* v_cache, float* o, int pos0,
@@ -6432,7 +9149,7 @@ __global__ void attn_prefill_k(const float* q, const float* k_cache, const float
             if (threadIdx.x == 0) {
                 float tot = wss[0];
                 const int nw = blockDim.x >> 5;
-                for (int w = 1; w < nw && w < 4; ++w) tot += wss[w];
+                for (int w = 1; w < nw && w < 8; ++w) tot += wss[w];
                 const float sc = tot * scale;
                 if (s == 0) {
                     wss[0] = -1e30f;
@@ -6655,19 +9372,21 @@ __global__ void argmax_partial_rows_k(const float* x, int n, int stride, float* 
 }
 
 __global__ void argmax_final_rows_k(const float* blk_max, const int* blk_idx, int nblk, int T, int* out) {
-    const int t = threadIdx.x;
-    if (t >= T) return;
-    float best = -1e30f;
-    int bi = 0;
-    const float* bm = blk_max + t * nblk;
-    const int* bi_p = blk_idx + t * nblk;
-    for (int i = 0; i < nblk; ++i) {
-        if (bm[i] > best) {
-            best = bm[i];
-            bi = bi_p[i];
+    // Grid-stride: old <<<1,32>>> only wrote slots 0..31, so B>32 greedy stayed 0.
+    for (int t = static_cast<int>(blockIdx.x * blockDim.x + threadIdx.x); t < T;
+         t += static_cast<int>(blockDim.x * gridDim.x)) {
+        float best = -1e30f;
+        int bi = 0;
+        const float* bm = blk_max + t * nblk;
+        const int* bi_p = blk_idx + t * nblk;
+        for (int i = 0; i < nblk; ++i) {
+            if (bm[i] > best) {
+                best = bm[i];
+                bi = bi_p[i];
+            }
         }
+        out[t] = bi;
     }
-    out[t] = bi;
 }
 
 __global__ void rope_batch_dp_k(float* q, float* k, int n_q, int n_kv, int head_dim, int rotary_dim,
@@ -6680,15 +9399,7 @@ __global__ void rope_batch_dp_k(float* q, float* k, int n_q, int n_kv, int head_
     if (h >= n_heads) return;
     float* v = (which == 0 ? q : k) + (static_cast<size_t>(t) * n_heads + h) * head_dim;
     const float p = static_cast<float>(*dpos + t);
-    const int pairs = rotary_dim / 2;
-    for (int i = threadIdx.x; i < pairs; i += blockDim.x) {
-        const float freq = 1.f / powf(theta, static_cast<float>(i) / static_cast<float>(pairs));
-        const float ang = p * freq;
-        const float c = cosf(ang), s = sinf(ang);
-        const float x0 = v[2 * i], x1 = v[2 * i + 1];
-        v[2 * i] = x0 * c - x1 * s;
-        v[2 * i + 1] = x0 * s + x1 * c;
-    }
+    rope_apply(v, rotary_dim, p, theta, head_dim);
 }
 
 __global__ void store_kv_batch_dp_k(float* cache, const float* src, const int* dpos, int T, int kn) {
@@ -6756,6 +9467,8 @@ __half* g_xf16 = nullptr;
 int g_xf16_n = 0;
 __half* g_wf16 = nullptr;
 size_t g_wf16_n = 0;
+float* g_yadd = nullptr;
+int g_yadd_n = 0;
 const float* g_xf16_src = nullptr;
 int g_xf16_src_n = 0;
 cudaStream_t g_dq_stream = nullptr;
@@ -6765,6 +9478,8 @@ int g_wf_slot = 0;
 bool g_fp8_tc = true;
 bool g_fp8_e4m3_mma = false;
 bool g_fp8_shared_tc = false;
+bool g_q8_tc = false;
+bool g_q8_cublas_add = false;
 bool g_fp8_e4_tc = false;
 bool g_fp8_e4_bn256 = false;
 bool g_fp8_e4_bk512 = false;
@@ -6772,6 +9487,7 @@ bool g_fp8_e4_pipe = false;
 bool g_fp8_e4_occ = false;
 bool g_fp8_e4_o2 = false;
 bool g_cublas_fp8_e4 = false;
+int g_lt_min_T = 8; // 2 inside launch_spec_chunk so T=2 reads W once
 cublasLtHandle_t g_lt = nullptr;
 cublasLtHandle_t g_lt2 = nullptr;
 // Persistent cublasLt descriptors: create/destroy per GEMM breaks T=256 graph
@@ -6889,7 +9605,7 @@ LtPack* lt_get(int m, int n, int k, int add) {
 void use_xe(const float* X, int T, int n);
 extern const uint8_t* g_xe;
 void lt_tune(const GpuW& w, const float* X, float* Y, int T, int add) {
-    if (!g_lt || !w.data || T < 256 || w.rows < 128 || w.cols < 128) return;
+    if (!g_lt || !w.data || T < 2 || w.rows < 128 || w.cols < 128) return;
     LtPack* pack = nullptr;
     for (int i = 0; i < g_lt_n; ++i)
         if (g_lt_cache[i].m == w.rows && g_lt_cache[i].n == T && g_lt_cache[i].k == w.cols &&
@@ -6951,6 +9667,39 @@ cudaEvent_t g_pair_ev = nullptr;
 uint8_t* g_xe_buf = nullptr;
 const uint8_t* g_xe = nullptr;
 int g_xe_n = 0, g_xe_T = 0, g_xe_cap = 0;
+int8_t* g_xq = nullptr;
+__half* g_xsc = nullptr;
+int g_xq_n = 0;
+int g_xgen = 1;
+int g_xq_gen = 0;
+const float* g_xq_ptr = nullptr;
+int g_xq_cols = 0, g_xq_T = 0;
+bool g_capturing = false;
+bool g_spec_prof = false;
+float g_spec_ms_lin = 0, g_spec_ms_gdn = 0, g_spec_ms_attn = 0, g_spec_ms_mlp = 0, g_spec_ms_lm = 0;
+
+void note_x_written() { ++g_xgen; }
+
+bool ensure_xq(const float* X, int n, int T) {
+    if (!g_xq || !g_xsc || !X || n <= 0 || T <= 0) return false;
+    if (n * T > g_xq_n) return false;
+    // Cache hits during graph capture too: first GEMV on this X inserts the
+    // quant node; later GEMVs (wqkv/wz/wa/wb) reuse g_xq. Re-quant every
+    // call bloated the spec graph with identical writes to the same buffer.
+    if (X == g_xq_ptr && n == g_xq_cols && T == g_xq_T && g_xq_gen == g_xgen) return true;
+    if (T == 1) {
+        const int nblk = n >> 5;
+        quant_x_q8_k<<<(nblk + 127) / 128, 128>>>(X, g_xq, g_xsc, n);
+    } else {
+        const int nblk = (n >> 5) * T;
+        quant_x_q8_n_k<<<(nblk + 127) / 128, 128>>>(X, g_xq, g_xsc, n, T);
+    }
+    g_xq_ptr = X;
+    g_xq_cols = n;
+    g_xq_T = T;
+    g_xq_gen = g_xgen;
+    return true;
+}
 
 cudaStream_t gemm_stream() { return g_launch_stream ? g_launch_stream : cudaStreamPerThread; }
 
@@ -7012,6 +9761,59 @@ void use_swiglu_xe(const float* gate, const float* up, int T, int n) {
 void launch_linear(const GpuW& w, const float* X, float* Y, int T, int add = 0);
 
 void launch_linear_pair(const GpuW& a, const GpuW& b, const float* X, float* Ya, float* Yb, int T) {
+    if (T == 2 && a.q == QuantKind::Q6_K && b.q == QuantKind::Q4_K && a.qk_soa && b.qk_soa &&
+        a.cols == b.cols && a.cols > 0 && (a.cols % 256) == 0 && a.rows >= 4096 && b.rows >= 4096 &&
+        a.data && b.data && X && Ya && Yb && g_xq && g_xsc && a.cols * 2 <= g_xq_n &&
+        ensure_xq(X, a.cols, 2)) {
+        static int once = 0;
+        if (!once) {
+            once = 1;
+            std::fprintf(stderr, "q6q4_t2=1 ild=1 1row=1\n");
+        }
+        rapidllm::cuda_gemv::launch_q6k_f32_t2_1row(a.data, X, Ya, a.rows, a.cols, 0);
+        rapidllm::cuda_gemv::launch_q4k_q8_t2_1row(b.data, g_xq, g_xsc, Yb, b.rows, b.cols, 0);
+        return;
+    }
+    if (T == 12 && a.q == QuantKind::Q6_K && b.q == QuantKind::Q4_K && a.qk_soa && b.qk_soa &&
+        a.cols == b.cols && a.cols > 0 && (a.cols % 256) == 0 && a.rows >= 4096 && b.rows >= 4096 &&
+        a.data && b.data && X && Ya && Yb && g_xq && g_xsc && a.cols * 12 <= g_xq_n &&
+        ensure_xq(X, a.cols, 12)) {
+        static int once = 0;
+        if (!once) {
+            once = 1;
+            std::fprintf(stderr, "q6q4_t12=1 ild=1 1row=1\n");
+        }
+        rapidllm::cuda_gemv::launch_q6k_f32_t12_1row(a.data, X, Ya, a.rows, a.cols, 0);
+        rapidllm::cuda_gemv::launch_q4k_q8_t12_1row(b.data, g_xq, g_xsc, Yb, b.rows, b.cols, 0);
+        return;
+    }
+    if (T == 6 && a.q == QuantKind::Q6_K && b.q == QuantKind::Q4_K && a.qk_soa && b.qk_soa &&
+        a.cols == b.cols && a.cols > 0 && (a.cols % 256) == 0 && a.rows >= 4096 && b.rows >= 4096 &&
+        a.data && b.data && X && Ya && Yb && g_xq && g_xsc && a.cols * 6 <= g_xq_n &&
+        ensure_xq(X, a.cols, 6)) {
+        static int once = 0;
+        if (!once) {
+            once = 1;
+            std::fprintf(stderr, "q6q4_t6=1 ild=1\n");
+        }
+        rapidllm::cuda_gemv::launch_q6k_f32_t6_ild(a.data, X, Ya, a.rows, a.cols, 0);
+        rapidllm::cuda_gemv::launch_q4k_q8_t6(b.data, g_xq, g_xsc, Yb, b.rows, b.cols, 0);
+        return;
+    }
+    // T=4 GDN wqkv(Q6)+wz(Q4), isolated TU. T=3 ild codegen unchanged.
+    if (T == 4 && a.q == QuantKind::Q6_K && b.q == QuantKind::Q4_K && a.qk_soa && b.qk_soa &&
+        a.cols == b.cols && a.cols > 0 && (a.cols % 256) == 0 && a.rows >= 4096 && b.rows >= 4096 &&
+        a.data && b.data && X && Ya && Yb && g_xq && g_xsc && a.cols * 4 <= g_xq_n &&
+        ensure_xq(X, a.cols, 4)) {
+        static int once = 0;
+        if (!once) {
+            once = 1;
+            std::fprintf(stderr, "q6q4_t4_dual=1 ild=1\n");
+        }
+        rapidllm::cuda_gemv::launch_q6q4_t4_dual(a.data, b.data, X, g_xq, g_xsc, Ya, Yb, a.rows, b.rows,
+                                                 a.cols);
+        return;
+    }
     // Dual-stream cublasLt on T=1024/2048 lost to HBM contention vs sequential
     // (2048-fill 7.68 vs 8.02). Keep sequential; leftover∥conv uses bak separately.
     launch_linear(a, X, Ya, T);
@@ -7019,8 +9821,12 @@ void launch_linear_pair(const GpuW& a, const GpuW& b, const float* X, float* Ya,
 }
 
 bool launch_cublas_f16(const GpuW& w, const float* X, float* Y, int T);
+void ensure_dq_stream();
 void launch_fp8_tc(const GpuW& w, const float* X, float* Y, int T);
 void launch_gemm_fp8(const GpuW& w, const float* X, float* Y, int T, int add);
+void launch_gemm_q8(const GpuW& w, const float* X, float* Y, int T, int add);
+bool launch_gemm_q8_tc(const GpuW& w, const float* X, float* Y, int T, int add);
+bool launch_cublas_q8(const GpuW& w, const float* X, float* Y, int T, int add);
 void launch_fp8_e4m3_mma(const GpuW& w, const float* x, float* y);
 bool launch_fp8_shared_tc(const GpuW& w, const float* X, float* Y, int T, int add);
 bool launch_fp8_e4_tc(const GpuW& w, const float* X, float* Y, int T, int add);
@@ -7034,6 +9840,67 @@ void gemv_grid(const GpuW& w, int& blocks, int& threads) {
     const int warps = w.rows >= 2048 ? 16 : 8;
     threads = warps * 32;
     blocks = (w.rows + warps - 1) / warps;
+}
+
+void launch_gemv_t2(const GpuW& w, const float* X, float* Y, int add) {
+    if (!w.data || w.rows <= 0 || w.cols <= 0 || !X || !Y) return;
+    int blocks = 0, threads = 0;
+    gemv_grid(w, blocks, threads);
+    const int warps = threads / 32;
+    const int pairs = (w.rows + 1) / 2;
+    const int pblocks = (pairs + warps - 1) / warps;
+    if (w.q == QuantKind::FP8_E4M3_B128 && w.fp8_rowmaj) {
+        static int once = 0;
+        if (!once) {
+            once = 1;
+            std::fprintf(stderr, "t2_x1_ldg=1 tile=%d\n", w.cols <= kFp8XsCap ? w.cols : kFp8XsCap);
+        }
+        const int tile = w.cols <= kFp8XsCap ? w.cols : kFp8XsCap;
+        gemv_fp8_rm_t2_k<<<pblocks, threads, sizeof(float) * static_cast<size_t>(tile)>>>(
+            w.data, X, Y, w.rows, w.cols, add);
+        return;
+    }
+    if (w.q == QuantKind::BF16) {
+        gemv_bf16_t2_k<<<pblocks, threads, sizeof(float) * kXsTile * 2>>>(
+            reinterpret_cast<const uint16_t*>(w.data), X, Y, w.rows, w.cols, add);
+        return;
+    }
+}
+
+void launch_gemv_t3(const GpuW& w, const float* X, float* Y, int add) {
+    if (!w.data || w.rows <= 0 || w.cols <= 0 || !X || !Y) return;
+    if (!(w.q == QuantKind::FP8_E4M3_B128 && w.fp8_rowmaj)) return;
+    int blocks = 0, threads = 0;
+    gemv_grid(w, blocks, threads);
+    const int warps = threads / 32;
+    const int pairs = (w.rows + 1) / 2;
+    const int pblocks = (pairs + warps - 1) / warps;
+    static int once = 0;
+    if (!once) {
+        once = 1;
+        std::fprintf(stderr, "t3_x12_ldg=1 tile=%d\n", w.cols <= kFp8XsCap ? w.cols : kFp8XsCap);
+    }
+    const int tile = w.cols <= kFp8XsCap ? w.cols : kFp8XsCap;
+    gemv_fp8_rm_t3_k<<<pblocks, threads, sizeof(float) * static_cast<size_t>(tile)>>>(
+        w.data, X, Y, w.rows, w.cols, add);
+}
+
+void launch_gemv_t4(const GpuW& w, const float* X, float* Y, int add) {
+    if (!w.data || w.rows <= 0 || w.cols <= 0 || !X || !Y) return;
+    if (!(w.q == QuantKind::FP8_E4M3_B128 && w.fp8_rowmaj)) return;
+    int blocks = 0, threads = 0;
+    gemv_grid(w, blocks, threads);
+    const int warps = threads / 32;
+    const int pairs = (w.rows + 1) / 2;
+    const int pblocks = (pairs + warps - 1) / warps;
+    static int once = 0;
+    if (!once) {
+        once = 1;
+        std::fprintf(stderr, "t4_x123_ldg=1 tile=%d\n", w.cols <= kFp8XsCap ? w.cols : kFp8XsCap);
+    }
+    const int tile = w.cols <= kFp8XsCap ? w.cols : kFp8XsCap;
+    gemv_fp8_rm_t4_k<<<pblocks, threads, sizeof(float) * static_cast<size_t>(tile)>>>(
+        w.data, X, Y, w.rows, w.cols, add);
 }
 
 void launch_gemv(const GpuW& w, const float* x, float* y, int add = 0, float* acc_ss = nullptr,
@@ -7085,16 +9952,55 @@ void launch_gemv(const GpuW& w, const float* x, float* y, int add = 0, float* ac
             throw std::runtime_error("CUDA K-quant GEMV cols must be multiple of 256");
         const int tile = w.cols < kXsTile ? w.cols : kXsTile;
         const size_t smem = sizeof(float) * static_cast<size_t>(tile);
-        // One row / warp: k-quant dequant is compute-bound; 2-row doubles that work.
+        // Large GEMV: 2 rows/warp reuses the smem x tile (same as Q8/BF16).
         if (w.q == QuantKind::Q4_K) {
-            if (w.qk_soa) gemv_qk_k<kQ4KSoaBsz><<<blocks, threads, smem>>>(w.data, x, y, w.rows, w.cols, add);
-            else gemv_qk_k<kQ4KBsz><<<blocks, threads, smem>>>(w.data, x, y, w.rows, w.cols, add);
+            if (w.rows >= 4096) {
+                const int pairs = (w.rows + 1) / 2;
+                const int warps = threads / 32;
+                const int pblocks = (pairs + warps - 1) / warps;
+                if (w.qk_soa && g_xq && g_xsc && (w.cols % 256) == 0 && w.cols <= g_xq_n) {
+                    static int once = 0;
+                    if (!once) {
+                        once = 1;
+                        std::fprintf(stderr, "q4k_q8_act=1 int_dot=1\n");
+                    }
+                    if (!ensure_xq(x, w.cols, 1)) {
+                        gemv_qk_2row_k<kQ4KSoaBsz><<<pblocks, threads, smem>>>(w.data, x, y, w.rows, w.cols, add);
+                    } else {
+                        gemv_q4k_soa_q8_2row_k<<<pblocks, threads>>>(w.data, g_xq, g_xsc, y, w.rows, w.cols, add);
+                    }
+                } else if (w.qk_soa)
+                    gemv_qk_2row_k<kQ4KSoaBsz><<<pblocks, threads, smem>>>(w.data, x, y, w.rows, w.cols, add);
+                else
+                    gemv_qk_2row_k<kQ4KBsz><<<pblocks, threads, smem>>>(w.data, x, y, w.rows, w.cols, add);
+            } else if (w.qk_soa)
+                gemv_qk_k<kQ4KSoaBsz><<<blocks, threads, smem>>>(w.data, x, y, w.rows, w.cols, add);
+            else
+                gemv_qk_k<kQ4KBsz><<<blocks, threads, smem>>>(w.data, x, y, w.rows, w.cols, add);
         } else if (w.q == QuantKind::Q5_K) {
-            if (w.qk_soa) gemv_qk_k<kQ5KSoaBsz><<<blocks, threads, smem>>>(w.data, x, y, w.rows, w.cols, add);
-            else gemv_qk_k<kQ5KBsz><<<blocks, threads, smem>>>(w.data, x, y, w.rows, w.cols, add);
+            if (w.rows >= 4096) {
+                const int pairs = (w.rows + 1) / 2;
+                const int warps = threads / 32;
+                const int pblocks = (pairs + warps - 1) / warps;
+                if (w.qk_soa) gemv_qk_2row_k<kQ5KSoaBsz><<<pblocks, threads, smem>>>(w.data, x, y, w.rows, w.cols, add);
+                else gemv_qk_2row_k<kQ5KBsz><<<pblocks, threads, smem>>>(w.data, x, y, w.rows, w.cols, add);
+            } else if (w.qk_soa)
+                gemv_qk_k<kQ5KSoaBsz><<<blocks, threads, smem>>>(w.data, x, y, w.rows, w.cols, add);
+            else
+                gemv_qk_k<kQ5KBsz><<<blocks, threads, smem>>>(w.data, x, y, w.rows, w.cols, add);
         } else {
-            if (w.qk_soa) gemv_qk_k<kQ6KSoaBsz><<<blocks, threads, smem>>>(w.data, x, y, w.rows, w.cols, add);
-            else gemv_qk_k<kQ6KBsz><<<blocks, threads, smem>>>(w.data, x, y, w.rows, w.cols, add);
+            if (w.rows >= 4096) {
+                const int pairs = (w.rows + 1) / 2;
+                const int warps = threads / 32;
+                const int pblocks = (pairs + warps - 1) / warps;
+                if (w.qk_soa)
+                    gemv_qk_2row_k<kQ6KSoaBsz><<<pblocks, threads, smem>>>(w.data, x, y, w.rows, w.cols, add);
+                else
+                    gemv_qk_2row_k<kQ6KBsz><<<pblocks, threads, smem>>>(w.data, x, y, w.rows, w.cols, add);
+            } else if (w.qk_soa)
+                gemv_qk_k<kQ6KSoaBsz><<<blocks, threads, smem>>>(w.data, x, y, w.rows, w.cols, add);
+            else
+                gemv_qk_k<kQ6KBsz><<<blocks, threads, smem>>>(w.data, x, y, w.rows, w.cols, add);
         }
         break;
     }
@@ -7450,15 +10356,7 @@ bool launch_cublas_fp8(const GpuW& w, const float* X, float* Y, int T, int add) 
     const size_t wn = static_cast<size_t>(w.rows) * static_cast<size_t>(w.cols);
     if (one == 0 || wn > one) return false;
     if (w.cols * T > g_xf16_n) return false;
-    if (!g_dq_stream) {
-        cudaStreamCreateWithFlags(&g_dq_stream, cudaStreamNonBlocking);
-        cudaEventCreateWithFlags(&g_dq_done[0], cudaEventDisableTiming);
-        cudaEventCreateWithFlags(&g_dq_done[1], cudaEventDisableTiming);
-        cudaEventCreateWithFlags(&g_gemm_done[0], cudaEventDisableTiming);
-        cudaEventCreateWithFlags(&g_gemm_done[1], cudaEventDisableTiming);
-        cudaEventRecord(g_gemm_done[0], cudaStreamPerThread);
-        cudaEventRecord(g_gemm_done[1], cudaStreamPerThread);
-    }
+    ensure_dq_stream();
     const int slot = g_wf_slot;
     g_wf_slot = 1 - g_wf_slot;
     __half* wbuf = g_wf16 + slot * one;
@@ -7479,7 +10377,7 @@ bool launch_cublas_fp8(const GpuW& w, const float* X, float* Y, int T, int add) 
 // Persistent row-major e4 (scales absorbed at load). No per-GEMM unpack. T=1 untouched.
 bool launch_cublas_fp8_e4(const GpuW& w, const float* X, float* Y, int T, int add) {
     cublasLtHandle_t lt = (g_launch_stream && g_launch_stream == g_bak_stream && g_lt2) ? g_lt2 : g_lt;
-    if (!g_cublas_fp8_e4 || !lt || T < 16 || w.rows < 128) return false;
+    if (!g_cublas_fp8_e4 || !lt || T < g_lt_min_T || w.rows < 128) return false;
     if (w.q != QuantKind::FP8_E4M3_B128 || !w.data || !w.fp8_rowmaj) return false;
     if (w.cols < 128 || (w.cols & 127) != 0) return false;
     LtPack* pack = lt_get(w.rows, T, w.cols, add ? 1 : 0);
@@ -7517,8 +10415,79 @@ bool launch_cublas_f16(const GpuW& w, const float* X, float* Y, int T) {
                             w.cols, g_xf16, CUDA_R_16F, w.cols, &beta, Y, CUDA_R_32F, w.rows, CUBLAS_COMPUTE_32F,
                             CUBLAS_GEMM_DEFAULT_TENSOR_OP) == CUBLAS_STATUS_SUCCESS;
     }
-    if (w.q == QuantKind::BF16) return false;
+    if (w.q == QuantKind::BF16) {
+        f32_to_bf16_k<<<(n + 255) / 256, 256>>>(X, reinterpret_cast<uint16_t*>(g_xf16), n);
+        return cublasGemmEx(g_blas, CUBLAS_OP_T, CUBLAS_OP_N, w.rows, T, w.cols, &alpha, w.data, CUDA_R_16BF,
+                            w.cols, g_xf16, CUDA_R_16BF, w.cols, &beta, Y, CUDA_R_32F, w.rows, CUBLAS_COMPUTE_32F,
+                            CUBLAS_GEMM_DEFAULT_TENSOR_OP) == CUBLAS_STATUS_SUCCESS;
+    }
     return false;
+}
+
+void ensure_dq_stream() {
+    if (g_dq_stream) return;
+    cudaStreamCreateWithFlags(&g_dq_stream, cudaStreamNonBlocking);
+    cudaEventCreateWithFlags(&g_dq_done[0], cudaEventDisableTiming);
+    cudaEventCreateWithFlags(&g_dq_done[1], cudaEventDisableTiming);
+    cudaEventCreateWithFlags(&g_gemm_done[0], cudaEventDisableTiming);
+    cudaEventCreateWithFlags(&g_gemm_done[1], cudaEventDisableTiming);
+    cudaEventRecord(g_gemm_done[0], cudaStreamPerThread);
+    cudaEventRecord(g_gemm_done[1], cudaStreamPerThread);
+}
+
+// T>=8: dequant one Q8 tile into g_wf16, then F16 tensor-core cublasGemmEx.
+// lm_head (vocab×H) is row-tiled so it fits the existing ping-pong workspace.
+bool launch_cublas_q8(const GpuW& w, const float* X, float* Y, int T, int add) {
+    if (!g_blas || !g_xf16 || !g_wf16 || T < 16) return false;
+    if (w.q != QuantKind::Q8_0 || !w.data || !w.scale) return false;
+    if (w.rows < 16 || w.cols < 32 || (w.cols & 31) != 0) return false;
+    if (w.cols * T > g_xf16_n) return false;
+    const size_t cap = g_wf16_n;
+    if (cap < static_cast<size_t>(w.cols) * 16) return false;
+    int mtile = static_cast<int>(cap / static_cast<size_t>(w.cols));
+    if (mtile > w.rows) mtile = w.rows;
+    mtile &= ~7;
+    if (mtile < 16) return false;
+    cudaStream_t st = gemm_stream();
+    f32_to_f16_k<<<(w.cols * T + 255) / 256, 256, 0, st>>>(X, g_xf16, w.cols * T);
+    const int8_t* Q = reinterpret_cast<const int8_t*>(w.data);
+    const __half* S = reinterpret_cast<const __half*>(w.scale);
+    const float alpha = 1.f, beta0 = 0.f;
+    cublasSetStream(g_blas, st);
+    float* ydst = Y;
+    if (add) {
+        // Dedicated activation scratch (d_y_seq_). Reusing g_wf16's second half
+        // overlapped a prior full-buffer dequant and zeroed 27B mixed tokens.
+        const size_t yn = static_cast<size_t>(w.rows) * static_cast<size_t>(T);
+        if (!g_yadd || yn > static_cast<size_t>(g_yadd_n) || Y == g_yadd) return false;
+        ydst = g_yadd;
+    }
+    __half* wbuf = g_wf16;
+    for (int r0 = 0; r0 < w.rows; r0 += mtile) {
+        int mr = w.rows - r0;
+        if (mr > mtile) mr = mtile;
+        const size_t n4 = (static_cast<size_t>(mr) * static_cast<size_t>(w.cols)) >> 2;
+        dequant_q8_soa_f16_k<<<static_cast<unsigned>((n4 + 255) / 256), 256, 0, st>>>(Q, S, wbuf, w.cols,
+                                                                                     r0, mr);
+        const bool ok =
+            cublasGemmEx(g_blas, CUBLAS_OP_T, CUBLAS_OP_N, mr, T, w.cols, &alpha, wbuf, CUDA_R_16F,
+                         w.cols, g_xf16, CUDA_R_16F, w.cols, &beta0, ydst + r0, CUDA_R_32F, w.rows,
+                         CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP) == CUBLAS_STATUS_SUCCESS;
+        if (!ok) return false;
+    }
+    if (add) {
+        const int yn = w.rows * T;
+        add_res_k<<<(yn + 255) / 256, 256, 0, st>>>(Y, ydst, yn);
+    }
+    if (w.rows > 256) {
+        static int once = 0;
+        if (!once) {
+            once = 1;
+            std::fprintf(stderr, "native_q8_cublas=1 m=%d n=%d T=%d add=%d tiles=%d\n", w.rows, w.cols, T,
+                         add, (w.rows + mtile - 1) / mtile);
+        }
+    }
+    return true;
 }
 
 int gdn_dyn_smem(int dk, int dv) {
@@ -7539,7 +10508,7 @@ void launch_gdn(const float* mix, const float* aa, const float* bb, uint16_t* S,
     const int sm = gdn_dyn_smem(dk, dv);
     if (T == 1 && dk == 128 && dv == 128 && conv_k == 4 && qkv_raw && conv_w && conv_st && nv > 0)
         gdn_decode_t1_k<<<nv, 256, sm>>>(aa, bb, S, A_log, dt_bias, o, nk, nv, qkv_raw, conv_w, conv_st, pf,
-                                         pf_bytes);
+                                         pf_bytes, 0, 0, 0, 0, 0);
     else if (T > 1 && dk == 128 && dv == 128 && mix) {
         gdn_norm_qk_mix_k<<<dim3(nk, T), 32>>>(const_cast<float*>(mix), T, nk, qkv_dim);
         gdn_pack_ab_k<<<(T * nv + 255) / 256, 256>>>(const_cast<float*>(aa), const_cast<float*>(bb), A_log,
@@ -7655,14 +10624,87 @@ void launch_gemm_fp8_dual(const GpuW& w1, const GpuW& w2, const float* X, float*
             swiglu_n_k<<<(((w1.rows * T + 3) / 4) + 255) / 256, 256>>>(Y1, Y2, Y1, w1.rows * T);
         return;
     }
-    if (T == 3 && w1.q == QuantKind::FP8_E4M3_B128 && w2.q == QuantKind::FP8_E4M3_B128 && w1.data &&
-        w2.data && w1.rows == w2.rows && w1.cols == w2.cols && w1.rows > 0 && w1.cols > 0) {
+    // K-major T=3 dual. Official 27B W is row-major; this kernel reads fp8_blk4
+    // and produced ~0 SwiGLU, so T=3 prefill skipped every MLP (l0 == post-GDN).
+    if (T == 3 && w1.fp8_kmajor && w2.fp8_kmajor && w1.q == QuantKind::FP8_E4M3_B128 &&
+        w2.q == QuantKind::FP8_E4M3_B128 && w1.data && w2.data && w1.rows == w2.rows &&
+        w1.cols == w2.cols && w1.rows > 0 && w1.cols > 0) {
         int blocks = 0, threads = 0;
         gemv_grid(w1, blocks, threads);
         const int tile = gemm_fp8_tile(3, w1.cols);
         const size_t smem = static_cast<size_t>(3) * tile * sizeof(float);
         gemm_fp8_t3_dual_k<<<blocks, threads, smem>>>(w1.data, w1.scale, w2.data, w2.scale, X, Y1, Y2, w1.rows,
                                                       w1.cols, tile, fuse_swiglu);
+        return;
+    }
+    if (T == 2 && w1.q == QuantKind::Q4_K && w2.q == QuantKind::Q4_K && w1.qk_soa && w2.qk_soa &&
+        w1.rows == w2.rows && w1.cols == w2.cols && w1.rows >= 4096 && (w1.cols % 256) == 0 && g_xq &&
+        g_xsc && w1.cols * 2 <= g_xq_n && ensure_xq(X, w1.cols, 2)) {
+        static int once = 0;
+        if (!once) {
+            once = 1;
+            std::fprintf(stderr, "q4k_q8_t2_dual=1 fuse=%d blk=1\n", fuse_swiglu);
+        }
+        rapidllm::cuda_gemv::launch_q4k_q8_t2_dual(w1.data, w2.data, g_xq, g_xsc, Y1, Y2, w1.rows, w1.cols);
+        if (fuse_swiglu && Y1 && Y2)
+            swiglu_n_k<<<(((w1.rows * T + 3) / 4) + 255) / 256, 256>>>(Y1, Y2, Y1, w1.rows * T);
+        return;
+    }
+    if (T == 3 && w1.q == QuantKind::Q4_K && w2.q == QuantKind::Q4_K && w1.qk_soa && w2.qk_soa &&
+        w1.rows == w2.rows && w1.cols == w2.cols && w1.rows >= 4096 && (w1.cols % 256) == 0 && g_xq &&
+        g_xsc && w1.cols * 3 <= g_xq_n && ensure_xq(X, w1.cols, 3)) {
+        static int once = 0;
+        if (!once) {
+            once = 1;
+            std::fprintf(stderr, "q4k_q8_t3_dual=1 fuse=%d blk=1\n", fuse_swiglu);
+        }
+        const int pairs = (w1.rows + 1) / 2;
+        const int t3th = 256;
+        const int t3w = t3th / 32;
+        const int t3pb = (pairs + t3w - 1) / t3w;
+        gemv_q4k_soa_q8_t3_dual_k<<<t3pb, t3th>>>(w1.data, w2.data, g_xq, g_xsc, Y1, Y2, w1.rows, w1.cols, 0);
+        if (fuse_swiglu && Y1 && Y2)
+            swiglu_n_k<<<(((w1.rows * T + 3) / 4) + 255) / 256, 256>>>(Y1, Y2, Y1, w1.rows * T);
+        return;
+    }
+    if (T == 4 && w1.q == QuantKind::Q4_K && w2.q == QuantKind::Q4_K && w1.qk_soa && w2.qk_soa &&
+        w1.rows == w2.rows && w1.cols == w2.cols && w1.rows >= 4096 && (w1.cols % 256) == 0 && g_xq &&
+        g_xsc && w1.cols * 4 <= g_xq_n && ensure_xq(X, w1.cols, 4)) {
+        static int once = 0;
+        if (!once) {
+            once = 1;
+            std::fprintf(stderr, "q4k_q8_t4_dual=1 fuse=%d\n", fuse_swiglu);
+        }
+        rapidllm::cuda_gemv::launch_q4k_q8_t4_dual(w1.data, w2.data, g_xq, g_xsc, Y1, Y2, w1.rows, w1.cols);
+        if (fuse_swiglu && Y1 && Y2)
+            swiglu_n_k<<<(((w1.rows * T + 3) / 4) + 255) / 256, 256>>>(Y1, Y2, Y1, w1.rows * T);
+        return;
+    }
+    if (T == 6 && w1.q == QuantKind::Q4_K && w2.q == QuantKind::Q4_K && w1.qk_soa && w2.qk_soa &&
+        w1.rows == w2.rows && w1.cols == w2.cols && w1.rows >= 4096 && (w1.cols % 256) == 0 && g_xq &&
+        g_xsc && w1.cols * 6 <= g_xq_n && ensure_xq(X, w1.cols, 6)) {
+        static int once = 0;
+        if (!once) {
+            once = 1;
+            std::fprintf(stderr, "q4k_q8_t6_dual=1 fuse=%d\n", fuse_swiglu);
+        }
+        rapidllm::cuda_gemv::launch_q4k_q8_t6_dual(w1.data, w2.data, g_xq, g_xsc, Y1, Y2, w1.rows, w1.cols);
+        if (fuse_swiglu && Y1 && Y2)
+            swiglu_n_k<<<(((w1.rows * T + 3) / 4) + 255) / 256, 256>>>(Y1, Y2, Y1, w1.rows * T);
+        return;
+    }
+    if (T == 12 && w1.q == QuantKind::Q4_K && w2.q == QuantKind::Q4_K && w1.qk_soa && w2.qk_soa &&
+        w1.rows == w2.rows && w1.cols == w2.cols && w1.rows >= 4096 && (w1.cols % 256) == 0 && g_xq &&
+        g_xsc && w1.cols * 12 <= g_xq_n && ensure_xq(X, w1.cols, 12)) {
+        static int once = 0;
+        if (!once) {
+            once = 1;
+            std::fprintf(stderr, "q4k_q8_t12_pair=1 fuse=%d 1row=1\n", fuse_swiglu);
+        }
+        rapidllm::cuda_gemv::launch_q4k_q8_t12_1row(w1.data, g_xq, g_xsc, Y1, w1.rows, w1.cols, 0);
+        rapidllm::cuda_gemv::launch_q4k_q8_t12_1row(w2.data, g_xq, g_xsc, Y2, w2.rows, w2.cols, 0);
+        if (fuse_swiglu && Y1 && Y2)
+            swiglu_n_k<<<(((w1.rows * T + 3) / 4) + 255) / 256, 256>>>(Y1, Y2, Y1, w1.rows * T);
         return;
     }
     launch_linear(w1, X, Y1, T);
@@ -8184,6 +11226,305 @@ void kquant_gemv_selftest() {
     run(QuantKind::Q4_K, 144, ops::gemv_q4_k, "q4k");
     run(QuantKind::Q5_K, 176, ops::gemv_q5_k, "q5k");
     run(QuantKind::Q6_K, 210, ops::gemv_q6_k, "q6k");
+    // Integer Q4×Q8-act vs float SOA GEMV (same W, quantized x).
+    {
+        const int m = 64, n = 512;
+        std::vector<float> x(n), y_ref(m), y_q8(m);
+        for (int i = 0; i < n; ++i) x[static_cast<size_t>(i)] = 0.02f * static_cast<float>((i % 17) - 8);
+        const size_t bytes = static_cast<size_t>(m) * (n / 256) * static_cast<size_t>(kQ4KBsz);
+        std::vector<uint8_t> W(bytes);
+        for (size_t i = 0; i < bytes; ++i) W[i] = static_cast<uint8_t>((i * 17 + 11) & 0xff);
+        const int nb = n / 256;
+        for (int r = 0; r < m; ++r) {
+            for (int b = 0; b < nb; ++b) {
+                uint8_t* blk = W.data() + (static_cast<size_t>(r) * nb + b) * kQ4KBsz;
+                const __half dh = __float2half(0.05f);
+                const __half dm = __float2half(0.01f);
+                std::memcpy(blk, &dh, 2);
+                std::memcpy(blk + 2, &dm, 2);
+            }
+        }
+        std::vector<uint8_t> Soa(static_cast<size_t>(m) * nb * kQ4KSoaBsz);
+        pack_q4k_soa(Soa.data(), W.data(), m, n);
+        uint8_t* dW = nullptr;
+        float *dX = nullptr, *dY = nullptr;
+        int8_t* dXq = nullptr;
+        __half* dXsc = nullptr;
+        CUDA_CHECK(cudaMalloc(&dW, Soa.size()));
+        CUDA_CHECK(cudaMalloc(&dX, sizeof(float) * n));
+        CUDA_CHECK(cudaMalloc(&dY, sizeof(float) * m));
+        CUDA_CHECK(cudaMalloc(&dXq, n));
+        CUDA_CHECK(cudaMalloc(&dXsc, sizeof(__half) * (n / 32)));
+        CUDA_CHECK(cudaMemcpy(dW, Soa.data(), Soa.size(), cudaMemcpyHostToDevice));
+        CUDA_CHECK(cudaMemcpy(dX, x.data(), sizeof(float) * n, cudaMemcpyHostToDevice));
+        GpuW tw;
+        tw.data = dW;
+        tw.q = QuantKind::Q4_K;
+        tw.rows = m;
+        tw.cols = n;
+        tw.qk_soa = true;
+        launch_gemv(tw, dX, dY, 0);
+        CUDA_CHECK(cudaMemcpy(y_ref.data(), dY, sizeof(float) * m, cudaMemcpyDeviceToHost));
+        quant_x_q8_k<<<((n >> 5) + 127) / 128, 128>>>(dX, dXq, dXsc, n);
+        CUDA_CHECK(cudaMemset(dY, 0, sizeof(float) * m));
+        gemv_q4k_soa_q8_2row_k<<<(m + 15) / 16, 256>>>(dW, dXq, dXsc, dY, m, n, 0);
+        CUDA_CHECK(cudaMemcpy(y_q8.data(), dY, sizeof(float) * m, cudaMemcpyDeviceToHost));
+        float maxe = 0.f, maxa = 0.f;
+        for (int i = 0; i < m; ++i) {
+            maxe = std::max(maxe, std::fabs(y_q8[i] - y_ref[i]));
+            maxa = std::max(maxa, std::fabs(y_ref[i]));
+        }
+        cudaFree(dW);
+        cudaFree(dX);
+        cudaFree(dY);
+        cudaFree(dXq);
+        cudaFree(dXsc);
+        const bool ok = maxe < std::max(0.05f * maxa, 2e-2f) && cudaGetLastError() == cudaSuccess;
+        std::fprintf(stderr, "native_q4k_q8act_err=%.5f maxa=%.4f ok=%d\n", maxe, maxa, ok ? 1 : 0);
+        if (!ok) throw std::runtime_error("native Q4×Q8-act GEMV selftest failed");
+    }
+}
+
+void q8_gemm_t_selftest() {
+    const int m = 64, n = 256, T = 4;
+    std::vector<int8_t> Q(static_cast<size_t>(m) * n);
+    std::vector<uint16_t> Sc(static_cast<size_t>(m) * (n / 32));
+    std::vector<float> X(static_cast<size_t>(T) * n), Yref(static_cast<size_t>(T) * m), Y(static_cast<size_t>(T) * m);
+    for (size_t i = 0; i < Q.size(); ++i) Q[i] = static_cast<int8_t>((static_cast<int>(i) * 13 + 7) % 61 - 30);
+    for (size_t i = 0; i < Sc.size(); ++i) {
+        const __half h = __float2half(0.02f + 0.001f * static_cast<float>(i % 7));
+        std::memcpy(Sc.data() + i, &h, 2);
+    }
+    for (size_t i = 0; i < X.size(); ++i) X[i] = 0.03f * static_cast<float>((static_cast<int>(i) % 11) - 5);
+    int8_t* dQ = nullptr;
+    __half* dS = nullptr;
+    float *dX = nullptr, *dY = nullptr, *dY1 = nullptr;
+    CUDA_CHECK(cudaMalloc(&dQ, Q.size()));
+    CUDA_CHECK(cudaMalloc(&dS, Sc.size() * 2));
+    CUDA_CHECK(cudaMalloc(&dX, X.size() * 4));
+    CUDA_CHECK(cudaMalloc(&dY, Y.size() * 4));
+    CUDA_CHECK(cudaMalloc(&dY1, sizeof(float) * m));
+    CUDA_CHECK(cudaMemcpy(dQ, Q.data(), Q.size(), cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(dS, Sc.data(), Sc.size() * 2, cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(dX, X.data(), X.size() * 4, cudaMemcpyHostToDevice));
+    GpuW tw;
+    tw.data = reinterpret_cast<const uint8_t*>(dQ);
+    tw.scale = reinterpret_cast<const float*>(dS);
+    tw.q = QuantKind::Q8_0;
+    tw.rows = m;
+    tw.cols = n;
+    for (int t = 0; t < T; ++t) {
+        CUDA_CHECK(cudaMemset(dY1, 0, sizeof(float) * m));
+        launch_gemv(tw, dX + static_cast<size_t>(t) * n, dY1, 0);
+        CUDA_CHECK(cudaMemcpy(Yref.data() + static_cast<size_t>(t) * m, dY1, sizeof(float) * m,
+                              cudaMemcpyDeviceToHost));
+    }
+    CUDA_CHECK(cudaMemset(dY, 0, Y.size() * 4));
+    launch_gemm_q8(tw, dX, dY, T, 0);
+    CUDA_CHECK(cudaMemcpy(Y.data(), dY, Y.size() * 4, cudaMemcpyDeviceToHost));
+    float maxe = 0.f, maxa = 0.f;
+    for (size_t i = 0; i < Y.size(); ++i) {
+        maxe = std::max(maxe, std::fabs(Y[i] - Yref[i]));
+        maxa = std::max(maxa, std::fabs(Yref[i]));
+    }
+    cudaFree(dQ);
+    cudaFree(dS);
+    cudaFree(dX);
+    cudaFree(dY);
+    cudaFree(dY1);
+    const bool ok = maxe < std::max(0.02f * maxa, 1e-3f) && cudaGetLastError() == cudaSuccess;
+    std::fprintf(stderr, "native_q8_gemm_t4_err=%.5f maxa=%.4f ok=%d\n", maxe, maxa, ok ? 1 : 0);
+    if (!ok) throw std::runtime_error("native Q8 GEMM T=4 selftest failed");
+}
+
+bool q8_tc_selftest() {
+    g_q8_cublas_add = false;
+    const int m = 128, n = 256, T = 16;
+    std::vector<int8_t> Q(static_cast<size_t>(m) * n);
+    std::vector<uint16_t> Sc(static_cast<size_t>(m) * (n / 32));
+    std::vector<float> X(static_cast<size_t>(T) * n), Yref(static_cast<size_t>(T) * m),
+        Ytc(static_cast<size_t>(T) * m), Ycb(static_cast<size_t>(T) * m);
+    for (size_t i = 0; i < Q.size(); ++i) Q[i] = static_cast<int8_t>((static_cast<int>(i) * 13 + 7) % 61 - 30);
+    for (size_t i = 0; i < Sc.size(); ++i) {
+        const __half h = __float2half(0.02f + 0.001f * static_cast<float>(i % 7));
+        std::memcpy(Sc.data() + i, &h, 2);
+    }
+    for (size_t i = 0; i < X.size(); ++i) X[i] = 0.03f * static_cast<float>((static_cast<int>(i) % 11) - 5);
+    int8_t* dQ = nullptr;
+    __half* dS = nullptr;
+    float *dX = nullptr, *dY = nullptr, *dY1 = nullptr;
+    __half *twf = nullptr, *txf = nullptr;
+    if (cudaMalloc(&dQ, Q.size()) != cudaSuccess) return false;
+    if (cudaMalloc(&dS, Sc.size() * 2) != cudaSuccess) {
+        cudaFree(dQ);
+        return false;
+    }
+    if (cudaMalloc(&dX, X.size() * 4) != cudaSuccess) {
+        cudaFree(dQ);
+        cudaFree(dS);
+        return false;
+    }
+    if (cudaMalloc(&dY, Yref.size() * 4) != cudaSuccess) {
+        cudaFree(dQ);
+        cudaFree(dS);
+        cudaFree(dX);
+        return false;
+    }
+    if (cudaMalloc(&dY1, sizeof(float) * m) != cudaSuccess) {
+        cudaFree(dQ);
+        cudaFree(dS);
+        cudaFree(dX);
+        cudaFree(dY);
+        return false;
+    }
+    cudaMemcpy(dQ, Q.data(), Q.size(), cudaMemcpyHostToDevice);
+    cudaMemcpy(dS, Sc.data(), Sc.size() * 2, cudaMemcpyHostToDevice);
+    cudaMemcpy(dX, X.data(), X.size() * 4, cudaMemcpyHostToDevice);
+    GpuW tw;
+    tw.data = reinterpret_cast<const uint8_t*>(dQ);
+    tw.scale = reinterpret_cast<const float*>(dS);
+    tw.q = QuantKind::Q8_0;
+    tw.rows = m;
+    tw.cols = n;
+    for (int t = 0; t < T; ++t) {
+        cudaMemset(dY1, 0, sizeof(float) * m);
+        launch_gemv(tw, dX + static_cast<size_t>(t) * n, dY1, 0);
+        cudaMemcpy(Yref.data() + static_cast<size_t>(t) * m, dY1, sizeof(float) * m, cudaMemcpyDeviceToHost);
+    }
+    auto max_err = [&](const std::vector<float>& Y) {
+        float maxe = 0.f, maxa = 0.f;
+        for (size_t i = 0; i < Y.size(); ++i) {
+            maxe = std::max(maxe, std::fabs(Y[i] - Yref[i]));
+            maxa = std::max(maxa, std::fabs(Yref[i]));
+        }
+        return std::pair<float, float>(maxe, maxa);
+    };
+    cudaMemset(dY, 0, Ytc.size() * 4);
+    const bool prev = g_q8_tc;
+    g_q8_tc = true;
+    const bool launched = launch_gemm_q8_tc(tw, dX, dY, T, 0);
+    g_q8_tc = prev;
+    bool tc_ok = false;
+    if (launched && cudaDeviceSynchronize() == cudaSuccess && cudaGetLastError() == cudaSuccess) {
+        cudaMemcpy(Ytc.data(), dY, Ytc.size() * 4, cudaMemcpyDeviceToHost);
+        const auto e = max_err(Ytc);
+        tc_ok = e.first < std::max(0.05f * e.second, 2e-3f);
+        std::fprintf(stderr, "native_q8_tc_t8_err=%.5f maxa=%.4f ok=%d\n", e.first, e.second, tc_ok ? 1 : 0);
+    } else {
+        cudaGetLastError();
+        std::fprintf(stderr, "native_q8_tc_t8_err=nan maxa=0 ok=0\n");
+    }
+    bool cb_ok = false;
+    if (cudaMalloc(&twf, 2ull * static_cast<size_t>(m) * n * sizeof(__half)) == cudaSuccess &&
+        cudaMalloc(&txf, static_cast<size_t>(n) * T * sizeof(__half)) == cudaSuccess) {
+        __half* old_wf = g_wf16;
+        const size_t old_wn = g_wf16_n;
+        __half* old_xf = g_xf16;
+        const int old_xn = g_xf16_n;
+        g_wf16 = twf;
+        g_wf16_n = 2ull * static_cast<size_t>(m) * n;
+        g_xf16 = txf;
+        g_xf16_n = n * T;
+        cudaMemset(dY, 0, Ycb.size() * 4);
+        const bool cb = launch_cublas_q8(tw, dX, dY, T, 0);
+        if (cb && cudaDeviceSynchronize() == cudaSuccess && cudaGetLastError() == cudaSuccess) {
+            cudaMemcpy(Ycb.data(), dY, Ycb.size() * 4, cudaMemcpyDeviceToHost);
+            const auto e = max_err(Ycb);
+            cb_ok = e.first < std::max(0.05f * e.second, 2e-3f);
+            std::fprintf(stderr, "native_q8_cublas_t8_err=%.5f maxa=%.4f ok=%d\n", e.first, e.second,
+                         cb_ok ? 1 : 0);
+        } else {
+            cudaGetLastError();
+            std::fprintf(stderr, "native_q8_cublas_t8_err=nan maxa=0 ok=0\n");
+        }
+        bool add_ok = false;
+        float* dyadd = nullptr;
+        if (cb_ok && cudaMalloc(&dyadd, Ycb.size() * 4) == cudaSuccess) {
+            float* old_ya = g_yadd;
+            const int old_yn = g_yadd_n;
+            g_yadd = dyadd;
+            g_yadd_n = static_cast<int>(Ycb.size());
+            std::vector<float> Ybase(Ycb.size(), 0.25f);
+            cudaMemcpy(dY, Ybase.data(), Ybase.size() * 4, cudaMemcpyHostToDevice);
+            const bool cba = launch_cublas_q8(tw, dX, dY, T, 1);
+            if (cba && cudaDeviceSynchronize() == cudaSuccess && cudaGetLastError() == cudaSuccess) {
+                std::vector<float> Ygot(Ycb.size());
+                cudaMemcpy(Ygot.data(), dY, Ygot.size() * 4, cudaMemcpyDeviceToHost);
+                float maxe = 0.f, maxa = 0.f;
+                for (size_t i = 0; i < Ygot.size(); ++i) {
+                    const float ref = 0.25f + Yref[i];
+                    maxe = std::max(maxe, std::fabs(Ygot[i] - ref));
+                    maxa = std::max(maxa, std::fabs(ref));
+                }
+                add_ok = maxe < std::max(0.05f * maxa, 2e-3f);
+                std::fprintf(stderr, "native_q8_cublas_add_err=%.5f maxa=%.4f ok=%d\n", maxe, maxa,
+                             add_ok ? 1 : 0);
+            } else {
+                cudaGetLastError();
+                std::fprintf(stderr, "native_q8_cublas_add_err=nan maxa=0 ok=0\n");
+            }
+            g_yadd = old_ya;
+            g_yadd_n = old_yn;
+            cudaFree(dyadd);
+        } else {
+            std::fprintf(stderr, "native_q8_cublas_add_err=nan maxa=0 ok=0\n");
+        }
+        g_q8_cublas_add = add_ok;
+        g_wf16 = old_wf;
+        g_wf16_n = old_wn;
+        g_xf16 = old_xf;
+        g_xf16_n = old_xn;
+    }
+    cudaFree(twf);
+    cudaFree(txf);
+    cudaFree(dQ);
+    cudaFree(dS);
+    cudaFree(dX);
+    cudaFree(dY);
+    cudaFree(dY1);
+    (void)cb_ok;
+    return tc_ok;
+}
+
+void argmax_rows_selftest() {
+    const int T = 48, n = 512, th = 256;
+    const int nblk = (n + th - 1) / th;
+    std::vector<float> hx(static_cast<size_t>(T) * n, 0.f);
+    for (int t = 0; t < T; ++t) {
+        for (int i = 0; i < n; ++i)
+            hx[static_cast<size_t>(t) * n + i] = 0.01f * static_cast<float>((i + t) % 17);
+        hx[static_cast<size_t>(t) * n + (100 + t)] = 50.f + static_cast<float>(t);
+    }
+    float *dx = nullptr, *dmax = nullptr;
+    int *didx = nullptr, *dout = nullptr;
+    auto fail_alloc = [&]() {
+        cudaFree(dx);
+        cudaFree(dmax);
+        cudaFree(didx);
+        cudaFree(dout);
+        throw std::runtime_error("argmax_rows_selftest alloc failed");
+    };
+    if (cudaMalloc(&dx, hx.size() * 4) != cudaSuccess) fail_alloc();
+    if (cudaMalloc(&dmax, sizeof(float) * static_cast<size_t>(nblk) * T) != cudaSuccess) fail_alloc();
+    if (cudaMalloc(&didx, sizeof(int) * static_cast<size_t>(nblk) * T) != cudaSuccess) fail_alloc();
+    if (cudaMalloc(&dout, sizeof(int) * T) != cudaSuccess) fail_alloc();
+    cudaMemcpy(dx, hx.data(), hx.size() * 4, cudaMemcpyHostToDevice);
+    dim3 grid(nblk, T);
+    argmax_partial_rows_k<<<grid, th>>>(dx, n, n, dmax, didx);
+    const int nth = 128;
+    argmax_final_rows_k<<<(T + nth - 1) / nth, nth>>>(dmax, didx, nblk, T, dout);
+    std::vector<int> hout(static_cast<size_t>(T), -1);
+    const cudaError_t st = cudaDeviceSynchronize();
+    cudaMemcpy(hout.data(), dout, sizeof(int) * T, cudaMemcpyDeviceToHost);
+    cudaFree(dx);
+    cudaFree(dmax);
+    cudaFree(didx);
+    cudaFree(dout);
+    int bad = 0;
+    for (int t = 0; t < T; ++t)
+        if (hout[static_cast<size_t>(t)] != 100 + t) ++bad;
+    std::fprintf(stderr, "argmax_rows_selftest T=%d bad=%d st=%d\n", T, bad, static_cast<int>(st));
+    if (st != cudaSuccess || bad != 0) throw std::runtime_error("argmax_rows_selftest failed (B>32 greedy)");
 }
 
 // Store compact KV for T tokens then attend the last token via tq (kv_mode=2).
@@ -8236,11 +11577,11 @@ void tq_kv_selftest() {
     qk_attn_decode_k<<<n_q, 256, sm_on>>>(dQf, dK + static_cast<size_t>(pos) * kn, dV + static_cast<size_t>(pos) * kn,
                                           nullptr, nullptr, reinterpret_cast<float*>(dKf),
                                           reinterpret_cast<float*>(dVf), dOf, dPos, n_q, n_kv, hd, 0, 1e7f,
-                                          1e-6f, 16384, 1, nullptr, nullptr, nullptr, nullptr);
+                                          1e-6f, 16384, 1, nullptr, nullptr, nullptr, nullptr, 0, 0, 0);
     qk_attn_decode_k<<<n_q, 256, sm_on>>>(
         dQt, dK + static_cast<size_t>(pos) * kn, dV + static_cast<size_t>(pos) * kn, nullptr, nullptr,
         reinterpret_cast<float*>(dKf), reinterpret_cast<float*>(dVf), dOt, dPos, n_q, n_kv, hd, 0, 1e7f, 1e-6f,
-        16384, 3, dKq, dKsc, dVq, dVsc);
+        16384, 3, dKq, dKsc, dVq, dVsc, 0, 0, 0);
     qk_attn_decode_tq_gqa_k<<<n_kv, 256>>>(dQt, dOt, dPos, n_q, n_kv, hd, dKq, dKsc, dVq, dVsc);
     CUDA_CHECK(cudaMemcpy(hOf.data(), dOf, hOf.size() * 4, cudaMemcpyDeviceToHost));
     CUDA_CHECK(cudaMemcpy(hOt.data(), dOt, hOt.size() * 4, cudaMemcpyDeviceToHost));
@@ -8273,11 +11614,35 @@ void tq_kv_selftest() {
     }
     float *dOp = nullptr;
     CUDA_CHECK(cudaMalloc(&dOp, static_cast<size_t>(T) * n_q * hd * 4));
+    {
+        cudaStreamAttrValue pol;
+        std::memset(&pol, 0, sizeof(pol));
+        if (cudaStreamSetAttribute(cudaStreamPerThread, cudaStreamAttributeAccessPolicyWindow, &pol) !=
+            cudaSuccess)
+            cudaGetLastError();
+        cudaCtxResetPersistingL2Cache();
+        cudaDeviceSynchronize();
+        cudaGetLastError();
+    }
+    const size_t op_n = static_cast<size_t>(T) * n_q * hd;
+    CUDA_CHECK(cudaMemset(dOp, 0, op_n * 4));
     attn_prefill_tq_gqa_k<<<dim3(n_kv, T), 256>>>(dQf, dOp, 0, T, n_q, n_kv, hd, dKq, dKsc, dVq, dVsc);
+    const cudaError_t pfe = cudaGetLastError();
+    const cudaError_t pfs = cudaDeviceSynchronize();
     std::vector<float> hOp(static_cast<size_t>(T) * n_q * hd);
     CUDA_CHECK(cudaMemcpy(hOp.data(), dOp, hOp.size() * 4, cudaMemcpyDeviceToHost));
     bool pfin = true;
-    for (float v : hOp) pfin = pfin && std::isfinite(v);
+    int nnan = 0, ifirst = -1;
+    for (size_t i = 0; i < hOp.size(); ++i) {
+        if (!std::isfinite(hOp[i])) {
+            pfin = false;
+            ++nnan;
+            if (ifirst < 0) ifirst = static_cast<int>(i);
+        }
+    }
+    if (pfe != cudaSuccess || pfs != cudaSuccess || !pfin)
+        std::fprintf(stderr, "tq_prefill_diag nnan=%d first=%d launch=%d sync=%d\n", nnan, ifirst,
+                     static_cast<int>(pfe), static_cast<int>(pfs));
     cudaFree(dK);
     cudaFree(dV);
     cudaFree(dQf);
@@ -8294,11 +11659,73 @@ void tq_kv_selftest() {
     cudaFree(dKd);
     cudaFree(dVd);
     cudaFree(dOp);
-    const bool ok = finite && pfin && cos > 0.65f && kmaxe < std::max(0.05f * kmaxa, 1e-3f) &&
+    const bool ok = finite && pfin && pfe == cudaSuccess && pfs == cudaSuccess &&
+                    cos > 0.65f && kmaxe < std::max(0.05f * kmaxa, 1e-3f) &&
                     cudaGetLastError() == cudaSuccess;
     std::fprintf(stderr, "tq_attend_cos=%.4f tq_prefill_finite=%d k_q8_err=%.5f maxa=%.4f ok=%d\n", cos,
                  pfin ? 1 : 0, kmaxe, maxa, ok ? 1 : 0);
     if (!ok) throw std::runtime_error("tq store+attend selftest failed");
+}
+
+void flash_gqa6_selftest() {
+    const int n_q = 24, n_kv = 4, hd = 256, ctx = 8, pos = 3;
+    const int kn = n_kv * hd, qn = n_q * hd;
+    std::vector<float> hQ(qn), hK(kn), hV(kn), hA(qn), hB(qn);
+    for (int i = 0; i < qn; ++i) hQ[i] = 0.01f * static_cast<float>((i % 17) - 8);
+    for (int i = 0; i < kn; ++i) {
+        hK[i] = 0.02f * static_cast<float>((i % 13) - 6);
+        hV[i] = 0.03f * static_cast<float>((i % 11) - 5);
+    }
+    float *dQ = nullptr, *dK = nullptr, *dV = nullptr, *dOa = nullptr, *dOb = nullptr, *dKc = nullptr,
+          *dVc = nullptr;
+    int* dPos = nullptr;
+    CUDA_CHECK(cudaMalloc(&dQ, qn * 4));
+    CUDA_CHECK(cudaMalloc(&dK, kn * 4));
+    CUDA_CHECK(cudaMalloc(&dV, kn * 4));
+    CUDA_CHECK(cudaMalloc(&dOa, qn * 4));
+    CUDA_CHECK(cudaMalloc(&dOb, qn * 4));
+    CUDA_CHECK(cudaMalloc(&dKc, ctx * kn * 2));
+    CUDA_CHECK(cudaMalloc(&dVc, ctx * kn * 2));
+    CUDA_CHECK(cudaMalloc(&dPos, 4));
+    CUDA_CHECK(cudaMemcpy(dQ, hQ.data(), qn * 4, cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(dK, hK.data(), kn * 4, cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(dV, hV.data(), kn * 4, cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemset(dOa, 0, qn * 4));
+    CUDA_CHECK(cudaMemset(dOb, 0, qn * 4));
+    CUDA_CHECK(cudaMemset(dKc, 0, ctx * kn * 2));
+    CUDA_CHECK(cudaMemset(dVc, 0, ctx * kn * 2));
+    CUDA_CHECK(cudaMemcpy(dPos, &pos, 4, cudaMemcpyHostToDevice));
+    const size_t sm = sizeof(float) * hd;
+    qk_attn_decode_k<<<n_q, 256, sm>>>(dQ, dK, dV, nullptr, nullptr, dKc, dVc, dOa, dPos, n_q, n_kv, hd, 0,
+                                       1e7f, 1e-6f, ctx, 1, nullptr, nullptr, nullptr, nullptr, 0, 0, 0);
+    CUDA_CHECK(cudaMemcpy(dQ, hQ.data(), qn * 4, cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemset(dKc, 0, ctx * kn * 2));
+    CUDA_CHECK(cudaMemset(dVc, 0, ctx * kn * 2));
+    qk_attn_decode_gqa_k<<<dim3(n_kv, n_q / n_kv), 256, sm>>>(dQ, dK, dV, nullptr, nullptr, dKc, dVc, dOb,
+                                                              dPos, n_q, n_kv, hd, 0, 1e7f, 1e-6f, ctx);
+    CUDA_CHECK(cudaMemcpy(hA.data(), dOa, qn * 4, cudaMemcpyDeviceToHost));
+    CUDA_CHECK(cudaMemcpy(hB.data(), dOb, qn * 4, cudaMemcpyDeviceToHost));
+    float dot = 0, na = 0, nb = 0, maxe = 0;
+    bool finite = true;
+    for (int i = 0; i < qn; ++i) {
+        finite = finite && std::isfinite(hA[i]) && std::isfinite(hB[i]);
+        dot += hA[i] * hB[i];
+        na += hA[i] * hA[i];
+        nb += hB[i] * hB[i];
+        maxe = std::max(maxe, std::fabs(hA[i] - hB[i]));
+    }
+    const float cos = (na > 0 && nb > 0) ? dot / std::sqrt(na * nb) : 0.f;
+    cudaFree(dQ);
+    cudaFree(dK);
+    cudaFree(dV);
+    cudaFree(dOa);
+    cudaFree(dOb);
+    cudaFree(dKc);
+    cudaFree(dVc);
+    cudaFree(dPos);
+    const bool ok = finite && cos > 0.99f && maxe < 1e-2f && cudaGetLastError() == cudaSuccess;
+    std::fprintf(stderr, "flash_gqa6_cos=%.4f maxe=%.5f ok=%d\n", cos, maxe, ok ? 1 : 0);
+    if (!ok) throw std::runtime_error("flash_gqa6 selftest failed");
 }
 
 void launch_gemm_qk(const GpuW& w, const float* X, float* Y, int T, int add) {
@@ -8317,16 +11744,41 @@ void launch_gemm_qk(const GpuW& w, const float* X, float* Y, int T, int add) {
     }
 }
 
-void launch_gemm_q8(const GpuW& w, const float* X, float* Y, int T) {
+void launch_gemm_q8(const GpuW& w, const float* X, float* Y, int T, int add) {
     int blocks = 0, threads = 0;
     gemv_grid(w, blocks, threads);
     int tile = 2048;
-    while (T > 0 && static_cast<size_t>(T) * (tile / 32) * kXsPad * sizeof(float) > 24 * 1024 && tile > 256)
+    while (T > 0 && static_cast<size_t>(T) * (tile / 32) * kXsPad * sizeof(float) > 24 * 1024 && tile > 128)
         tile /= 2;
     const size_t smem = static_cast<size_t>(T) * (tile / 32) * kXsPad * sizeof(float);
-    gemm_q8_soa_k<<<blocks, threads, smem>>>(reinterpret_cast<const int8_t*>(w.data),
-                                             reinterpret_cast<const __half*>(w.scale), X, Y, w.rows, w.cols,
-                                             T, tile);
+    const int8_t* Q = reinterpret_cast<const int8_t*>(w.data);
+    const __half* S = reinterpret_cast<const __half*>(w.scale);
+    if (T <= 4)
+        gemm_q8_soa_k<<<blocks, threads, smem>>>(Q, S, X, Y, w.rows, w.cols, T, tile, add);
+    else
+        gemm_q8_soa_wide_k<<<blocks, threads, smem>>>(Q, S, X, Y, w.rows, w.cols, T, tile, add);
+}
+
+bool launch_gemm_q8_tc(const GpuW& w, const float* X, float* Y, int T, int add) {
+    if (!g_q8_tc || T < 8 || w.rows < 16) return false;
+    if (w.q != QuantKind::Q8_0 || !w.data || !w.scale) return false;
+    if (w.cols < 128 || (w.cols & 127) != 0) return false;
+    constexpr int BM = 128, WLD = 136, XLD = 136;
+    const int BN = T >= 64 ? 64 : (T >= 32 ? 32 : (T >= 16 ? 16 : 8));
+    dim3 grid((w.rows + BM - 1) / BM, (T + BN - 1) / BN);
+    const size_t smem = (static_cast<size_t>(BM) * WLD + static_cast<size_t>(BN) * XLD) * sizeof(__half);
+    const int8_t* Q = reinterpret_cast<const int8_t*>(w.data);
+    const __half* S = reinterpret_cast<const __half*>(w.scale);
+    cudaStream_t st = gemm_stream();
+    if (BN == 64)
+        gemm_q8_soa_tc_k<64><<<grid, 256, smem, st>>>(Q, S, X, Y, w.rows, w.cols, T, add);
+    else if (BN == 32)
+        gemm_q8_soa_tc_k<32><<<grid, 256, smem, st>>>(Q, S, X, Y, w.rows, w.cols, T, add);
+    else if (BN == 16)
+        gemm_q8_soa_tc_k<16><<<grid, 256, smem, st>>>(Q, S, X, Y, w.rows, w.cols, T, add);
+    else
+        gemm_q8_soa_tc_k<8><<<grid, 256, smem, st>>>(Q, S, X, Y, w.rows, w.cols, T, add);
+    return true;
 }
 
 template <int TN>
@@ -8385,9 +11837,15 @@ void launch_linear(const GpuW& w, const float* X, float* Y, int T, int add) {
     if (!w.data || w.rows <= 0 || w.cols <= 0 || T <= 0) return;
     if (w.q == QuantKind::F32 || w.q == QuantKind::F16 || w.q == QuantKind::BF16) {
         if (T >= 16 && w.q == QuantKind::F32 && launch_cublas_f32(w, X, Y, T, add)) return;
-        if (!add && (w.q == QuantKind::F16 || w.q == QuantKind::BF16) && launch_cublas_f16(w, X, Y, T)) return;
+        if (!add && T >= 16 && (w.q == QuantKind::F16 || w.q == QuantKind::BF16) &&
+            launch_cublas_f16(w, X, Y, T))
+            return;
         if (T == 1) {
             launch_gemv(w, X, Y, add);
+            return;
+        }
+        if (T == 2 && w.q == QuantKind::BF16) {
+            launch_gemv_t2(w, X, Y, add);
             return;
         }
         for (int t = 0; t < T; ++t)
@@ -8398,7 +11856,23 @@ void launch_linear(const GpuW& w, const float* X, float* Y, int T, int add) {
         // Row-major (scales absorbed): cublasLt on persistent W. T<16 stays
         // per-token rm GEMV so T=2/3/4 graphs never see cublasLt setup.
         if (w.fp8_rowmaj) {
-            if (T >= 16 && launch_cublas_fp8_e4(w, X, Y, T, add)) return;
+            // T=2 spec verify / T=3 short prefill: custom one-W-read GEMV.
+            // Lt n=2/3 is slower than T=1 GEMV on this card.
+            if (T == 2) {
+                launch_gemv_t2(w, X, Y, add);
+                return;
+            }
+            if (T == 3) {
+                launch_gemv_t3(w, X, Y, add);
+                return;
+            }
+            if (T == 4) {
+                launch_gemv_t4(w, X, Y, add);
+                return;
+            }
+            // T=2/3/4 spec/prefill graphs stay on GEMV. Batch decode is T=B>=8:
+            // one cublasLt pass so 8 seqs do not reread 28GiB eight times.
+            if (T >= g_lt_min_T && launch_cublas_fp8_e4(w, X, Y, T, add)) return;
             for (int t = 0; t < T; ++t)
                 launch_gemv(w, X + static_cast<size_t>(t) * w.cols, Y + static_cast<size_t>(t) * w.rows, add);
             return;
@@ -8421,29 +11895,227 @@ void launch_linear(const GpuW& w, const float* X, float* Y, int T, int add) {
         }
         return;
     }
-    if (!add && w.q == QuantKind::Q8_0 && T > 1) {
-        int t = 0;
-        while (t < T) {
-            const int tt = T - t > 4 ? 4 : T - t;
-            if (tt == 1)
-                launch_gemv(w, X + static_cast<size_t>(t) * w.cols, Y + static_cast<size_t>(t) * w.rows);
-            else
-                launch_gemm_q8(w, X + static_cast<size_t>(t) * w.cols, Y + static_cast<size_t>(t) * w.rows, tt);
-            t += tt;
+    if (w.q == QuantKind::Q8_0 && T > 1) {
+        if (T >= 16 && !add && launch_cublas_q8(w, X, Y, T, 0)) return;
+        if (T >= 2 && T <= 4) {
+            static int once = 0;
+            if (!once) {
+                once = 1;
+                std::fprintf(stderr, "q8_t%d_gemm=1\n", T);
+            }
+            launch_gemm_q8(w, X, Y, T, add);
+            return;
         }
+        for (int t = 0; t < T; ++t)
+            launch_gemv(w, X + static_cast<size_t>(t) * w.cols, Y + static_cast<size_t>(t) * w.rows, add);
         return;
     }
     if ((w.q == QuantKind::Q4_K || w.q == QuantKind::Q5_K || w.q == QuantKind::Q6_K) && T > 1) {
-        int t = 0;
-        while (t < T) {
-            const int tt = T - t > 16 ? 16 : T - t;
-            if (tt == 1)
-                launch_gemv(w, X + static_cast<size_t>(t) * w.cols, Y + static_cast<size_t>(t) * w.rows, add);
-            else
-                launch_gemm_qk(w, X + static_cast<size_t>(t) * w.cols, Y + static_cast<size_t>(t) * w.rows, tt,
-                               add);
-            t += tt;
+        if (T == 2 && w.q == QuantKind::Q6_K && w.qk_soa && w.rows >= 4096 && (w.cols % 256) == 0) {
+            static int once = 0;
+            if (!once) {
+                once = 1;
+                std::fprintf(stderr, "q6k_f32_t2=1 thr=256 ild=1 pipe=1 1row=1\n");
+            }
+            rapidllm::cuda_gemv::launch_q6k_f32_t2_1row(w.data, X, Y, w.rows, w.cols, add);
+            return;
         }
+        if (T == 2 && w.q == QuantKind::Q4_K && w.qk_soa && w.rows >= 4096 && (w.cols % 256) == 0 &&
+            g_xq && g_xsc && w.cols * 2 <= g_xq_n && ensure_xq(X, w.cols, 2)) {
+            static int once = 0;
+            if (!once) {
+                once = 1;
+                std::fprintf(stderr, "q4k_q8_t2=1 int_dot=1 thr=256 1row=1\n");
+            }
+            rapidllm::cuda_gemv::launch_q4k_q8_t2_1row(w.data, g_xq, g_xsc, Y, w.rows, w.cols, add);
+            return;
+        }
+        if (T == 2 && w.rows >= 4096 && (w.cols % 256) == 0) {
+            int blocks = 0, threads = 0;
+            gemv_grid(w, blocks, threads);
+            const int tile = w.cols < kXsTile ? w.cols : kXsTile;
+            const size_t smem = sizeof(float) * static_cast<size_t>(tile);
+            const int pairs = (w.rows + 1) / 2;
+            const int warps = threads / 32;
+            const int pblocks = (pairs + warps - 1) / warps;
+            static int t2once = 0;
+            if (!t2once) {
+                t2once = 1;
+                std::fprintf(stderr, "qk_t2_x1_ldg=1 tile=%d\n", tile);
+            }
+            if (w.q == QuantKind::Q4_K) {
+                if (w.qk_soa)
+                    gemv_qk_t2_2row_k<kQ4KSoaBsz><<<pblocks, threads, smem>>>(w.data, X, Y, w.rows, w.cols, add);
+                else
+                    gemv_qk_t2_2row_k<kQ4KBsz><<<pblocks, threads, smem>>>(w.data, X, Y, w.rows, w.cols, add);
+            } else if (w.q == QuantKind::Q6_K) {
+                if (w.qk_soa)
+                    gemv_qk_t2_2row_k<kQ6KSoaBsz><<<pblocks, threads, smem>>>(w.data, X, Y, w.rows, w.cols, add);
+                else
+                    gemv_qk_t2_2row_k<kQ6KBsz><<<pblocks, threads, smem>>>(w.data, X, Y, w.rows, w.cols, add);
+            } else {
+                if (w.qk_soa)
+                    gemv_qk_t2_2row_k<kQ5KSoaBsz><<<pblocks, threads, smem>>>(w.data, X, Y, w.rows, w.cols, add);
+                else
+                    gemv_qk_t2_2row_k<kQ5KBsz><<<pblocks, threads, smem>>>(w.data, X, Y, w.rows, w.cols, add);
+            }
+            return;
+        }
+        if (T == 3 && w.q == QuantKind::Q4_K && w.qk_soa && w.rows >= 4096 && (w.cols % 256) == 0 &&
+            g_xq && g_xsc && w.cols * 3 <= g_xq_n && ensure_xq(X, w.cols, 3)) {
+            static int once = 0;
+            if (!once) {
+                once = 1;
+                std::fprintf(stderr, "q4k_q8_t3=1 int_dot=1 thr=256\n");
+            }
+            int blocks = 0, threads = 0;
+            gemv_grid(w, blocks, threads);
+            const int pairs = (w.rows + 1) / 2;
+            const int warps = threads / 32;
+            const int pblocks = (pairs + warps - 1) / warps;
+            const int t3th = 256;
+            const int t3w = t3th / 32;
+            const int t3pb = (pairs + t3w - 1) / t3w;
+            gemv_q4k_soa_q8_t3_2row_k<<<t3pb, t3th>>>(w.data, g_xq, g_xsc, Y, w.rows, w.cols, add);
+            return;
+        }
+        if (false && T == 3 && w.q == QuantKind::Q6_K && w.qk_soa && w.rows >= 4096 && (w.cols % 256) == 0 &&
+            g_xq && g_xsc && w.cols * 3 <= g_xq_n && ensure_xq(X, w.cols, 3)) {
+            // Q6 integer T=3 drifted Q4 tokens onto the official cycle (56.6 wall).
+            static int once = 0;
+            if (!once) {
+                once = 1;
+                std::fprintf(stderr, "q6k_q8_t3=1 int_dot=1 thr=256\n");
+            }
+            const int pairs = (w.rows + 1) / 2;
+            const int t3th = 256;
+            const int t3w = t3th / 32;
+            const int t3pb = (pairs + t3w - 1) / t3w;
+            gemv_q6k_soa_q8_t3_2row_k<<<t3pb, t3th>>>(w.data, g_xq, g_xsc, Y, w.rows, w.cols, add);
+            return;
+        }
+        if (T == 4 && w.q == QuantKind::Q4_K && w.qk_soa && w.rows >= 4096 && (w.cols % 256) == 0 &&
+            g_xq && g_xsc && w.cols * 4 <= g_xq_n && ensure_xq(X, w.cols, 4)) {
+            static int once = 0;
+            if (!once) {
+                once = 1;
+                std::fprintf(stderr, "q4k_q8_t4=1 int_dot=1 thr=256\n");
+            }
+            const int pairs = (w.rows + 1) / 2;
+            const int t4th = 256;
+            const int t4w = t4th / 32;
+            const int t4pb = (pairs + t4w - 1) / t4w;
+            gemv_q4k_soa_q8_t4_2row_k<<<t4pb, t4th>>>(w.data, g_xq, g_xsc, Y, w.rows, w.cols, add);
+            return;
+        }
+        if (T == 3 && w.q == QuantKind::Q6_K && w.qk_soa && w.rows >= 4096 && (w.cols % 256) == 0) {
+            static int once = 0;
+            if (!once) {
+                once = 1;
+                std::fprintf(stderr, "q6k_f32_t3=1 thr=256 ild=1 pipe=1\n");
+            }
+            rapidllm::cuda_gemv::launch_q6k_f32_t3_ild(w.data, X, Y, w.rows, w.cols, add);
+            return;
+        }
+        if (T == 4 && w.q == QuantKind::Q6_K && w.qk_soa && w.rows >= 4096 && (w.cols % 256) == 0) {
+            static int once = 0;
+            if (!once) {
+                once = 1;
+                std::fprintf(stderr, "q6k_f32_t4=1 thr=256 ild=1 pipe=1\n");
+            }
+            rapidllm::cuda_gemv::launch_q6k_f32_t4_ild(w.data, X, Y, w.rows, w.cols, add);
+            return;
+        }
+        if (T == 6 && w.q == QuantKind::Q6_K && w.qk_soa && w.rows >= 4096 && (w.cols % 256) == 0) {
+            static int once = 0;
+            if (!once) {
+                once = 1;
+                std::fprintf(stderr, "q6k_f32_t6=1 thr=256 ild=1 pipe=1\n");
+            }
+            rapidllm::cuda_gemv::launch_q6k_f32_t6_ild(w.data, X, Y, w.rows, w.cols, add);
+            return;
+        }
+        if (T == 6 && w.q == QuantKind::Q4_K && w.qk_soa && w.rows >= 4096 && (w.cols % 256) == 0 &&
+            g_xq && g_xsc && w.cols * 6 <= g_xq_n && ensure_xq(X, w.cols, 6)) {
+            static int once = 0;
+            if (!once) {
+                once = 1;
+                std::fprintf(stderr, "q4k_q8_t6=1 int_dot=1 thr=256\n");
+            }
+            rapidllm::cuda_gemv::launch_q4k_q8_t6(w.data, g_xq, g_xsc, Y, w.rows, w.cols, add);
+            return;
+        }
+        if (T == 12 && w.q == QuantKind::Q6_K && w.qk_soa && w.rows >= 4096 && (w.cols % 256) == 0) {
+            static int once = 0;
+            if (!once) {
+                once = 1;
+                std::fprintf(stderr, "q6k_f32_t12=1 thr=256 ild=1 pipe=1 1row=1\n");
+            }
+            rapidllm::cuda_gemv::launch_q6k_f32_t12_1row(w.data, X, Y, w.rows, w.cols, add);
+            return;
+        }
+        if (T == 12 && w.q == QuantKind::Q4_K && w.qk_soa && w.rows >= 4096 && (w.cols % 256) == 0 &&
+            g_xq && g_xsc && w.cols * 12 <= g_xq_n && ensure_xq(X, w.cols, 12)) {
+            static int once = 0;
+            if (!once) {
+                once = 1;
+                std::fprintf(stderr, "q4k_q8_t12=1 int_dot=1 thr=256 1row=1\n");
+            }
+            rapidllm::cuda_gemv::launch_q4k_q8_t12_1row(w.data, g_xq, g_xsc, Y, w.rows, w.cols, add);
+            return;
+        }
+        if (T == 3 && w.rows >= 4096 && (w.cols % 256) == 0 && w.qk_soa &&
+            (w.q == QuantKind::Q4_K || w.q == QuantKind::Q6_K)) {
+            int blocks = 0, threads = 0;
+            gemv_grid(w, blocks, threads);
+            const int tile = w.cols < kXsTile ? w.cols : kXsTile;
+            const size_t smem = sizeof(float) * static_cast<size_t>(tile);
+            const int pairs = (w.rows + 1) / 2;
+            const int warps = threads / 32;
+            const int pblocks = (pairs + warps - 1) / warps;
+            static int t3once = 0;
+            if (!t3once) {
+                t3once = 1;
+                std::fprintf(stderr, "qk_t3_2row=1 tile=%d\n", tile);
+            }
+            if (w.q == QuantKind::Q4_K)
+                gemv_qk_t3_2row_k<kQ4KSoaBsz><<<pblocks, threads, smem>>>(w.data, X, Y, w.rows, w.cols, add);
+            else
+                gemv_qk_t3_2row_k<kQ6KSoaBsz><<<pblocks, threads, smem>>>(w.data, X, Y, w.rows, w.cols, add);
+            return;
+        }
+        if (T == 4 && w.rows >= 4096 && (w.cols % 256) == 0 && w.qk_soa &&
+            (w.q == QuantKind::Q4_K || w.q == QuantKind::Q6_K)) {
+            int blocks = 0, threads = 0;
+            gemv_grid(w, blocks, threads);
+            const int tile = w.cols < kXsTile ? w.cols : kXsTile;
+            const size_t smem = sizeof(float) * static_cast<size_t>(tile);
+            const int pairs = (w.rows + 1) / 2;
+            const int warps = threads / 32;
+            const int pblocks = (pairs + warps - 1) / warps;
+            static int t4once = 0;
+            if (!t4once) {
+                t4once = 1;
+                std::fprintf(stderr, "qk_t4_2row=1 tile=%d\n", tile);
+            }
+            if (w.q == QuantKind::Q4_K)
+                gemv_qk_t4_2row_k<kQ4KSoaBsz><<<pblocks, threads, smem>>>(w.data, X, Y, w.rows, w.cols, add);
+            else
+                gemv_qk_t4_2row_k<kQ6KSoaBsz><<<pblocks, threads, smem>>>(w.data, X, Y, w.rows, w.cols, add);
+            return;
+        }
+        if (T == 4 && w.rows >= 4096 && (w.cols % 256) == 0) {
+            static int t4once = 0;
+            if (!t4once) {
+                t4once = 1;
+                std::fprintf(stderr, "qk_t4_gemm=1\n");
+            }
+            launch_gemm_qk(w, X, Y, T, add);
+            return;
+        }
+        // Other short T: per-token GEMV.
+        for (int t = 0; t < T; ++t)
+            launch_gemv(w, X + static_cast<size_t>(t) * w.cols, Y + static_cast<size_t>(t) * w.rows, add);
         return;
     }
     if (T == 1) {
@@ -8455,6 +12127,7 @@ void launch_linear(const GpuW& w, const float* X, float* Y, int T, int add) {
 }
 
 void launch_rms(const float* x, const float* g, float* y, int n, float eps) {
+    note_x_written();
     const int th = n >= 1024 ? 256 : 128;
     rmsnorm_k<<<1, th>>>(x, g, y, n, eps);
 }
@@ -8493,6 +12166,10 @@ struct GpuLayer {
     float eps = 1e-6f;
     float theta = 1e7f;
 };
+
+__global__ void pack_mtp_draft_k(int* toks, const int* best) {
+    toks[1] = *best;
+}
 
 class EngineImpl final : public Engine {
 public:
@@ -8556,10 +12233,25 @@ public:
         }
         g_fp8_tc = fp8_tc_selftest();
         kquant_gemv_selftest();
+        q8_gemm_t_selftest();
+        g_q8_tc = q8_tc_selftest();
+        argmax_rows_selftest();
+        {
+            cudaStreamAttrValue pol;
+            std::memset(&pol, 0, sizeof(pol));
+            if (cudaStreamSetAttribute(cudaStreamPerThread, cudaStreamAttributeAccessPolicyWindow, &pol) !=
+                cudaSuccess)
+                cudaGetLastError();
+            cudaCtxResetPersistingL2Cache();
+            cudaDeviceSynchronize();
+            cudaGetLastError();
+        }
         tq_kv_selftest();
-        std::fprintf(stderr, "fp8_tensor_core=%d e4_tc=%d e4_bk512=%d cublas_fp8_e4=%d\n",
+        flash_gqa6_selftest();
+        std::fprintf(stderr, "fp8_tensor_core=%d e4_tc=%d e4_bk512=%d cublas_fp8_e4=%d native_q8_tc=%d "
+                             "q8_cublas_add=%d\n",
                      g_fp8_tc ? 1 : 0, g_fp8_e4_tc ? 1 : 0, g_fp8_e4_bk512 ? 1 : 0,
-                     g_cublas_fp8_e4 ? 1 : 0);
+                     g_cublas_fp8_e4 ? 1 : 0, g_q8_tc ? 1 : 0, g_q8_cublas_add ? 1 : 0);
         {
             const int xs_bytes = kFp8XsCap * static_cast<int>(sizeof(float));
             const cudaError_t ae =
@@ -8568,6 +12260,18 @@ public:
             const cudaError_t a2 =
                 cudaFuncSetAttribute(gdn_decode_t1_k, cudaFuncAttributeMaxDynamicSharedMemorySize, 72 * 1024);
             if (a2 != cudaSuccess) cudaGetLastError();
+            const cudaError_t a2b =
+                cudaFuncSetAttribute(gdn_decode_tn_k<2>, cudaFuncAttributeMaxDynamicSharedMemorySize, 72 * 1024);
+            if (a2b != cudaSuccess) cudaGetLastError();
+            const cudaError_t a3 =
+                cudaFuncSetAttribute(gdn_decode_tn_k<3>, cudaFuncAttributeMaxDynamicSharedMemorySize, 72 * 1024);
+            if (a3 != cudaSuccess) cudaGetLastError();
+            const cudaError_t a4 =
+                cudaFuncSetAttribute(gdn_decode_tn_k<4>, cudaFuncAttributeMaxDynamicSharedMemorySize, 72 * 1024);
+            if (a4 != cudaSuccess) cudaGetLastError();
+            const cudaError_t a6 =
+                cudaFuncSetAttribute(gdn_decode_tn_k<6>, cudaFuncAttributeMaxDynamicSharedMemorySize, 72 * 1024);
+            if (a6 != cudaSuccess) cudaGetLastError();
             const cudaError_t be =
                 cudaFuncSetAttribute(gemm_fp8_t3_k, cudaFuncAttributeMaxDynamicSharedMemorySize, 72 * 1024);
             if (be != cudaSuccess) cudaGetLastError();
@@ -8596,6 +12300,15 @@ public:
             if (xe != cudaSuccess) cudaGetLastError();
             xe = cudaFuncSetAttribute(gemv_fp8_rm_2row_k, cudaFuncAttributeMaxDynamicSharedMemorySize, xs_bytes);
             if (xe != cudaSuccess) cudaGetLastError();
+            xe = cudaFuncSetAttribute(gemv_fp8_rm_t2_k, cudaFuncAttributeMaxDynamicSharedMemorySize, xs_bytes);
+            if (xe != cudaSuccess) cudaGetLastError();
+            xe = cudaFuncSetAttribute(gemv_fp8_rm_t3_k, cudaFuncAttributeMaxDynamicSharedMemorySize, xs_bytes);
+            if (xe != cudaSuccess) cudaGetLastError();
+            xe = cudaFuncSetAttribute(gemv_fp8_rm_t4_k, cudaFuncAttributeMaxDynamicSharedMemorySize, xs_bytes);
+            if (xe != cudaSuccess) cudaGetLastError();
+            xe = cudaFuncSetAttribute(gemv_bf16_t2_k, cudaFuncAttributeMaxDynamicSharedMemorySize,
+                                      kXsTile * 2 * static_cast<int>(sizeof(float)));
+            if (xe != cudaSuccess) cudaGetLastError();
             xe = cudaFuncSetAttribute(gemv_fp8_2row_add_k, cudaFuncAttributeMaxDynamicSharedMemorySize, xs_bytes);
             if (xe != cudaSuccess) cudaGetLastError();
             xe = cudaFuncSetAttribute(gemv_fp8_dual_k, cudaFuncAttributeMaxDynamicSharedMemorySize, xs_bytes);
@@ -8617,9 +12330,21 @@ public:
             if (xe != cudaSuccess) cudaGetLastError();
             xe = cudaFuncSetAttribute(gemv_fp8_2row_attn_in_k, cudaFuncAttributeMaxDynamicSharedMemorySize, xs_bytes);
             if (xe != cudaSuccess) cudaGetLastError();
-            xe = cudaFuncSetAttribute(gemv_q8_soa_k, cudaFuncAttributeMaxDynamicSharedMemorySize, xs_bytes);
+            xe = cudaFuncSetAttribute(gemv_q8_soa_k, cudaFuncAttributeMaxDynamicSharedMemorySize, 48 * 1024);
             if (xe != cudaSuccess) cudaGetLastError();
-            xe = cudaFuncSetAttribute(gemv_q8_soa_2row_k, cudaFuncAttributeMaxDynamicSharedMemorySize, xs_bytes);
+            xe = cudaFuncSetAttribute(gemv_q8_soa_2row_k, cudaFuncAttributeMaxDynamicSharedMemorySize, 48 * 1024);
+            if (xe != cudaSuccess) cudaGetLastError();
+            xe = cudaFuncSetAttribute(gemm_q8_soa_k, cudaFuncAttributeMaxDynamicSharedMemorySize, 48 * 1024);
+            if (xe != cudaSuccess) cudaGetLastError();
+            xe = cudaFuncSetAttribute(gemm_q8_soa_wide_k, cudaFuncAttributeMaxDynamicSharedMemorySize, 48 * 1024);
+            if (xe != cudaSuccess) cudaGetLastError();
+            xe = cudaFuncSetAttribute(gemm_q8_soa_tc_k<8>, cudaFuncAttributeMaxDynamicSharedMemorySize, 48 * 1024);
+            if (xe != cudaSuccess) cudaGetLastError();
+            xe = cudaFuncSetAttribute(gemm_q8_soa_tc_k<16>, cudaFuncAttributeMaxDynamicSharedMemorySize, 48 * 1024);
+            if (xe != cudaSuccess) cudaGetLastError();
+            xe = cudaFuncSetAttribute(gemm_q8_soa_tc_k<32>, cudaFuncAttributeMaxDynamicSharedMemorySize, 48 * 1024);
+            if (xe != cudaSuccess) cudaGetLastError();
+            xe = cudaFuncSetAttribute(gemm_q8_soa_tc_k<64>, cudaFuncAttributeMaxDynamicSharedMemorySize, 64 * 1024);
             if (xe != cudaSuccess) cudaGetLastError();
             xe = cudaFuncSetAttribute(gemv_qk_k<kQ4KBsz>, cudaFuncAttributeMaxDynamicSharedMemorySize, xs_bytes);
             if (xe != cudaSuccess) cudaGetLastError();
@@ -8633,7 +12358,33 @@ public:
             if (xe != cudaSuccess) cudaGetLastError();
             xe = cudaFuncSetAttribute(gemv_qk_2row_k<kQ6KBsz>, cudaFuncAttributeMaxDynamicSharedMemorySize, xs_bytes);
             if (xe != cudaSuccess) cudaGetLastError();
+            xe = cudaFuncSetAttribute(gemv_qk_t2_2row_k<kQ4KBsz>, cudaFuncAttributeMaxDynamicSharedMemorySize,
+                                      xs_bytes);
+            if (xe != cudaSuccess) cudaGetLastError();
+            xe = cudaFuncSetAttribute(gemv_qk_t2_2row_k<kQ6KBsz>, cudaFuncAttributeMaxDynamicSharedMemorySize,
+                                      xs_bytes);
+            if (xe != cudaSuccess) cudaGetLastError();
+            xe = cudaFuncSetAttribute(gemv_qk_t2_2row_k<kQ4KSoaBsz>, cudaFuncAttributeMaxDynamicSharedMemorySize,
+                                      xs_bytes);
+            if (xe != cudaSuccess) cudaGetLastError();
+            xe = cudaFuncSetAttribute(gemv_qk_t2_2row_k<kQ6KSoaBsz>, cudaFuncAttributeMaxDynamicSharedMemorySize,
+                                      xs_bytes);
+            if (xe != cudaSuccess) cudaGetLastError();
+            xe = cudaFuncSetAttribute(gemv_qk_t3_2row_k<kQ4KSoaBsz>, cudaFuncAttributeMaxDynamicSharedMemorySize,
+                                      xs_bytes);
+            if (xe != cudaSuccess) cudaGetLastError();
+            xe = cudaFuncSetAttribute(gemv_qk_t3_2row_k<kQ6KSoaBsz>, cudaFuncAttributeMaxDynamicSharedMemorySize,
+                                      xs_bytes);
+            if (xe != cudaSuccess) cudaGetLastError();
+            xe = cudaFuncSetAttribute(gemv_qk_t4_2row_k<kQ4KSoaBsz>, cudaFuncAttributeMaxDynamicSharedMemorySize,
+                                      xs_bytes);
+            if (xe != cudaSuccess) cudaGetLastError();
+            xe = cudaFuncSetAttribute(gemv_qk_t4_2row_k<kQ6KSoaBsz>, cudaFuncAttributeMaxDynamicSharedMemorySize,
+                                      xs_bytes);
+            if (xe != cudaSuccess) cudaGetLastError();
             xe = cudaFuncSetAttribute(gemv_qk_k<kQ4KSoaBsz>, cudaFuncAttributeMaxDynamicSharedMemorySize, xs_bytes);
+            if (xe != cudaSuccess) cudaGetLastError();
+            xe = cudaFuncSetAttribute(gemv_qk_2row_k<kQ4KSoaBsz>, cudaFuncAttributeMaxDynamicSharedMemorySize, xs_bytes);
             if (xe != cudaSuccess) cudaGetLastError();
             xe = cudaFuncSetAttribute(gemv_qk_k<kQ5KSoaBsz>, cudaFuncAttributeMaxDynamicSharedMemorySize, xs_bytes);
             if (xe != cudaSuccess) cudaGetLastError();
@@ -8652,6 +12403,8 @@ public:
         g_xf16_src_n = 0;
         g_wf16 = nullptr;
         g_wf16_n = 0;
+        g_yadd = nullptr;
+        g_yadd_n = 0;
         if (g_blas) {
             cublasDestroy(g_blas);
             g_blas = nullptr;
@@ -8681,6 +12434,17 @@ public:
     }
 
     void prefill(const int32_t* ids, int n) override {
+        mtp_hist_n_ = 0;
+        mtp_kv_pos_ = 0;
+        mtp_stream_n_ = 0;
+        mtp_has_legal_ = false;
+        if (d_mtp_kc_ && d_mtp_vc_) {
+            const int kn = mtp_L_.nkv * mtp_L_.hd;
+            if (kn > 0) {
+                CUDA_CHECK(cudaMemset(d_mtp_kc_, 0, sizeof(float) * static_cast<size_t>(kMtpCap) * kn));
+                CUDA_CHECK(cudaMemset(d_mtp_vc_, 0, sizeof(float) * kMtpCap * kn));
+            }
+        }
         CUDA_CHECK(cudaMemset(d_S_, 0, s_bytes_));
         CUDA_CHECK(cudaMemset(d_conv_, 0, conv_bytes_));
         if (ctx_ <= 1024 && kv_bytes_ > 0) {
@@ -8700,16 +12464,19 @@ public:
             pos_ = n;
             if (n > 0) CUDA_CHECK(cudaMemcpy(d_tok_, ids + (n - 1), 4, cudaMemcpyHostToDevice));
             snap_last_residual(n);
+            mtp_snap_hist(ids, n);
         } else if (!use_vis && n >= 2 && n <= kPfGraphMax && pf_graph_execs_[n]) {
             CUDA_CHECK(cudaMemcpy(d_toks_, ids, sizeof(int) * n, cudaMemcpyHostToDevice));
             CUDA_CHECK(cudaGraphLaunch(pf_graph_execs_[n], cudaStreamPerThread));
             pos_ = n;
             if (n > 0) CUDA_CHECK(cudaMemcpy(d_tok_, ids + (n - 1), 4, cudaMemcpyHostToDevice));
             snap_last_residual(n);
+            mtp_snap_hist(ids, n);
         } else if (!use_vis && (n <= 1 || pf_cap_ <= 1)) {
             for (int t = 0; t < n; ++t) decode_token(ids[t]);
         } else {
             launch_prefill(ids, n);
+            mtp_snap_hist(ids, n);
             if (!use_vis && !skip_pf_graph_) maybe_capture_prefill(n);
         }
         if (!graph_exec_ && vocab_ > 256) {
@@ -8718,6 +12485,67 @@ public:
         }
         finish_logits();
         CUDA_CHECK(cudaMemcpy(d_tok_, d_best_, 4, cudaMemcpyDeviceToDevice));
+        mtp_stream_prefill(ids, n);
+    }
+
+    void zero_slot(int slot) {
+        if (slot < 0 || slot >= max_batch_) return;
+        const size_t s1 = s_bytes_ / static_cast<size_t>(std::max(max_batch_, 1));
+        const size_t c1 = conv_bytes_ / static_cast<size_t>(std::max(max_batch_, 1));
+        const size_t k1 = kv_bytes_ / static_cast<size_t>(std::max(max_batch_, 1));
+        if (s1)
+            CUDA_CHECK(cudaMemset(reinterpret_cast<uint8_t*>(d_S_) + s1 * slot, 0, s1));
+        if (c1)
+            CUDA_CHECK(cudaMemset(reinterpret_cast<uint8_t*>(d_conv_) + c1 * slot, 0, c1));
+        if (k1) {
+            CUDA_CHECK(cudaMemset(reinterpret_cast<uint8_t*>(d_kcache_) + k1 * slot, 0, k1));
+            CUDA_CHECK(cudaMemset(reinterpret_cast<uint8_t*>(d_vcache_) + k1 * slot, 0, k1));
+        }
+        if (kv_tq_ && d_k_q8_) {
+            const int nblk = std::max(1, max_hd_ / kTqBlk);
+            const size_t tq_tok = static_cast<size_t>(n_attn_) * ctx_ * static_cast<size_t>(std::max(max_nkv_, 1));
+            CUDA_CHECK(cudaMemset(d_k_q8_ + tq_tok * max_hd_ * slot, 0, tq_tok * max_hd_));
+            CUDA_CHECK(cudaMemset(reinterpret_cast<uint8_t*>(d_k_sc_) + tq_tok * 2 * slot, 0, tq_tok * 2));
+            CUDA_CHECK(cudaMemset(d_v_qs_ + tq_tok * nblk * kTq3B * slot, 0, tq_tok * nblk * kTq3B));
+            CUDA_CHECK(cudaMemset(reinterpret_cast<uint8_t*>(d_v_sc_) + tq_tok * nblk * 2 * slot, 0,
+                                  tq_tok * nblk * 2));
+        }
+    }
+
+    void zero_slots(int n_slots) override {
+        n_slots = std::min(n_slots, max_batch_);
+        for (int s = 0; s < n_slots; ++s) zero_slot(s);
+    }
+
+    void prefill_slot(const int32_t* ids, int n, int slot) override {
+        if (n <= 0) return;
+        if (slot < 0 || slot >= max_batch_) throw std::runtime_error("prefill_slot oob");
+        zero_slot(slot);
+        pf_slot_ = slot;
+        int zero = 0;
+        CUDA_CHECK(cudaMemcpy(d_pos_, &zero, 4, cudaMemcpyHostToDevice));
+        pos_ = 0;
+        // Graphs are captured for slot 0 only.
+        if (slot == 0 && n == 256 && pf256_exec_) {
+            CUDA_CHECK(cudaMemcpy(d_toks_, ids, sizeof(int) * n, cudaMemcpyHostToDevice));
+            CUDA_CHECK(cudaGraphLaunch(pf256_exec_, cudaStreamPerThread));
+            pos_ = n;
+            if (n > 0) CUDA_CHECK(cudaMemcpy(d_tok_, ids + (n - 1), 4, cudaMemcpyHostToDevice));
+            snap_last_residual(n);
+        } else if (slot == 0 && n >= 2 && n <= kPfGraphMax && pf_graph_execs_[n]) {
+            CUDA_CHECK(cudaMemcpy(d_toks_, ids, sizeof(int) * n, cudaMemcpyHostToDevice));
+            CUDA_CHECK(cudaGraphLaunch(pf_graph_execs_[n], cudaStreamPerThread));
+            pos_ = n;
+            if (n > 0) CUDA_CHECK(cudaMemcpy(d_tok_, ids + (n - 1), 4, cudaMemcpyHostToDevice));
+            snap_last_residual(n);
+        } else if (n <= 1 || pf_cap_ <= 1) {
+            for (int t = 0; t < n; ++t) decode_token(ids[t]);
+        } else {
+            launch_prefill(ids, n);
+        }
+        finish_logits();
+        CUDA_CHECK(cudaMemcpy(d_tok_, d_best_, 4, cudaMemcpyDeviceToDevice));
+        pf_slot_ = 0;
     }
 
     void decode_token(int32_t token) override {
@@ -8734,6 +12562,7 @@ public:
         }
         finish_logits();
         ++pos_;
+        mtp_append_hist(token);
     }
 
     void decode_steps(int n) override {
@@ -8765,6 +12594,931 @@ public:
         CUDA_CHECK(cudaMemcpy(host, d_xn_, sizeof(float) * static_cast<size_t>(hidden_), cudaMemcpyDeviceToHost));
     }
 
+    // Official NextN stem: fc(concat(norm(embed), norm(hidden))).
+    // hgamma_ov: null → 27B final_norm (d0 stem) / tiny pre_h; else that gamma.
+    void mtp_fuse(const float* h_in, int32_t token, bool swap_cat = false, const float* hgamma_ov = nullptr,
+                  bool set_tok = true) {
+        const int H = hidden_;
+        const float eps = store_->model().rms_eps;
+        if (set_tok) CUDA_CHECK(cudaMemcpy(d_mtp_tok_, &token, 4, cudaMemcpyHostToDevice));
+        embed_into(d_mtp_tok_, d_y_);
+        float* e_dst = swap_cat ? d_mtp_cat_ + H : d_mtp_cat_;
+        float* h_dst = swap_cat ? d_mtp_cat_ : d_mtp_cat_ + H;
+        launch_rms(d_y_, d_mtp_ne_, e_dst, H, eps);
+        // 27B d0: pre_fc_norm_hidden (even on post-final-norm last_hidden) tops 127155
+        // and the 1-layer decoder drowns 20666. Stem + final_norm hidden half hits
+        // greedy d0. Tiny fixture still uses mtp.pre_h.
+        // Official d1: post-final-norm last_hidden + pre_fc_hidden + 1-layer.
+        const float* hgamma = hgamma_ov ? hgamma_ov : ((H >= 64 && d_final_norm_) ? d_final_norm_ : d_mtp_nh_);
+        launch_rms(h_in, hgamma, h_dst, H, eps);
+        const GpuW& fc = (mtp_fc_f32_.data && mtp_fc_f32_.q == QuantKind::F32) ? mtp_fc_f32_ : mtp_fc_;
+        launch_gemv(fc, d_mtp_cat_, d_mtp_h_);
+    }
+
+    void mtp_take_id_dev() {
+        const int H = hidden_;
+        const float eps = store_->model().rms_eps;
+        const bool lh_xrms = lm_head_.q == QuantKind::FP8_E4M3_B128 && lm_head_.fp8_kmajor &&
+                             lm_head_.rows >= 4096 && lm_head_.cols == H;
+        if (lh_xrms)
+            launch_gemv(lm_head_, d_mtp_h_, d_logits_, 0, nullptr, d_mtp_nn_, nullptr, eps);
+        else {
+            launch_rms(d_mtp_h_, d_mtp_nn_, d_xn_, H, eps);
+            launch_gemv(lm_head_, d_xn_, d_logits_);
+        }
+        launch_argmax();
+    }
+
+    void launch_mtp_official_dev() {
+        mtp_fuse(d_mtp_post_, 0, false, d_mtp_nh_, false);
+        mtp_layer(-1);
+        mtp_take_id_dev();
+    }
+
+    void maybe_capture_mtp() {
+        if (mtp_graph_exec_ || !has_mtp_ || hidden_ < 64 || !d_mtp_post_ || !d_mtp_nh_) return;
+        try {
+            abort_stream_capture();
+            cudaError_t e = cudaDeviceSynchronize();
+            if (e != cudaSuccess) cudaGetLastError();
+            // K-quant lm_head / first-use FuncSetAttribute / ensure_xq must run
+            // off-capture. Eager warmup then record the same launch sequence.
+            {
+                int z = 0;
+                CUDA_CHECK(cudaMemcpy(d_mtp_tok_, &z, 4, cudaMemcpyHostToDevice));
+                if (d_mtp_pos_) CUDA_CHECK(cudaMemcpy(d_mtp_pos_, &z, 4, cudaMemcpyHostToDevice));
+                launch_mtp_official_dev();
+                e = cudaDeviceSynchronize();
+                if (e != cudaSuccess) {
+                    std::fprintf(stderr, "mtp_warmup err=%s\n", cudaGetErrorString(e));
+                    cudaGetLastError();
+                    return;
+                }
+            }
+            capturing_ = true;
+            e = cudaStreamBeginCapture(cudaStreamPerThread, cudaStreamCaptureModeThreadLocal);
+            if (e != cudaSuccess) {
+                capturing_ = false;
+                std::fprintf(stderr, "mtp_capture_begin err=%s\n", cudaGetErrorString(e));
+                return;
+            }
+            launch_mtp_official_dev();
+            cudaGraph_t g = nullptr;
+            e = cudaStreamEndCapture(cudaStreamPerThread, &g);
+            capturing_ = false;
+            if (e != cudaSuccess) {
+                std::fprintf(stderr, "mtp_capture_end err=%s\n", cudaGetErrorString(e));
+                abort_stream_capture();
+                return;
+            }
+            if (!instantiate_graph(g, &mtp_graph_exec_, "mtp_capture", 1)) return;
+            mtp_graph_ = g;
+            cudaGraphUpload(mtp_graph_exec_, cudaStreamPerThread);
+            std::fprintf(stderr, "mtp_cuda_graph=1\n");
+        } catch (const std::exception& ex) {
+            capturing_ = false;
+            abort_stream_capture();
+            std::fprintf(stderr, "mtp_capture throw=%s\n", ex.what());
+        }
+    }
+
+    void maybe_capture_mtp_t2() {
+        if (mtp_t2_exec_ || !mtp_graph_exec_ || !spec_graph_exec_ || !d_toks_ || !d_best_) return;
+        try {
+            abort_stream_capture();
+            cudaError_t e = cudaDeviceSynchronize();
+            if (e != cudaSuccess) cudaGetLastError();
+            capturing_ = true;
+            e = cudaStreamBeginCapture(cudaStreamPerThread, cudaStreamCaptureModeThreadLocal);
+            if (e != cudaSuccess) {
+                capturing_ = false;
+                std::fprintf(stderr, "mtp_t2_capture_begin err=%s\n", cudaGetErrorString(e));
+                return;
+            }
+            launch_mtp_official_dev();
+            pack_mtp_draft_k<<<1, 1>>>(d_toks_, d_best_);
+            launch_spec_chunk(2);
+            cudaGraph_t g = nullptr;
+            e = cudaStreamEndCapture(cudaStreamPerThread, &g);
+            capturing_ = false;
+            if (e != cudaSuccess) {
+                std::fprintf(stderr, "mtp_t2_capture_end err=%s\n", cudaGetErrorString(e));
+                abort_stream_capture();
+                return;
+            }
+            if (!instantiate_graph(g, &mtp_t2_exec_, "mtp_t2_capture", 2)) return;
+            mtp_t2_graph_ = g;
+            cudaGraphUpload(mtp_t2_exec_, cudaStreamPerThread);
+            std::fprintf(stderr, "mtp_t2_cuda_graph=1\n");
+        } catch (const std::exception& ex) {
+            capturing_ = false;
+            abort_stream_capture();
+            std::fprintf(stderr, "mtp_t2_capture throw=%s\n", ex.what());
+        }
+    }
+
+    int mtp_spec2(int32_t t0, int32_t* preds) override {
+        // Pipeline existing MTP graph + T=2 graph on one stream. No new capture
+        // (capturing launch_spec_chunk at init dirties persist KV).
+        if (!has_mtp_ || hidden_ < 64 || !d_mtp_post_ || !d_mtp_nh_) return 0;
+        if (!mtp_graph_exec_ || !spec_graph_exec_) return 0;
+        const int pos0 = pos_;
+        CUDA_CHECK(cudaMemcpy(d_mtp_tok_, &t0, 4, cudaMemcpyHostToDevice));
+        CUDA_CHECK(cudaMemcpy(d_toks_, &t0, 4, cudaMemcpyHostToDevice));
+        CUDA_CHECK(cudaMemcpy(d_mtp_pos_, &mtp_kv_pos_, 4, cudaMemcpyHostToDevice));
+        if (d_pos_b_) {
+            const int hp[2] = {pos0, pos0 + 1};
+            CUDA_CHECK(cudaMemcpy(d_pos_b_, hp, sizeof(hp), cudaMemcpyHostToDevice));
+        }
+        set_pos_k<<<1, 1>>>(d_pos_, pos0);
+        static int tlog = 0;
+        cudaEvent_t ev0 = nullptr, ev1 = nullptr;
+        const bool time_it = hidden_ >= 64 && tlog < 4;
+        if (time_it) {
+            cudaEventCreate(&ev0);
+            cudaEventCreate(&ev1);
+            cudaEventRecord(ev0, cudaStreamPerThread);
+        }
+        CUDA_CHECK(cudaGraphLaunch(mtp_graph_exec_, cudaStreamPerThread));
+        pack_mtp_draft_k<<<1, 1>>>(d_toks_, d_best_);
+        CUDA_CHECK(cudaGraphLaunch(spec_graph_exec_, cudaStreamPerThread));
+        int best[2] = {};
+        CUDA_CHECK(cudaMemcpy(best, d_best_n_, sizeof(int) * 2, cudaMemcpyDeviceToHost));
+        if (time_it) {
+            cudaEventRecord(ev1, cudaStreamPerThread);
+            cudaEventSynchronize(ev1);
+            float ms = 0;
+            cudaEventElapsedTime(&ms, ev0, ev1);
+            std::fprintf(stderr, "mtp_spec2_ms=%.2f\n", ms);
+            cudaEventDestroy(ev0);
+            cudaEventDestroy(ev1);
+            ++tlog;
+        }
+        int32_t d1 = 0;
+        CUDA_CHECK(cudaMemcpy(&d1, d_toks_ + 1, 4, cudaMemcpyDeviceToHost));
+        const int hit = (best[0] == d1) ? 2 : 1;
+        if (hit < 2) {
+            if (spec_t0_snap_) {
+                if (s_bytes_ && d_S_ && d_S_bak_)
+                    CUDA_CHECK(cudaMemcpy(d_S_, d_S_bak_, s_bytes_, cudaMemcpyDeviceToDevice));
+                if (conv_bytes_ && d_conv_ && d_conv_bak_)
+                    CUDA_CHECK(cudaMemcpy(d_conv_, d_conv_bak_, conv_bytes_, cudaMemcpyDeviceToDevice));
+                pos_ = pos0 + 1;
+                set_pos_k<<<1, 1>>>(d_pos_, pos_);
+                if (d_h_ && d_h_seq_)
+                    CUDA_CHECK(cudaMemcpy(d_h_, d_h_seq_, sizeof(float) * hidden_, cudaMemcpyDeviceToDevice));
+                last_tok_ = best[0];
+                CUDA_CHECK(cudaMemcpy(d_best_, &last_tok_, 4, cudaMemcpyHostToDevice));
+                if (d_tok_) CUDA_CHECK(cudaMemcpy(d_tok_, &t0, 4, cudaMemcpyHostToDevice));
+                mtp_append_hist(t0);
+                if (preds) preds[0] = t0;
+                mtp_has_legal_ = false;
+                return 1;
+            }
+            return 0;
+        }
+        if (mtp_kv_pos_ + 1 < kMtpCap) ++mtp_kv_pos_;
+        if (preds) {
+            preds[0] = t0;
+            preds[1] = d1;
+        }
+        pos_ = pos0 + 2;
+        set_pos_k<<<1, 1>>>(d_pos_, pos_);
+        snap_last_residual(2);
+        last_tok_ = best[1];
+        if (d_mtp_post_ && d_final_norm_ && d_h_)
+            launch_rms(d_h_, d_final_norm_, d_mtp_post_, hidden_, store_->model().rms_eps);
+        return 2;
+    }
+
+    int mtp_spec4(int32_t t0, int32_t* preds) override {
+        // Graph d0 (same stem as mtp_spec2) + recursive t_mtp_out drafts + T=4.
+        // Draft tokens stay on device until one D2H; no per-draft host sync.
+        if (!has_mtp_ || hidden_ < 64 || !d_mtp_post_ || !d_mtp_nh_ || !d_best_) return 0;
+        if (!mtp_graph_exec_ || !spec_graph_t4_exec_ || !d_toks_) return 0;
+        const int H = hidden_;
+        CUDA_CHECK(cudaMemcpy(d_mtp_tok_, &t0, 4, cudaMemcpyHostToDevice));
+        CUDA_CHECK(cudaMemcpy(d_toks_, &t0, 4, cudaMemcpyHostToDevice));
+        CUDA_CHECK(cudaMemcpy(d_mtp_pos_, &mtp_kv_pos_, 4, cudaMemcpyHostToDevice));
+        static int tlog = 0;
+        cudaEvent_t ev0 = nullptr, ev1 = nullptr;
+        const bool time_it = tlog < 6;
+        if (time_it) {
+            cudaEventCreate(&ev0);
+            cudaEventCreate(&ev1);
+            cudaEventRecord(ev0, cudaStreamPerThread);
+        }
+        CUDA_CHECK(cudaGraphLaunch(mtp_graph_exec_, cudaStreamPerThread));
+        CUDA_CHECK(cudaMemcpy(d_toks_ + 1, d_best_, 4, cudaMemcpyDeviceToDevice));
+        CUDA_CHECK(cudaMemcpy(d_mtp_tok_, d_best_, 4, cudaMemcpyDeviceToDevice));
+        float* h_mid = d_mtp_hh_ + static_cast<size_t>(kMtpCap - 2) * H;
+        CUDA_CHECK(cudaMemcpy(h_mid, d_mtp_h_, sizeof(float) * H, cudaMemcpyDeviceToDevice));
+        // First draft at pos 0 is self-only (keeps d0=5). Recurse past streamed
+        // prompt slots 1..stream_n so d1 attends prompt KV + d0.
+        const int rec = (mtp_stream_n_ > 0 && mtp_kv_pos_ == 0) ? (mtp_stream_n_ + 1) : (mtp_kv_pos_ + 1);
+        mtp_fuse(h_mid, 0, false, d_mtp_nh_, false);
+        mtp_layer(rec);
+        mtp_take_id_dev();
+        CUDA_CHECK(cudaMemcpy(d_toks_ + 2, d_best_, 4, cudaMemcpyDeviceToDevice));
+        CUDA_CHECK(cudaMemcpy(d_mtp_tok_, d_best_, 4, cudaMemcpyDeviceToDevice));
+        CUDA_CHECK(cudaMemcpy(h_mid, d_mtp_h_, sizeof(float) * H, cudaMemcpyDeviceToDevice));
+        mtp_fuse(h_mid, 0, false, d_mtp_nh_, false);
+        mtp_layer(rec + 1);
+        mtp_take_id_dev();
+        CUDA_CHECK(cudaMemcpy(d_toks_ + 3, d_best_, 4, cudaMemcpyDeviceToDevice));
+        int32_t ht[4] = {t0, 0, 0, 0};
+        CUDA_CHECK(cudaMemcpy(ht, d_toks_, sizeof(ht), cudaMemcpyDeviceToHost));
+        if (time_it) {
+            cudaEventRecord(ev1, cudaStreamPerThread);
+            cudaEventSynchronize(ev1);
+            float ms = 0;
+            cudaEventElapsedTime(&ms, ev0, ev1);
+            std::fprintf(stderr, "mtp_draft4_ms=%.2f t0=%d d0=%d d1=%d d2=%d kvpos=%d rec=%d\n", ms, ht[0],
+                         ht[1], ht[2], ht[3], mtp_kv_pos_, rec);
+            cudaEventDestroy(ev0);
+            cudaEventDestroy(ev1);
+            ++tlog;
+        }
+        mtp_toks_on_dev_ = true;
+        return spec_verify(ht, 4, preds);
+    }
+
+    // vLLM Qwen3.5 MTP: last_hidden is post-final-norm; then pre_fc_* + fc + 1-layer + mtp.norm.
+    int32_t mtp_official_id(const float* h_res, int32_t tok, int pos, bool post_norm, bool use_layer) {
+        const int H = hidden_;
+        const float eps = store_->model().rms_eps;
+        const int kn = mtp_L_.nkv * mtp_L_.hd;
+        const float* href = h_res;
+        float* scratch = d_mtp_hh_ + static_cast<size_t>(kMtpCap - 1) * H;
+        if (post_norm && d_final_norm_) {
+            launch_rms(h_res, d_final_norm_, scratch, H, eps);
+            href = scratch;
+        }
+        CUDA_CHECK(cudaMemset(d_mtp_kc_, 0, sizeof(float) * static_cast<size_t>(kMtpCap) * kn));
+        CUDA_CHECK(cudaMemset(d_mtp_vc_, 0, sizeof(float) * kMtpCap * kn));
+        mtp_fuse(href, tok, false, d_mtp_nh_);
+        if (use_layer) mtp_layer(pos);
+        int32_t id = 0;
+        const bool lh_xrms = lm_head_.q == QuantKind::FP8_E4M3_B128 && lm_head_.fp8_kmajor &&
+                             lm_head_.rows >= 4096 && lm_head_.cols == H;
+        if (lh_xrms)
+            launch_gemv(lm_head_, d_mtp_h_, d_logits_, 0, nullptr, d_mtp_nn_, nullptr, eps);
+        else {
+            launch_rms(d_mtp_h_, d_mtp_nn_, d_xn_, H, eps);
+            launch_gemv(lm_head_, d_xn_, d_logits_);
+        }
+        launch_argmax();
+        CUDA_CHECK(cudaMemcpy(&id, d_best_, 4, cudaMemcpyDeviceToHost));
+        return id;
+    }
+
+    // Two-token official MTP: layer(h_post, embed(tok0)) then layer(h_post, embed(tok1))
+    // with the same MTP KV so d1 attends to d0. vLLM runs this as T=2.
+    int32_t mtp_official_chain(const float* h_res, int32_t tok0, int32_t tok1, bool recursive) {
+        const int H = hidden_;
+        const float eps = store_->model().rms_eps;
+        const int kn = mtp_L_.nkv * mtp_L_.hd;
+        float* h_post = d_mtp_hh_ + static_cast<size_t>(kMtpCap - 1) * H;
+        float* h_mid = d_mtp_hh_ + static_cast<size_t>(kMtpCap - 2) * H;
+        if (d_final_norm_)
+            launch_rms(h_res, d_final_norm_, h_post, H, eps);
+        else
+            CUDA_CHECK(cudaMemcpy(h_post, h_res, sizeof(float) * H, cudaMemcpyDeviceToDevice));
+        CUDA_CHECK(cudaMemset(d_mtp_kc_, 0, sizeof(float) * static_cast<size_t>(kMtpCap) * kn));
+        CUDA_CHECK(cudaMemset(d_mtp_vc_, 0, sizeof(float) * kMtpCap * kn));
+        mtp_fuse(h_post, tok0, false, d_mtp_nh_);
+        mtp_layer(0);
+        if (recursive)
+            CUDA_CHECK(cudaMemcpy(h_mid, d_mtp_h_, sizeof(float) * H, cudaMemcpyDeviceToDevice));
+        mtp_fuse(recursive ? h_mid : h_post, tok1, false, d_mtp_nh_);
+        mtp_layer(1);
+        int32_t id = 0;
+        const bool lh_xrms = lm_head_.q == QuantKind::FP8_E4M3_B128 && lm_head_.fp8_kmajor &&
+                             lm_head_.rows >= 4096 && lm_head_.cols == H;
+        if (lh_xrms)
+            launch_gemv(lm_head_, d_mtp_h_, d_logits_, 0, nullptr, d_mtp_nn_, nullptr, eps);
+        else {
+            launch_rms(d_mtp_h_, d_mtp_nn_, d_xn_, H, eps);
+            launch_gemv(lm_head_, d_xn_, d_logits_);
+        }
+        launch_argmax();
+        CUDA_CHECK(cudaMemcpy(&id, d_best_, 4, cudaMemcpyDeviceToHost));
+        return id;
+    }
+
+    void mtp_layer(int pos) {
+        const int H = hidden_;
+        const float eps = store_->model().rms_eps;
+        const int nq = mtp_L_.nq, nkv = mtp_L_.nkv, hd = mtp_L_.hd;
+        const int rotary = mtp_L_.rotary;
+        const int qn = nq * hd;
+        // MTP draft is 1 token (graph) / short chain. Attending 256 empty slots
+        // is a tax; 8 covers pos 0..1 used by the two T=2 MTP steps.
+        const int kctx = 8;
+        const size_t sm = (static_cast<size_t>(kctx) + static_cast<size_t>(hd)) * sizeof(float);
+        const int ath = hd >= 256 ? 256 : 128;
+        static int layer_l2_n = 0;
+        const bool dump_l2 = hidden_ < 64 && layer_l2_n < 3 && !capturing_;
+        auto l2_host = [&](const float* p, int n, const char* tag) {
+            std::vector<float> h(static_cast<size_t>(n));
+            CUDA_CHECK(cudaMemcpy(h.data(), p, sizeof(float) * n, cudaMemcpyDeviceToHost));
+            double s = 0;
+            for (int i = 0; i < n; ++i) s += static_cast<double>(h[i]) * h[i];
+            std::fprintf(stderr, "mtp_l2 pos=%d %s %.4f\n", pos, tag, std::sqrt(s));
+        };
+        if (dump_l2) l2_host(d_mtp_h_, H, "pre");
+        launch_rms(d_mtp_h_, mtp_L_.attn_norm, d_xn_, H, mtp_L_.eps);
+        launch_gemv(mtp_L_.wq, d_xn_, d_qg_);
+        if (hd >= 64)
+            split_qg_perhead_k<<<(qn + 255) / 256, 256>>>(d_qg_, d_q_, d_gate_, nq, hd);
+        else
+            split_qg_k<<<(qn + 255) / 256, 256>>>(d_qg_, d_q_, d_gate_, qn);
+        launch_gemv_dual(mtp_L_.wk, mtp_L_.wv, d_xn_, d_k_, d_vtmp_);
+        if (pos >= 0) CUDA_CHECK(cudaMemcpy(d_mtp_pos_, &pos, 4, cudaMemcpyHostToDevice));
+        qk_attn_decode_k<<<nq, ath, sm>>>(d_q_, d_k_, d_vtmp_, mtp_L_.q_norm, mtp_L_.k_norm, d_mtp_kc_,
+                                          d_mtp_vc_, d_o_, d_mtp_pos_, nq, nkv, hd, rotary, mtp_L_.theta,
+                                          mtp_L_.eps, kctx, 0, nullptr, nullptr, nullptr, nullptr, 0, 0, 0);
+        const bool gate_x =
+            mtp_L_.wo_a.q == QuantKind::FP8_E4M3_B128 && mtp_L_.wo_a.fp8_kmajor && mtp_L_.wo_a.rows >= 4096;
+        if (dump_l2) l2_host(d_o_, qn, "attn_o");
+        if (gate_x)
+            launch_gemv(mtp_L_.wo_a, d_o_, d_mtp_h_, 1, nullptr, nullptr, nullptr, 0.f, d_gate_);
+        else {
+            apply_gate_k<<<(qn + 255) / 256, 256>>>(d_o_, d_gate_, qn);
+            launch_gemv(mtp_L_.wo_a, d_o_, d_mtp_h_, 1);
+        }
+        if (dump_l2) l2_host(d_mtp_h_, H, "post_attn");
+        const bool mlp_xrms =
+            d_ss_ && mtp_L_.wg.q == QuantKind::FP8_E4M3_B128 && mtp_L_.wg.fp8_kmajor && mtp_L_.wg.rows >= 4096;
+        if (mlp_xrms)
+            launch_gemv_dual(mtp_L_.wg, mtp_L_.wu, d_mtp_h_, d_gate_mlp_, d_up_, 1, mtp_L_.ffn_norm, nullptr, eps);
+        else {
+            launch_rms(d_mtp_h_, mtp_L_.ffn_norm, d_xn_, H, eps);
+            launch_gemv_dual(mtp_L_.wg, mtp_L_.wu, d_xn_, d_gate_mlp_, d_up_, 1);
+        }
+        launch_gemv(mtp_L_.wd, d_gate_mlp_, d_mtp_h_, 1);
+        if (dump_l2) {
+            l2_host(d_mtp_h_, H, "post_mlp");
+            ++layer_l2_n;
+        }
+    }
+
+    // Fill MTP KV from backbone residuals so recursive d1/d2 attend the prompt.
+    // First draft still uses d_mtp_post_ + t0 (same stem as mtp_spec2). Hidden
+    // < 64 is the tiny golden — skip so 44 18 45 43 5 11 stays put.
+    void mtp_stream_prefill(const int32_t* ids, int n) {
+        if (!has_mtp_ || hidden_ < 64 || !ids || n <= 0 || !d_h_seq_ || !d_mtp_nh_) return;
+        n = std::min(n, kMtpCap - 16);
+        const int H = hidden_;
+        const float eps = store_->model().rms_eps;
+        float* scratch = d_mtp_hh_ + static_cast<size_t>(kMtpCap - 1) * H;
+        // Slots 1..n hold prompt KV. Slot 0 stays empty so the first draft
+        // (pos=0, T=1) does not attend the prompt and keeps d0=greedy.
+        for (int i = 0; i < n; ++i) {
+            const float* h = d_h_seq_ + static_cast<size_t>(i) * H;
+            if (d_final_norm_) {
+                launch_rms(h, d_final_norm_, scratch, H, eps);
+                mtp_fuse(scratch, ids[i], false, d_mtp_nh_);
+            } else {
+                mtp_fuse(h, ids[i], false, d_mtp_nh_);
+            }
+            mtp_layer(i + 1);
+        }
+        mtp_stream_n_ = n;
+        mtp_kv_pos_ = 0;
+        static int once = 0;
+        if (!once) {
+            once = 1;
+            std::fprintf(stderr, "mtp_stream_pf n=%d slots=1..%d kvpos=0\n", n, n);
+        }
+    }
+
+    void mtp_snap_hist(const int32_t* ids, int n) {
+        if (!has_mtp_ || !d_mtp_hh_ || n <= 0) return;
+        n = std::min(n, kMtpCap);
+        // Pre-final-norm last-layer residual. MTP stem applies hnorm itself.
+        CUDA_CHECK(cudaMemcpy(d_mtp_hh_, d_h_seq_, sizeof(float) * static_cast<size_t>(n) * hidden_,
+                              cudaMemcpyDeviceToDevice));
+        mtp_hids_.assign(ids, ids + n);
+        mtp_hist_n_ = n;
+        // Official last_hidden is post-final-norm (L2~140), not the raw residual (L2~1e7).
+        if (d_mtp_post_ && d_final_norm_ && n > 0)
+            launch_rms(d_h_seq_ + static_cast<size_t>(n - 1) * hidden_, d_final_norm_, d_mtp_post_, hidden_,
+                       store_->model().rms_eps);
+    }
+
+    void mtp_append_hist(int32_t token) {
+        if (!has_mtp_ || !d_mtp_hh_ || mtp_hist_n_ >= kMtpCap) return;
+        CUDA_CHECK(cudaMemcpy(d_mtp_hh_ + static_cast<size_t>(mtp_hist_n_) * hidden_, d_h_,
+                              sizeof(float) * hidden_, cudaMemcpyDeviceToDevice));
+        if (static_cast<int>(mtp_hids_.size()) <= mtp_hist_n_) mtp_hids_.resize(static_cast<size_t>(mtp_hist_n_) + 1);
+        mtp_hids_[static_cast<size_t>(mtp_hist_n_)] = token;
+        ++mtp_hist_n_;
+        if (d_mtp_post_ && d_final_norm_)
+            launch_rms(d_h_, d_final_norm_, d_mtp_post_, hidden_, store_->model().rms_eps);
+    }
+
+    int32_t mtp_one(const float* h, int32_t tok, int pos, bool run_layer) {
+        const int H = hidden_;
+        const float eps = store_->model().rms_eps;
+        const int kn = mtp_L_.nkv * mtp_L_.hd;
+        CUDA_CHECK(cudaMemset(d_mtp_kc_, 0, sizeof(float) * static_cast<size_t>(kMtpCap) * kn));
+        CUDA_CHECK(cudaMemset(d_mtp_vc_, 0, sizeof(float) * static_cast<size_t>(kMtpCap) * kn));
+        mtp_fuse(h, tok);
+        if (run_layer) mtp_layer(pos);
+        const bool lh_xrms = lm_head_.q == QuantKind::FP8_E4M3_B128 && lm_head_.fp8_kmajor &&
+                             lm_head_.rows >= 4096 && lm_head_.cols == H;
+        if (lh_xrms)
+            launch_gemv(lm_head_, d_mtp_h_, d_logits_, 0, nullptr, d_mtp_nn_, nullptr, eps);
+        else {
+            launch_rms(d_mtp_h_, d_mtp_nn_, d_xn_, H, eps);
+            launch_gemv(lm_head_, d_xn_, d_logits_);
+        }
+        launch_argmax();
+        int32_t id = 0;
+        CUDA_CHECK(cudaMemcpy(&id, d_best_, 4, cudaMemcpyDeviceToHost));
+        return id;
+    }
+
+    void mtp_diag_first(int32_t first) {
+        if (mtp_diag_done_ || hidden_ < 64) return;
+        mtp_diag_done_ = true;
+        const int H = hidden_;
+        const float eps = store_->model().rms_eps;
+        const int hist = std::min(mtp_hist_n_, kMtpCap);
+        const int32_t tok3 = (hist > 0) ? mtp_hids_[static_cast<size_t>(hist - 1)] : first;
+        float* d_fn = d_mtp_hh_ + static_cast<size_t>(kMtpCap - 1) * H;
+        launch_rms(d_h_, d_final_norm_, d_fn, H, eps);
+
+        const TensorDesc* fc_td = store_->table().find("mtp.fc");
+        if (fc_td) {
+            std::fprintf(stderr, "mtp_fc_src shape=%d,%d ndim=%d nbytes=%llu q=%d gpu=%dx%d q=%d f32=%d\n",
+                         static_cast<int>(fc_td->shape[0]), static_cast<int>(fc_td->shape[1]), fc_td->ndim,
+                         static_cast<unsigned long long>(fc_td->nbytes), static_cast<int>(fc_td->quant),
+                         mtp_fc_.rows, mtp_fc_.cols, static_cast<int>(mtp_fc_.q),
+                         mtp_fc_f32_.q == QuantKind::F32 ? 1 : 0);
+        }
+
+        auto dump_rank = [&](const char* tag, int32_t want) {
+            std::vector<float> lg(static_cast<size_t>(vocab_));
+            CUDA_CHECK(cudaMemcpy(lg.data(), d_logits_, sizeof(float) * vocab_, cudaMemcpyDeviceToHost));
+            int top = 0;
+            float mv = lg[0];
+            for (int i = 1; i < vocab_; ++i)
+                if (lg[i] > mv) {
+                    mv = lg[i];
+                    top = i;
+                }
+            auto rank_of = [&](int32_t id) {
+                if (id < 0 || id >= vocab_) return -1;
+                int r = 1;
+                const float tw = lg[id];
+                for (int i = 0; i < vocab_; ++i)
+                    if (lg[i] > tw) ++r;
+                return r;
+            };
+            const float w158 = (158534 < vocab_) ? lg[158534] : 0.f;
+            const float w170 = (170164 < vocab_) ? lg[170164] : 0.f;
+            const float wfirst = (first >= 0 && first < vocab_) ? lg[first] : 0.f;
+            const float w123 = (123157 < vocab_) ? lg[123157] : 0.f;
+            const float w107 = (107551 < vocab_) ? lg[107551] : 0.f;
+            std::fprintf(stderr,
+                         "mtp_rank %s top=%d max=%.4f want=%d wlogit=%.4f rank=%d "
+                         "r158534=%d l158=%.4f r170164=%d l170=%.4f rfirst=%d lfirst=%.4f "
+                         "r123157=%d l123=%.4f r107551=%d l107=%.4f\n",
+                         tag, top, mv, want, (want >= 0 && want < vocab_) ? lg[want] : 0.f, rank_of(want),
+                         rank_of(158534), w158, rank_of(170164), w170, rank_of(first), wfirst,
+                         rank_of(123157), w123, rank_of(107551), w107);
+            if (std::strcmp(tag, "hist_layer") == 0 || std::strcmp(tag, "ship_stem") == 0 ||
+                std::strcmp(tag, "ship_layer") == 0 || std::strcmp(tag, "tf_stem") == 0 ||
+                std::strcmp(tag, "tf_layer") == 0 || std::strcmp(tag, "main_lm") == 0) {
+                int idx[8];
+                for (int k = 0; k < 8; ++k) {
+                    int best = 0;
+                    float bv = -1e30f;
+                    for (int i = 0; i < vocab_; ++i) {
+                        bool used = false;
+                        for (int j = 0; j < k; ++j)
+                            if (idx[j] == i) used = true;
+                        if (!used && lg[i] > bv) {
+                            bv = lg[i];
+                            best = i;
+                        }
+                    }
+                    idx[k] = best;
+                }
+                std::fprintf(stderr, "mtp_top8 %s", tag);
+                for (int k = 0; k < 8; ++k) std::fprintf(stderr, " %d:%.3f", idx[k], lg[idx[k]]);
+                std::fprintf(stderr, "\n");
+            }
+        };
+
+        auto stem_logits = [&](const float* h, int32_t tok, bool swap) {
+            mtp_fuse(h, tok, swap);
+            launch_rms(d_mtp_h_, d_mtp_nn_, d_xn_, H, eps);
+            launch_gemv(lm_head_, d_xn_, d_logits_);
+        };
+
+        // CPU vs GPU GEMV on the current embed||hidden cat (fn hidden, token=first).
+        mtp_fuse(d_fn, first, false);
+        std::vector<float> cat(static_cast<size_t>(H) * 2), y_gpu(static_cast<size_t>(H));
+        CUDA_CHECK(cudaMemcpy(cat.data(), d_mtp_cat_, sizeof(float) * H * 2, cudaMemcpyDeviceToHost));
+        CUDA_CHECK(cudaMemcpy(y_gpu.data(), d_mtp_h_, sizeof(float) * H, cudaMemcpyDeviceToHost));
+        double l2c = 0, l2y = 0;
+        for (int i = 0; i < H * 2; ++i) l2c += static_cast<double>(cat[i]) * cat[i];
+        for (int i = 0; i < H; ++i) l2y += static_cast<double>(y_gpu[i]) * y_gpu[i];
+        float y0_cpu = 0.f, y0_gpu = y_gpu[0];
+        double max_abs = 0;
+        if (fc_td && !fc_td->data.empty() && fc_td->quant == QuantKind::BF16) {
+            const uint16_t* W = reinterpret_cast<const uint16_t*>(fc_td->data.data());
+            std::vector<float> y_cpu(static_cast<size_t>(H), 0.f);
+            ops::gemv_bf16(W, cat.data(), y_cpu.data(), H, H * 2);
+            y0_cpu = y_cpu[0];
+            for (int i = 0; i < H; ++i)
+                max_abs = std::max(max_abs, std::fabs(static_cast<double>(y_cpu[i] - y_gpu[i])));
+            CUDA_CHECK(cudaMemcpy(d_mtp_h_, y_cpu.data(), sizeof(float) * H, cudaMemcpyHostToDevice));
+            launch_rms(d_mtp_h_, d_mtp_nn_, d_xn_, H, eps);
+            launch_gemv(lm_head_, d_xn_, d_logits_);
+            dump_rank("cpu_fc_stem", 158534);
+        }
+        std::fprintf(stderr,
+                     "mtp_fc_cmp y0_cpu=%.6f y0_gpu=%.6f max_abs=%.6f l2_cat=%.4f l2_fc=%.4f "
+                     "cat0=%.5f %.5f %.5f %.5f y0:3=%.5f %.5f %.5f %.5f\n",
+                     y0_cpu, y0_gpu, max_abs, std::sqrt(l2c), std::sqrt(l2y), cat[0], cat[1], cat[H],
+                     cat[H + 1], y_gpu[0], y_gpu[1], y_gpu[2], y_gpu[3]);
+
+        stem_logits(d_fn, first, false);
+        dump_rank("fn_stem", 158534);
+        stem_logits(d_h_, first, false);
+        dump_rank("res_stem", 158534);
+        stem_logits(d_fn, first, true);
+        dump_rank("fn_stem_swap", 158534);
+        stem_logits(d_fn, tok3, false);
+        dump_rank("fn_stem_tok3", 170164);
+
+        const int32_t a_fn = mtp_one(d_fn, first, 0, true);
+        dump_rank("fn_layer", 158534);
+        const int32_t a_res = mtp_one(d_h_, first, 0, true);
+        dump_rank("res_layer", 158534);
+        const int32_t a_fn_stem = mtp_one(d_fn, first, 0, false);
+        const int32_t a_res_stem = mtp_one(d_h_, first, 0, false);
+
+        const int kn = mtp_L_.nkv * mtp_L_.hd;
+        CUDA_CHECK(cudaMemset(d_mtp_kc_, 0, sizeof(float) * static_cast<size_t>(kMtpCap) * kn));
+        CUDA_CHECK(cudaMemset(d_mtp_vc_, 0, sizeof(float) * static_cast<size_t>(kMtpCap) * kn));
+        for (int i = 0; i + 1 < hist; ++i) {
+            mtp_fuse(d_mtp_hh_ + static_cast<size_t>(i) * H, mtp_hids_[static_cast<size_t>(i + 1)]);
+            mtp_layer(i);
+        }
+        int32_t a_hist = 0;
+        if (hist > 0) {
+            mtp_fuse(d_mtp_hh_ + static_cast<size_t>(hist - 1) * H, first);
+            mtp_layer(hist - 1);
+            launch_rms(d_mtp_h_, d_mtp_nn_, d_xn_, H, eps);
+            launch_gemv(lm_head_, d_xn_, d_logits_);
+            launch_argmax();
+            CUDA_CHECK(cudaMemcpy(&a_hist, d_best_, 4, cudaMemcpyDeviceToHost));
+            dump_rank("hist_layer", 123157);
+            dump_rank("ship_layer", 123157);
+        }
+
+        // Shipped pairing stem only: (h_last residual, embed(t0)), no MTP layer.
+        if (hist > 0) {
+            stem_logits(d_mtp_hh_ + static_cast<size_t>(hist - 1) * H, first, false);
+            dump_rank("ship_stem", 123157);
+            stem_logits(d_fn, first, false);
+            dump_rank("ship_stem_fn", 123157);
+        }
+
+        // Reference: main lm_head on the same residual, then MTP under
+        // (h_last, embed(131317)) vs teacher-forced (h_last, embed(123157)).
+        {
+            launch_rms(d_h_, d_final_norm_, d_xn_, H, eps);
+            launch_gemv(lm_head_, d_xn_, d_logits_);
+            dump_rank("main_lm", first);
+            if (hist > 0) {
+                launch_rms(d_mtp_hh_ + static_cast<size_t>(hist - 1) * H, d_final_norm_, d_xn_, H, eps);
+                launch_gemv(lm_head_, d_xn_, d_logits_);
+                dump_rank("main_lm_hh", first);
+            }
+            const int32_t e_t0 = first;       // 131317 on official pair
+            const int32_t e_t1 = 123157;      // teacher-forced next
+            const float* href = (hist > 0) ? (d_mtp_hh_ + static_cast<size_t>(hist - 1) * H) : d_h_;
+            stem_logits(href, e_t0, false);
+            dump_rank("ref_stem_e131317", 123157);
+            stem_logits(href, e_t1, false);
+            dump_rank("tf_stem", 107551);
+            auto run_hist_last = [&](int32_t etok, const char* tag, int32_t want) {
+                CUDA_CHECK(cudaMemset(d_mtp_kc_, 0, sizeof(float) * static_cast<size_t>(kMtpCap) * kn));
+                CUDA_CHECK(cudaMemset(d_mtp_vc_, 0, sizeof(float) * static_cast<size_t>(kMtpCap) * kn));
+                for (int i = 0; i + 1 < hist; ++i) {
+                    mtp_fuse(d_mtp_hh_ + static_cast<size_t>(i) * H, mtp_hids_[static_cast<size_t>(i + 1)]);
+                    mtp_layer(i);
+                }
+                if (hist > 0) {
+                    mtp_fuse(href, etok);
+                    mtp_layer(hist - 1);
+                } else {
+                    mtp_fuse(href, etok);
+                    mtp_layer(0);
+                }
+                launch_rms(d_mtp_h_, d_mtp_nn_, d_xn_, H, eps);
+                launch_gemv(lm_head_, d_xn_, d_logits_);
+                dump_rank(tag, want);
+            };
+            run_hist_last(e_t0, "ref_layer_e131317", 123157);
+            run_hist_last(e_t1, "tf_layer", 107551);
+        }
+
+        // hist + last-prompt-token (h_i, embed(x_i)) alignment
+        CUDA_CHECK(cudaMemset(d_mtp_kc_, 0, sizeof(float) * static_cast<size_t>(kMtpCap) * kn));
+        CUDA_CHECK(cudaMemset(d_mtp_vc_, 0, sizeof(float) * static_cast<size_t>(kMtpCap) * kn));
+        for (int i = 0; i < hist; ++i) {
+            mtp_fuse(d_mtp_hh_ + static_cast<size_t>(i) * H, mtp_hids_[static_cast<size_t>(i)]);
+            mtp_layer(i);
+        }
+        launch_rms(d_mtp_h_, d_mtp_nn_, d_xn_, H, eps);
+        launch_gemv(lm_head_, d_xn_, d_logits_);
+        dump_rank("hist_samepos", 170164);
+
+        mtp_one(d_fn, tok3, 0, true);
+        dump_rank("fn_layer_tok3", 170164);
+        mtp_one(d_h_, tok3, 0, true);
+        dump_rank("res_layer_tok3", 170164);
+
+        CUDA_CHECK(cudaMemset(d_mtp_kc_, 0, sizeof(float) * static_cast<size_t>(kMtpCap) * kn));
+        CUDA_CHECK(cudaMemset(d_mtp_vc_, 0, sizeof(float) * static_cast<size_t>(kMtpCap) * kn));
+        mtp_fuse(d_fn, tok3);
+        mtp_layer(0);
+        mtp_fuse(d_mtp_h_, first);
+        mtp_layer(1);
+        launch_rms(d_mtp_h_, d_mtp_nn_, d_xn_, H, eps);
+        launch_gemv(lm_head_, d_xn_, d_logits_);
+        dump_rank("warmup_then_t0", 158534);
+
+        CUDA_CHECK(cudaMemset(d_mtp_kc_, 0, sizeof(float) * static_cast<size_t>(kMtpCap) * kn));
+        CUDA_CHECK(cudaMemset(d_mtp_vc_, 0, sizeof(float) * static_cast<size_t>(kMtpCap) * kn));
+        int32_t tA = mtp_one(d_fn, tok3, 0, true);
+        mtp_fuse(d_mtp_h_, tA);
+        mtp_layer(1);
+        launch_rms(d_mtp_h_, d_mtp_nn_, d_xn_, H, eps);
+        launch_gemv(lm_head_, d_xn_, d_logits_);
+        dump_rank("chain_tok3_s1", 158534);
+        std::fprintf(stderr, "mtp_chain_tok3 tA=%d\n", tA);
+
+        std::fprintf(stderr,
+                     "mtp_diag first=%d tok3=%d hist_n=%d fn_layer=%d res_layer=%d fn_stem=%d res_stem=%d "
+                     "hist_layer=%d hids:",
+                     first, tok3, hist, a_fn, a_res, a_fn_stem, a_res_stem, a_hist);
+        for (int i = 0; i < hist && i < 8; ++i) std::fprintf(stderr, " %d", mtp_hids_[static_cast<size_t>(i)]);
+        std::fprintf(stderr, "\n");
+    }
+
+    int mtp_draft(int32_t first, int n, int32_t* out) override {
+        if (!has_mtp_ || n <= 0 || !d_mtp_h_ || !d_mtp_cat_ || !d_mtp_hh_) return 0;
+        const int nq = mtp_L_.nq, nkv = mtp_L_.nkv, hd = mtp_L_.hd;
+        const int kn = nkv * hd;
+        if (nq <= 0 || nkv <= 0 || hd <= 0 || kn <= 0) return 0;
+        const int H = hidden_;
+        const float eps = store_->model().rms_eps;
+
+        const int hist = std::min(mtp_hist_n_, kMtpCap);
+        const float* h_last = (hist > 0) ? (d_mtp_hh_ + static_cast<size_t>(hist - 1) * H) : d_h_;
+        const float* h_prev = (hist > 1) ? (d_mtp_hh_ + static_cast<size_t>(hist - 2) * H) : h_last;
+        n = std::min(n, kMtpCap);
+
+        auto take_id = [&](int32_t* dst) {
+            const bool lh_xrms = lm_head_.q == QuantKind::FP8_E4M3_B128 && lm_head_.fp8_kmajor &&
+                                 lm_head_.rows >= 4096 && lm_head_.cols == H;
+            if (lh_xrms)
+                launch_gemv(lm_head_, d_mtp_h_, d_logits_, 0, nullptr, d_mtp_nn_, nullptr, eps);
+            else {
+                launch_rms(d_mtp_h_, d_mtp_nn_, d_xn_, H, eps);
+                launch_gemv(lm_head_, d_xn_, d_logits_);
+            }
+            launch_argmax();
+            if (dst) CUDA_CHECK(cudaMemcpy(dst, d_best_, 4, cudaMemcpyDeviceToHost));
+        };
+
+        // Tiny: stem, residual + pre_h, d0=last / d1+=hist-prev.
+        // 27B: same pairing; fuse hidden half is final_norm (see mtp_fuse).
+        // Official vLLM (post-norm + pre_fc_h + 1-layer + chain) was remesured:
+        // stem_d0=127155 layer_d0=8702 d1=69833 accepted=0. Do not ship.
+        static bool wire_once = false;
+        if (!wire_once) {
+            wire_once = true;
+            std::fprintf(stderr,
+                         "mtp_wire last=%d t0=%d hist=%d pair=fnorm-h-d0-last-d1-prev hh=res cat=eh hgamma=%s\n",
+                         hist > 0 ? mtp_hids_[static_cast<size_t>(hist - 1)] : -1, first, hist,
+                         (H >= 64 && d_final_norm_) ? "final_norm" : "pre_h");
+        }
+        int got = 0;
+        int32_t token = first;
+        if (n > 0) {
+            // Official and GGUF: post-final-norm + pre_fc + 1-layer. Graph is
+            // capture-safe after the eager warmup in maybe_capture_mtp.
+            if (H >= 64 && d_mtp_post_ && d_mtp_nh_ && mtp_graph_exec_) {
+                // Graph already runs fuse + 1-layer + take_id. Do not replay take_id.
+                CUDA_CHECK(cudaMemcpy(d_mtp_tok_, &first, 4, cudaMemcpyHostToDevice));
+                CUDA_CHECK(cudaMemcpy(d_mtp_pos_, &mtp_kv_pos_, 4, cudaMemcpyHostToDevice));
+                CUDA_CHECK(cudaGraphLaunch(mtp_graph_exec_, cudaStreamPerThread));
+                int32_t gid = 0;
+                CUDA_CHECK(cudaMemcpy(&gid, d_best_, 4, cudaMemcpyDeviceToHost));
+                if (gid == 0) {
+                    mtp_fuse(d_mtp_post_, first, false, d_mtp_nh_);
+                    mtp_layer(mtp_kv_pos_);
+                    take_id(out);
+                } else if (out) {
+                    out[0] = gid;
+                }
+            } else if (H >= 64 && d_mtp_post_ && d_mtp_nh_) {
+                // Official and GGUF: post-final-norm + 1-layer. Q4 dump
+                // layer_post_t0_pre tops 5 (greedy next). Stem-only was 87997
+                // and residual+layer was 17 — both miss the prefix.
+                mtp_fuse(d_mtp_post_, first, false, d_mtp_nh_);
+                mtp_layer(mtp_kv_pos_);
+                take_id(out);
+            } else {
+                mtp_fuse(h_last, first);
+                take_id(out);
+            }
+            if (out) token = out[0];
+            got = 1;
+        }
+        for (int i = got; i < n; ++i) {
+            // Official NextN 1-layer (h_post, embed(d0)) tops 3554/17353/96459,
+            // not 69103. Keep stem d1 so verify-time redraft still supplies 69103
+            // after decode(d0) without a failed-layer tax.
+            mtp_fuse(h_prev, token);
+            take_id(out + i);
+            token = out[i];
+            ++got;
+        }
+        static int step0_dump = 0;
+        if (H < 64 && step0_dump < 1 && got > 0 && out) {
+            ++step0_dump;
+            const int32_t d0w = out[0];
+            const int32_t want = 69103;
+            std::vector<float> hr(static_cast<size_t>(H));
+            CUDA_CHECK(cudaMemcpy(hr.data(), h_last, sizeof(float) * H, cudaMemcpyDeviceToHost));
+            double l2 = 0, mx = 0;
+            int n1k = 0, n1e5 = 0;
+            for (int i = 0; i < H; ++i) {
+                const double a = std::fabs(static_cast<double>(hr[i]));
+                l2 += a * a;
+                if (a > mx) mx = a;
+                if (a > 1e3) ++n1k;
+                if (a > 1e5) ++n1e5;
+            }
+            const float* h_post = d_mtp_post_ ? d_mtp_post_ : h_last;
+            double l2p = 0;
+            if (d_mtp_post_) {
+                std::vector<float> hp(static_cast<size_t>(H));
+                CUDA_CHECK(cudaMemcpy(hp.data(), d_mtp_post_, sizeof(float) * H, cudaMemcpyDeviceToHost));
+                for (int i = 0; i < H; ++i) l2p += static_cast<double>(hp[i]) * hp[i];
+            }
+            auto rank_of = [&](int32_t id) {
+                if (id < 0 || id >= vocab_) return -1;
+                std::vector<float> lg(static_cast<size_t>(vocab_));
+                CUDA_CHECK(cudaMemcpy(lg.data(), d_logits_, sizeof(float) * vocab_, cudaMemcpyDeviceToHost));
+                int r = 1;
+                const float tw = lg[id];
+                for (int i = 0; i < vocab_; ++i)
+                    if (lg[i] > tw) ++r;
+                return r;
+            };
+            auto take_g = [&](const float* g) {
+                int32_t id = 0;
+                launch_rms(d_mtp_h_, g, d_xn_, H, eps);
+                launch_gemv(lm_head_, d_xn_, d_logits_);
+                launch_argmax();
+                CUDA_CHECK(cudaMemcpy(&id, d_best_, 4, cudaMemcpyDeviceToHost));
+                return id;
+            };
+            auto dump_var = [&](const char* tag, const float* h, int32_t tok, const float* hg, bool layer) {
+                const int knp = mtp_L_.nkv * mtp_L_.hd;
+                if (layer) {
+                    CUDA_CHECK(cudaMemset(d_mtp_kc_, 0, sizeof(float) * static_cast<size_t>(kMtpCap) * knp));
+                    CUDA_CHECK(cudaMemset(d_mtp_vc_, 0, sizeof(float) * kMtpCap * knp));
+                }
+                mtp_fuse(h, tok, false, hg);
+                if (layer) mtp_layer(0);
+                const int32_t id = take_g(d_mtp_nn_);
+                const int r_w = rank_of(want);
+                const int r_g = rank_of(last_tok_);
+                std::fprintf(stderr, "mtp_var %s top=%d r69103=%d r_greedy=%d layer=%d tok=%d\n", tag, id, r_w,
+                             r_g, layer ? 1 : 0, tok);
+                return id;
+            };
+            auto write_f32 = [&](const char* path, const float* src) {
+                std::vector<float> tmp(static_cast<size_t>(H));
+                CUDA_CHECK(cudaMemcpy(tmp.data(), src, sizeof(float) * H, cudaMemcpyDeviceToHost));
+                if (FILE* f = std::fopen(path, "wb")) {
+                    std::fwrite(tmp.data(), sizeof(float), static_cast<size_t>(H), f);
+                    std::fclose(f);
+                    std::fprintf(stderr, "mtp_bin %s n=%d\n", path, H);
+                }
+            };
+            write_f32("/home/znsoft/RapidLLM/build/rl_h_res_t0.bin", h_last);
+            if (d_mtp_post_) write_f32("/home/znsoft/RapidLLM/build/rl_h_post_t0.bin", d_mtp_post_);
+            if (hist > 1) {
+                write_f32("/home/znsoft/RapidLLM/build/rl_h_res_pf.bin",
+                          d_mtp_hh_ + static_cast<size_t>(hist - 2) * H);
+                launch_rms(d_mtp_hh_ + static_cast<size_t>(hist - 2) * H, d_final_norm_, d_xn_, H, eps);
+                write_f32("/home/znsoft/RapidLLM/build/rl_h_post_pf.bin", d_xn_);
+                launch_gemv(lm_head_, d_xn_, d_logits_);
+                launch_argmax();
+                int32_t pf_top = 0;
+                CUDA_CHECK(cudaMemcpy(&pf_top, d_best_, 4, cudaMemcpyDeviceToHost));
+                std::vector<float> pflg(static_cast<size_t>(vocab_));
+                CUDA_CHECK(cudaMemcpy(pflg.data(), d_logits_, sizeof(float) * vocab_, cudaMemcpyDeviceToHost));
+                std::fprintf(stderr, "mtp_pf_lm top=%d r4=%d r0=%d r131317=%d l0=%.3f l4=%.3f\n", pf_top,
+                             rank_of(4), rank_of(0), rank_of(131317), pflg[0],
+                             (4 < vocab_) ? pflg[4] : 0.f);
+                {
+                    int idx[8];
+                    for (int k = 0; k < 8; ++k) {
+                        int best = 0;
+                        float bv = -1e30f;
+                        for (int i = 0; i < vocab_; ++i) {
+                            bool used = false;
+                            for (int j = 0; j < k; ++j)
+                                if (idx[j] == i) used = true;
+                            if (!used && pflg[i] > bv) {
+                                bv = pflg[i];
+                                best = i;
+                            }
+                        }
+                        idx[k] = best;
+                    }
+                    std::fprintf(stderr, "mtp_top8 pf_lm");
+                    for (int k = 0; k < 8; ++k) std::fprintf(stderr, " %d:%.3f", idx[k], pflg[idx[k]]);
+                    std::fprintf(stderr, "\n");
+                }
+            }
+            std::fprintf(stderr,
+                         "mtp_scale l2_res=%.2f max=%.2f n>1e3=%d n>1e5=%d l2_post=%.2f t0=%d greedy=%d d0=%d "
+                         "hist=%d pos=%d\n",
+                         std::sqrt(l2), mx, n1k, n1e5, std::sqrt(l2p), first, last_tok_, d0w, hist, pos_);
+            dump_var("stem_res_t0_fn", h_last, first, nullptr, false);
+            dump_var("stem_res_d0_fn", h_last, d0w, nullptr, false);
+            dump_var("stem_post_t0_pre", h_post, first, d_mtp_nh_, false);
+            dump_var("stem_post_d0_pre", h_post, d0w, d_mtp_nh_, false);
+            dump_var("stem_post_d0_fn", h_post, d0w, nullptr, false);
+            dump_var("layer_post_t0_pre", h_post, first, d_mtp_nh_, true);
+            dump_var("layer_post_d0_pre", h_post, d0w, d_mtp_nh_, true);
+            dump_var("layer_res_d0_pre", h_last, d0w, d_mtp_nh_, true);
+            dump_var("layer_post_d0_fn", h_post, d0w, nullptr, true);
+            if (hist > 1) {
+                dump_var("stem_prev_d0_fn", h_prev, d0w, nullptr, false);
+                dump_var("layer_prev_d0_pre", h_prev, d0w, d_mtp_nh_, true);
+                // Residual velocity: h_pred = h_last + s*(h_last - h_prev). Legal, no peek.
+                float* h_ex = d_mtp_hh_ + static_cast<size_t>(kMtpCap - 3) * H;
+                std::vector<float> hl(static_cast<size_t>(H)), hpv(static_cast<size_t>(H)),
+                    hx(static_cast<size_t>(H));
+                CUDA_CHECK(cudaMemcpy(hl.data(), h_last, sizeof(float) * H, cudaMemcpyDeviceToHost));
+                CUDA_CHECK(cudaMemcpy(hpv.data(), h_prev, sizeof(float) * H, cudaMemcpyDeviceToHost));
+                const float scales[] = {0.25f, 0.5f, 1.f, 1.5f, 2.f};
+                for (float s : scales) {
+                    for (int j = 0; j < H; ++j)
+                        hx[static_cast<size_t>(j)] =
+                            hl[static_cast<size_t>(j)] +
+                            s * (hl[static_cast<size_t>(j)] - hpv[static_cast<size_t>(j)]);
+                    CUDA_CHECK(cudaMemcpy(h_ex, hx.data(), sizeof(float) * H, cudaMemcpyHostToDevice));
+                    char tag[64];
+                    std::snprintf(tag, sizeof(tag), "stem_ex%.2f_d0_fn", static_cast<double>(s));
+                    dump_var(tag, h_ex, d0w, nullptr, false);
+                    std::snprintf(tag, sizeof(tag), "stem_ex%.2f_t0_fn", static_cast<double>(s));
+                    dump_var(tag, h_ex, first, nullptr, false);
+                }
+            }
+            // Official layer hidden kept for cosine vs h after decode(d0).
+            {
+                const int knp = mtp_L_.nkv * mtp_L_.hd;
+                CUDA_CHECK(cudaMemset(d_mtp_kc_, 0, sizeof(float) * static_cast<size_t>(kMtpCap) * knp));
+                CUDA_CHECK(cudaMemset(d_mtp_vc_, 0, sizeof(float) * kMtpCap * knp));
+                mtp_fuse(h_post, d0w, false, d_mtp_nh_);
+                mtp_layer(0);
+                float* h_ly = d_mtp_hh_ + static_cast<size_t>(kMtpCap - 2) * H;
+                CUDA_CHECK(cudaMemcpy(h_ly, d_mtp_h_, sizeof(float) * H, cudaMemcpyDeviceToDevice));
+                write_f32("/home/znsoft/RapidLLM/build/rl_h_layer.bin", h_ly);
+                const int32_t t_mtp = take_g(d_mtp_nn_);
+                CUDA_CHECK(cudaMemcpy(d_mtp_h_, h_ly, sizeof(float) * H, cudaMemcpyDeviceToDevice));
+                const int32_t t_fn = take_g(d_final_norm_);
+                mtp_fuse(h_ly, d0w);
+                const int32_t t_refuze = take_g(d_mtp_nn_);
+                std::fprintf(stderr, "mtp_take d0=%d layer_mtp=%d layer_fn=%d refuze=%d r69103=%d hit=%d%d%d\n",
+                             d0w, t_mtp, t_fn, t_refuze, rank_of(want), t_mtp == want, t_fn == want,
+                             t_refuze == want);
+            }
+            std::fprintf(stderr, "mtp_mismatch t0=%d greedy=%d drafts:", first, last_tok_);
+            for (int i = 0; i < got; ++i) std::fprintf(stderr, " %d", out[i]);
+            std::fprintf(stderr, " want_d0=20666 want_d1=69103 match_d0=%d match_d1=%d\n",
+                         out[0] == last_tok_ ? 1 : 0, (got > 1 && out[1] == want) ? 1 : 0);
+        }
+        return got;
+    }
+
     void copy_logits(float* host) const override {
         if (h_pin_) {
             CUDA_CHECK(cudaMemcpyAsync(h_pin_, d_logits_, sizeof(float) * vocab_, cudaMemcpyDeviceToHost,
@@ -8793,8 +13547,26 @@ public:
         if (B > max_batch_) throw std::runtime_error("decode_tokens B exceeds max_batch");
         CUDA_CHECK(cudaMemcpy(d_toks_, tokens, sizeof(int) * B, cudaMemcpyHostToDevice));
         CUDA_CHECK(cudaMemcpy(d_pos_b_, poss, sizeof(int) * B, cudaMemcpyHostToDevice));
-        launch_decode_batch(B);
+        if (batch_graph_exec_ && B == batch_graph_B_) {
+            CUDA_CHECK(cudaGraphLaunch(batch_graph_exec_, cudaStreamPerThread));
+        } else {
+            launch_decode_batch(B);
+        }
         CUDA_CHECK(cudaStreamSynchronize(cudaStreamPerThread));
+    }
+
+    bool prefill_eq_batch(const int32_t* ids, int T, int B) override {
+        if (!ids || T <= 0 || B <= 1) return false;
+        const int N = T * B;
+        if (N > seq_cap_) {
+            std::fprintf(stderr, "prefill_eq_skip N=%d seq_cap=%d T=%d B=%d\n", N, seq_cap_, T, B);
+            return false;
+        }
+        CUDA_CHECK(cudaMemcpy(d_toks_, ids, sizeof(int) * N, cudaMemcpyHostToDevice));
+        launch_prefill_eq(T, B);
+        CUDA_CHECK(cudaStreamSynchronize(cudaStreamPerThread));
+        std::fprintf(stderr, "prefill_eq_batch=1 T=%d B=%d\n", T, B);
+        return true;
     }
 
     void copy_logits_n(float* host, int B) const override {
@@ -8840,64 +13612,479 @@ public:
 
     int spec_verify(const int32_t* toks, int T, int32_t* preds) override {
         if (T <= 0 || !toks) return 0;
-        if (T == 1) {
-            decode_token(toks[0]);
-            if (preds) preds[0] = last_tok_;
-            return 1;
-        }
-        T = std::min(T, std::min(pf_cap_, logit_rows_));
-        const int pos0 = pos_;
-        if (bak_stream_) CUDA_CHECK(cudaStreamSynchronize(bak_stream_));
-        if (bak_stream_) {
-            if (s_bytes_)
-                CUDA_CHECK(cudaMemcpyAsync(d_S_bak_, d_S_, s_bytes_, cudaMemcpyDeviceToDevice, bak_stream_));
-            if (conv_bytes_)
-                CUDA_CHECK(cudaMemcpyAsync(d_conv_bak_, d_conv_, conv_bytes_, cudaMemcpyDeviceToDevice, bak_stream_));
-            if (kv_bytes_ && d_k_bak_ && d_v_bak_) {
-                CUDA_CHECK(cudaMemcpyAsync(d_k_bak_, d_kcache_, kv_bytes_, cudaMemcpyDeviceToDevice, bak_stream_));
-                CUDA_CHECK(cudaMemcpyAsync(d_v_bak_, d_vcache_, kv_bytes_, cudaMemcpyDeviceToDevice, bak_stream_));
+        T = std::min(T, 12);
+
+        auto two_phase = [&](int n) {
+            // Decode-graph path. Miss stops after toks[0] — no KV/S backup.
+            for (int i = 0; i < n; ++i) {
+                if (i > 0 && last_tok_ != toks[i]) return i;
+                decode_token(toks[i]);
+                if (preds) preds[i] = toks[i];
+                if (i > 0) {
+                    mtp_legal_t0_ = toks[i - 1];
+                    mtp_legal_t1_ = toks[i];
+                    mtp_has_legal_ = true;
+                    if (mtp_kv_pos_ + 1 < kMtpCap) ++mtp_kv_pos_;
+                }
             }
-        } else {
-            if (s_bytes_) CUDA_CHECK(cudaMemcpy(d_S_bak_, d_S_, s_bytes_, cudaMemcpyDeviceToDevice));
-            if (conv_bytes_) CUDA_CHECK(cudaMemcpy(d_conv_bak_, d_conv_, conv_bytes_, cudaMemcpyDeviceToDevice));
-            if (kv_bytes_ && d_k_bak_ && d_v_bak_) {
+            return n;
+        };
+
+        // Fused T=2/T=3 graphs: one W read. Miss restores t0 snap and keeps toks[0].
+        static const bool vlog = [] {
+            const char* e = std::getenv("RAPIDLLM_MTP_LOG");
+            return e && e[0] == '1';
+        }();
+        if (T >= 12 && spec_graph_t12_exec_) {
+            const int pos0 = pos_;
+            if (!spec_t0_snap_) {
+                CUDA_CHECK(cudaMemcpy(d_S_bak_, d_S_, s_bytes_, cudaMemcpyDeviceToDevice));
+                if (conv_bytes_ && d_conv_ && d_conv_bak_)
+                    CUDA_CHECK(cudaMemcpy(d_conv_bak_, d_conv_, conv_bytes_, cudaMemcpyDeviceToDevice));
                 CUDA_CHECK(cudaMemcpy(d_k_bak_, d_kcache_, kv_bytes_, cudaMemcpyDeviceToDevice));
                 CUDA_CHECK(cudaMemcpy(d_v_bak_, d_vcache_, kv_bytes_, cudaMemcpyDeviceToDevice));
             }
-        }
-        if (bak_stream_) CUDA_CHECK(cudaStreamSynchronize(bak_stream_));
-        CUDA_CHECK(cudaMemcpy(d_toks_, toks, sizeof(int) * T, cudaMemcpyHostToDevice));
-        CUDA_CHECK(cudaMemcpy(d_pos_, &pos0, 4, cudaMemcpyHostToDevice));
-        if (T == 4 && spec_graph_exec_) {
-            CUDA_CHECK(cudaGraphLaunch(spec_graph_exec_, cudaStreamPerThread));
-        } else {
-            launch_spec_chunk(T);
-        }
-        int hpred[8];
-        CUDA_CHECK(cudaMemcpy(hpred, d_best_n_, sizeof(int) * T, cudaMemcpyDeviceToHost));
-        if (preds) {
-            for (int t = 0; t < T; ++t) preds[t] = hpred[t];
-        }
-        int k = 1;
-        while (k < T && hpred[k - 1] == toks[k]) ++k;
-        if (k < T) {
-            if (bak_stream_) CUDA_CHECK(cudaStreamSynchronize(bak_stream_));
-            if (s_bytes_) CUDA_CHECK(cudaMemcpy(d_S_, d_S_bak_, s_bytes_, cudaMemcpyDeviceToDevice));
-            if (conv_bytes_) CUDA_CHECK(cudaMemcpy(d_conv_, d_conv_bak_, conv_bytes_, cudaMemcpyDeviceToDevice));
-            if (kv_bytes_ && d_k_bak_ && d_v_bak_) {
-                CUDA_CHECK(cudaMemcpy(d_kcache_, d_k_bak_, kv_bytes_, cudaMemcpyDeviceToDevice));
-                CUDA_CHECK(cudaMemcpy(d_vcache_, d_v_bak_, kv_bytes_, cudaMemcpyDeviceToDevice));
+            if (!mtp_toks_on_dev_)
+                CUDA_CHECK(cudaMemcpy(d_toks_, toks, sizeof(int) * 12, cudaMemcpyHostToDevice));
+            if (d_pos_b_) {
+                const int hp[12] = {pos0,      pos0 + 1,  pos0 + 2,  pos0 + 3,  pos0 + 4,  pos0 + 5,
+                                    pos0 + 6,  pos0 + 7,  pos0 + 8,  pos0 + 9,  pos0 + 10, pos0 + 11};
+                CUDA_CHECK(cudaMemcpy(d_pos_b_, hp, sizeof(hp), cudaMemcpyHostToDevice));
             }
-            CUDA_CHECK(cudaMemcpy(d_toks_, toks, sizeof(int) * k, cudaMemcpyHostToDevice));
-            CUDA_CHECK(cudaMemcpy(d_pos_, &pos0, 4, cudaMemcpyHostToDevice));
-            launch_spec_chunk(k);
+            set_pos_k<<<1, 1>>>(d_pos_, pos0);
+            CUDA_CHECK(cudaGraphLaunch(spec_graph_t12_exec_, cudaStreamPerThread));
+            int best[12] = {};
+            CUDA_CHECK(cudaMemcpy(best, d_best_n_, sizeof(int) * 12, cudaMemcpyDeviceToHost));
+            const int hit2 = (best[0] == toks[1]) ? 1 : 0;
+            const int hit3 = (hit2 && best[1] == toks[2]) ? 1 : 0;
+            const int hit4 = (hit3 && best[2] == toks[3]) ? 1 : 0;
+            const int hit6 = (hit4 && best[3] == toks[4] && best[4] == toks[5]) ? 1 : 0;
+            int hit12 = hit6;
+            for (int i = 5; hit12 && i < 11; ++i) {
+                if (best[i] != toks[i + 1]) hit12 = 0;
+            }
+            if (vlog && hidden_ >= 64)
+                std::fprintf(stderr, "mtp_verify_t12 t0=%d p0=%d d1=%d hit2=%d hit6=%d hit12=%d\n", toks[0],
+                             best[0], toks[1], hit2, hit6, hit12);
+            if (!hit2) {
+                if (spec_t0_snap_) {
+                    if (s_bytes_ && d_S_ && d_S_bak_)
+                        CUDA_CHECK(cudaMemcpy(d_S_, d_S_bak_, s_bytes_, cudaMemcpyDeviceToDevice));
+                    if (conv_bytes_ && d_conv_ && d_conv_bak_)
+                        CUDA_CHECK(cudaMemcpy(d_conv_, d_conv_bak_, conv_bytes_, cudaMemcpyDeviceToDevice));
+                    pos_ = pos0 + 1;
+                    set_pos_k<<<1, 1>>>(d_pos_, pos_);
+                    if (d_h_ && d_h_seq_)
+                        CUDA_CHECK(cudaMemcpy(d_h_, d_h_seq_, sizeof(float) * hidden_,
+                                              cudaMemcpyDeviceToDevice));
+                    last_tok_ = best[0];
+                    CUDA_CHECK(cudaMemcpy(d_best_, &last_tok_, 4, cudaMemcpyHostToDevice));
+                    if (d_tok_) CUDA_CHECK(cudaMemcpy(d_tok_, &toks[0], 4, cudaMemcpyHostToDevice));
+                    mtp_append_hist(toks[0]);
+                    if (preds) preds[0] = toks[0];
+                    mtp_has_legal_ = false;
+                    return 1;
+                }
+                return two_phase(1);
+            }
+            if (!hit12) {
+                if (spec_t0_snap_ && s_bytes_ && d_S_ && d_S_bak_)
+                    CUDA_CHECK(cudaMemcpy(d_S_, d_S_bak_, s_bytes_, cudaMemcpyDeviceToDevice));
+                if (spec_t0_snap_ && conv_bytes_ && d_conv_ && d_conv_bak_)
+                    CUDA_CHECK(cudaMemcpy(d_conv_, d_conv_bak_, conv_bytes_, cudaMemcpyDeviceToDevice));
+                pos_ = pos0;
+                set_pos_k<<<1, 1>>>(d_pos_, pos0);
+                return spec_verify(toks, hit6 ? 6 : (hit4 ? 4 : (hit3 ? 3 : 2)), preds);
+            }
+            if (mtp_kv_pos_ + 11 < kMtpCap) mtp_kv_pos_ += 11;
+            if (preds) {
+                for (int i = 0; i < 12; ++i) preds[i] = toks[i];
+            }
+            pos_ = pos0 + 12;
+            set_pos_k<<<1, 1>>>(d_pos_, pos_);
+            last_tok_ = best[11];
+            snap_last_residual(12);
+            return 12;
         }
-        last_tok_ = hpred[k - 1];
-        pos_ = pos0 + k;
+        if (T >= 6 && spec_graph_t6_exec_) {
+            const int pos0 = pos_;
+            if (!spec_t0_snap_) {
+                CUDA_CHECK(cudaMemcpy(d_S_bak_, d_S_, s_bytes_, cudaMemcpyDeviceToDevice));
+                if (conv_bytes_ && d_conv_ && d_conv_bak_)
+                    CUDA_CHECK(cudaMemcpy(d_conv_bak_, d_conv_, conv_bytes_, cudaMemcpyDeviceToDevice));
+                CUDA_CHECK(cudaMemcpy(d_k_bak_, d_kcache_, kv_bytes_, cudaMemcpyDeviceToDevice));
+                CUDA_CHECK(cudaMemcpy(d_v_bak_, d_vcache_, kv_bytes_, cudaMemcpyDeviceToDevice));
+            }
+            if (!mtp_toks_on_dev_)
+                CUDA_CHECK(cudaMemcpy(d_toks_, toks, sizeof(int) * 6, cudaMemcpyHostToDevice));
+            if (d_pos_b_) {
+                const int hp[6] = {pos0, pos0 + 1, pos0 + 2, pos0 + 3, pos0 + 4, pos0 + 5};
+                CUDA_CHECK(cudaMemcpy(d_pos_b_, hp, sizeof(hp), cudaMemcpyDeviceToDevice));
+            }
+            set_pos_k<<<1, 1>>>(d_pos_, pos0);
+            CUDA_CHECK(cudaGraphLaunch(spec_graph_t6_exec_, cudaStreamPerThread));
+            int best[6] = {};
+            CUDA_CHECK(cudaMemcpy(best, d_best_n_, sizeof(int) * 6, cudaMemcpyDeviceToHost));
+            const int hit2 = (best[0] == toks[1]) ? 1 : 0;
+            const int hit3 = (hit2 && best[1] == toks[2]) ? 1 : 0;
+            const int hit4 = (hit3 && best[2] == toks[3]) ? 1 : 0;
+            const int hit5 = (hit4 && best[3] == toks[4]) ? 1 : 0;
+            const int hit6 = (hit5 && best[4] == toks[5]) ? 1 : 0;
+            if (vlog && hidden_ >= 64)
+                std::fprintf(stderr, "mtp_verify_t6 t0=%d p0=%d d1=%d hit=%d%d%d%d%d\n", toks[0], best[0],
+                             toks[1], hit2, hit3, hit4, hit5, hit6);
+            if (!hit2) {
+                if (spec_t0_snap_) {
+                    if (s_bytes_ && d_S_ && d_S_bak_)
+                        CUDA_CHECK(cudaMemcpy(d_S_, d_S_bak_, s_bytes_, cudaMemcpyDeviceToDevice));
+                    if (conv_bytes_ && d_conv_ && d_conv_bak_)
+                        CUDA_CHECK(cudaMemcpy(d_conv_, d_conv_bak_, conv_bytes_, cudaMemcpyDeviceToDevice));
+                    pos_ = pos0 + 1;
+                    set_pos_k<<<1, 1>>>(d_pos_, pos_);
+                    if (d_h_ && d_h_seq_)
+                        CUDA_CHECK(cudaMemcpy(d_h_, d_h_seq_, sizeof(float) * hidden_,
+                                              cudaMemcpyDeviceToDevice));
+                    last_tok_ = best[0];
+                    CUDA_CHECK(cudaMemcpy(d_best_, &last_tok_, 4, cudaMemcpyHostToDevice));
+                    if (d_tok_) CUDA_CHECK(cudaMemcpy(d_tok_, &toks[0], 4, cudaMemcpyHostToDevice));
+                    mtp_append_hist(toks[0]);
+                    if (preds) preds[0] = toks[0];
+                    mtp_has_legal_ = false;
+                    return 1;
+                }
+                return two_phase(1);
+            }
+            if (!hit6) {
+                if (spec_t0_snap_ && s_bytes_ && d_S_ && d_S_bak_)
+                    CUDA_CHECK(cudaMemcpy(d_S_, d_S_bak_, s_bytes_, cudaMemcpyDeviceToDevice));
+                if (spec_t0_snap_ && conv_bytes_ && d_conv_ && d_conv_bak_)
+                    CUDA_CHECK(cudaMemcpy(d_conv_, d_conv_bak_, conv_bytes_, cudaMemcpyDeviceToDevice));
+                pos_ = pos0;
+                set_pos_k<<<1, 1>>>(d_pos_, pos0);
+                return spec_verify(toks, hit4 ? 4 : (hit3 ? 3 : 2), preds);
+            }
+            if (mtp_kv_pos_ + 5 < kMtpCap) mtp_kv_pos_ += 5;
+            if (preds) {
+                for (int i = 0; i < 6; ++i) preds[i] = toks[i];
+            }
+            pos_ = pos0 + 6;
+            set_pos_k<<<1, 1>>>(d_pos_, pos_);
+            snap_last_residual(6);
+            last_tok_ = best[5];
+            CUDA_CHECK(cudaMemcpy(d_best_, &last_tok_, 4, cudaMemcpyHostToDevice));
+            if (d_logits_ && vocab_ > 0)
+                CUDA_CHECK(cudaMemcpy(d_logits_, d_logits_ + static_cast<size_t>(5) * vocab_,
+                                      sizeof(float) * vocab_, cudaMemcpyDeviceToDevice));
+            for (int i = 0; i < 6; ++i) {
+                CUDA_CHECK(cudaMemcpy(d_h_, d_h_seq_ + static_cast<size_t>(i) * hidden_,
+                                      sizeof(float) * hidden_, cudaMemcpyDeviceToDevice));
+                mtp_append_hist(toks[i]);
+            }
+            return 6;
+        }
+        if (T >= 4 && spec_graph_t4_exec_) {
+            const int pos0 = pos_;
+            if (!spec_t0_snap_) {
+                CUDA_CHECK(cudaMemcpy(d_S_bak_, d_S_, s_bytes_, cudaMemcpyDeviceToDevice));
+                if (conv_bytes_ && d_conv_ && d_conv_bak_)
+                    CUDA_CHECK(cudaMemcpy(d_conv_bak_, d_conv_, conv_bytes_, cudaMemcpyDeviceToDevice));
+                CUDA_CHECK(cudaMemcpy(d_k_bak_, d_kcache_, kv_bytes_, cudaMemcpyDeviceToDevice));
+                CUDA_CHECK(cudaMemcpy(d_v_bak_, d_vcache_, kv_bytes_, cudaMemcpyDeviceToDevice));
+            }
+            if (!mtp_toks_on_dev_)
+                CUDA_CHECK(cudaMemcpy(d_toks_, toks, sizeof(int) * 4, cudaMemcpyHostToDevice));
+            if (d_pos_b_) {
+                const int hp[4] = {pos0, pos0 + 1, pos0 + 2, pos0 + 3};
+                CUDA_CHECK(cudaMemcpy(d_pos_b_, hp, sizeof(hp), cudaMemcpyHostToDevice));
+            }
+            set_pos_k<<<1, 1>>>(d_pos_, pos0);
+            CUDA_CHECK(cudaGraphLaunch(spec_graph_t4_exec_, cudaStreamPerThread));
+            int best[4] = {};
+            CUDA_CHECK(cudaMemcpy(best, d_best_n_, sizeof(int) * 4, cudaMemcpyDeviceToHost));
+            const int hit2 = (best[0] == toks[1]) ? 1 : 0;
+            const int hit3 = (hit2 && best[1] == toks[2]) ? 1 : 0;
+            const int hit4 = (hit3 && best[2] == toks[3]) ? 1 : 0;
+            if (vlog && hidden_ >= 64)
+                std::fprintf(stderr, "mtp_verify_t4 t0=%d p0=%d d1=%d hit=%d%d%d\n", toks[0], best[0], toks[1],
+                             hit2, hit3, hit4);
+            if (!hit2) {
+                if (spec_t0_snap_) {
+                    if (s_bytes_ && d_S_ && d_S_bak_)
+                        CUDA_CHECK(cudaMemcpy(d_S_, d_S_bak_, s_bytes_, cudaMemcpyDeviceToDevice));
+                    if (conv_bytes_ && d_conv_ && d_conv_bak_)
+                        CUDA_CHECK(cudaMemcpy(d_conv_, d_conv_bak_, conv_bytes_, cudaMemcpyDeviceToDevice));
+                    pos_ = pos0 + 1;
+                    set_pos_k<<<1, 1>>>(d_pos_, pos_);
+                    if (d_h_ && d_h_seq_)
+                        CUDA_CHECK(cudaMemcpy(d_h_, d_h_seq_, sizeof(float) * hidden_,
+                                              cudaMemcpyDeviceToDevice));
+                    last_tok_ = best[0];
+                    CUDA_CHECK(cudaMemcpy(d_best_, &last_tok_, 4, cudaMemcpyHostToDevice));
+                    if (d_tok_) CUDA_CHECK(cudaMemcpy(d_tok_, &toks[0], 4, cudaMemcpyHostToDevice));
+                    mtp_append_hist(toks[0]);
+                    if (preds) preds[0] = toks[0];
+                    mtp_has_legal_ = false;
+                    return 1;
+                }
+                return two_phase(1);
+            }
+            if (!hit4) {
+                // hit2: restore GDN after t0+d0 (mid snap). No T=2 replay.
+                if (hit2 && spec_t0_snap_ && d_S_mid_ && d_conv_mid_) {
+                    CUDA_CHECK(cudaMemcpy(d_S_, d_S_mid_, s_bytes_, cudaMemcpyDeviceToDevice));
+                    if (conv_bytes_)
+                        CUDA_CHECK(cudaMemcpy(d_conv_, d_conv_mid_, conv_bytes_, cudaMemcpyDeviceToDevice));
+                    pos_ = pos0 + 2;
+                    set_pos_k<<<1, 1>>>(d_pos_, pos_);
+                    if (d_h_ && d_h_seq_)
+                        CUDA_CHECK(cudaMemcpy(d_h_, d_h_seq_ + hidden_, sizeof(float) * hidden_,
+                                              cudaMemcpyDeviceToDevice));
+                    last_tok_ = best[1];
+                    CUDA_CHECK(cudaMemcpy(d_best_, &last_tok_, 4, cudaMemcpyHostToDevice));
+                    if (d_tok_) CUDA_CHECK(cudaMemcpy(d_tok_, &toks[1], 4, cudaMemcpyHostToDevice));
+                    if (d_mtp_post_ && d_final_norm_ && d_h_)
+                        launch_rms(d_h_, d_final_norm_, d_mtp_post_, hidden_, store_->model().rms_eps);
+                    mtp_append_hist(toks[0]);
+                    mtp_append_hist(toks[1]);
+                    if (mtp_kv_pos_ + 1 < kMtpCap) ++mtp_kv_pos_;
+                    if (preds) {
+                        preds[0] = toks[0];
+                        preds[1] = toks[1];
+                    }
+                    return 2;
+                }
+                if (spec_t0_snap_) {
+                    if (s_bytes_ && d_S_ && d_S_bak_)
+                        CUDA_CHECK(cudaMemcpy(d_S_, d_S_bak_, s_bytes_, cudaMemcpyDeviceToDevice));
+                    if (conv_bytes_ && d_conv_ && d_conv_bak_)
+                        CUDA_CHECK(cudaMemcpy(d_conv_, d_conv_bak_, conv_bytes_, cudaMemcpyDeviceToDevice));
+                    pos_ = pos0 + 1;
+                    set_pos_k<<<1, 1>>>(d_pos_, pos_);
+                    if (d_h_ && d_h_seq_)
+                        CUDA_CHECK(cudaMemcpy(d_h_, d_h_seq_, sizeof(float) * hidden_,
+                                              cudaMemcpyDeviceToDevice));
+                    last_tok_ = best[0];
+                    CUDA_CHECK(cudaMemcpy(d_best_, &last_tok_, 4, cudaMemcpyHostToDevice));
+                    if (d_tok_) CUDA_CHECK(cudaMemcpy(d_tok_, &toks[0], 4, cudaMemcpyHostToDevice));
+                    mtp_append_hist(toks[0]);
+                    if (preds) preds[0] = toks[0];
+                    mtp_has_legal_ = false;
+                    return 1;
+                }
+                return two_phase(1);
+            }
+            if (mtp_kv_pos_ + 3 < kMtpCap) mtp_kv_pos_ += 3;
+            if (preds) {
+                preds[0] = toks[0];
+                preds[1] = toks[1];
+                preds[2] = toks[2];
+                preds[3] = toks[3];
+            }
+            pos_ = pos0 + 4;
+            set_pos_k<<<1, 1>>>(d_pos_, pos_);
+            snap_last_residual(4);
+            last_tok_ = best[3];
+            CUDA_CHECK(cudaMemcpy(d_best_, &last_tok_, 4, cudaMemcpyHostToDevice));
+            if (d_logits_ && vocab_ > 0)
+                CUDA_CHECK(cudaMemcpy(d_logits_, d_logits_ + static_cast<size_t>(3) * vocab_,
+                                      sizeof(float) * vocab_, cudaMemcpyDeviceToDevice));
+            for (int i = 0; i < 4; ++i) {
+                CUDA_CHECK(cudaMemcpy(d_h_, d_h_seq_ + static_cast<size_t>(i) * hidden_,
+                                      sizeof(float) * hidden_, cudaMemcpyDeviceToDevice));
+                mtp_append_hist(toks[i]);
+            }
+            return 4;
+        }
+        if (T >= 3 && spec_graph_t3_exec_) {
+            const int pos0 = pos_;
+            if (!spec_t0_snap_) {
+                CUDA_CHECK(cudaMemcpy(d_S_bak_, d_S_, s_bytes_, cudaMemcpyDeviceToDevice));
+                if (conv_bytes_ && d_conv_ && d_conv_bak_)
+                    CUDA_CHECK(cudaMemcpy(d_conv_bak_, d_conv_, conv_bytes_, cudaMemcpyDeviceToDevice));
+                CUDA_CHECK(cudaMemcpy(d_k_bak_, d_kcache_, kv_bytes_, cudaMemcpyDeviceToDevice));
+                CUDA_CHECK(cudaMemcpy(d_v_bak_, d_vcache_, kv_bytes_, cudaMemcpyDeviceToDevice));
+            }
+            if (!mtp_toks_on_dev_)
+                CUDA_CHECK(cudaMemcpy(d_toks_, toks, sizeof(int) * 3, cudaMemcpyHostToDevice));
+            if (d_pos_b_) {
+                const int hp[3] = {pos0, pos0 + 1, pos0 + 2};
+                CUDA_CHECK(cudaMemcpy(d_pos_b_, hp, sizeof(hp), cudaMemcpyHostToDevice));
+            }
+            set_pos_k<<<1, 1>>>(d_pos_, pos0);
+            CUDA_CHECK(cudaGraphLaunch(spec_graph_t3_exec_, cudaStreamPerThread));
+            int best[3] = {};
+            CUDA_CHECK(cudaMemcpy(best, d_best_n_, sizeof(int) * 3, cudaMemcpyDeviceToHost));
+            const int hit2 = (best[0] == toks[1]) ? 1 : 0;
+            const int hit3 = (hit2 && best[1] == toks[2]) ? 1 : 0;
+            if (vlog && hidden_ >= 64)
+                std::fprintf(stderr, "mtp_verify_t3 t0=%d p0=%d d1=%d p1=%d d2=%d hit=%d%d\n", toks[0], best[0],
+                             toks[1], best[1], toks[2], hit2, hit3);
+            if (!hit2) {
+                if (spec_t0_snap_) {
+                    if (s_bytes_ && d_S_ && d_S_bak_)
+                        CUDA_CHECK(cudaMemcpy(d_S_, d_S_bak_, s_bytes_, cudaMemcpyDeviceToDevice));
+                    if (conv_bytes_ && d_conv_ && d_conv_bak_)
+                        CUDA_CHECK(cudaMemcpy(d_conv_, d_conv_bak_, conv_bytes_, cudaMemcpyDeviceToDevice));
+                    pos_ = pos0 + 1;
+                    set_pos_k<<<1, 1>>>(d_pos_, pos_);
+                    if (d_h_ && d_h_seq_)
+                        CUDA_CHECK(cudaMemcpy(d_h_, d_h_seq_, sizeof(float) * hidden_,
+                                              cudaMemcpyDeviceToDevice));
+                    last_tok_ = best[0];
+                    CUDA_CHECK(cudaMemcpy(d_best_, &last_tok_, 4, cudaMemcpyHostToDevice));
+                    if (d_tok_) CUDA_CHECK(cudaMemcpy(d_tok_, &toks[0], 4, cudaMemcpyHostToDevice));
+                    mtp_append_hist(toks[0]);
+                    if (preds) preds[0] = toks[0];
+                    mtp_has_legal_ = false;
+                    return 1;
+                }
+                return two_phase(1);
+            }
+            if (!hit3) {
+                // No T=2 replay after T=3 — rejected KV slots stay live otherwise.
+                if (spec_t0_snap_) {
+                    if (s_bytes_ && d_S_ && d_S_bak_)
+                        CUDA_CHECK(cudaMemcpy(d_S_, d_S_bak_, s_bytes_, cudaMemcpyDeviceToDevice));
+                    if (conv_bytes_ && d_conv_ && d_conv_bak_)
+                        CUDA_CHECK(cudaMemcpy(d_conv_, d_conv_bak_, conv_bytes_, cudaMemcpyDeviceToDevice));
+                    pos_ = pos0 + 1;
+                    set_pos_k<<<1, 1>>>(d_pos_, pos_);
+                    if (d_h_ && d_h_seq_)
+                        CUDA_CHECK(cudaMemcpy(d_h_, d_h_seq_, sizeof(float) * hidden_,
+                                              cudaMemcpyDeviceToDevice));
+                    last_tok_ = best[0];
+                    CUDA_CHECK(cudaMemcpy(d_best_, &last_tok_, 4, cudaMemcpyHostToDevice));
+                    if (d_tok_) CUDA_CHECK(cudaMemcpy(d_tok_, &toks[0], 4, cudaMemcpyHostToDevice));
+                    mtp_append_hist(toks[0]);
+                    if (preds) preds[0] = toks[0];
+                    mtp_has_legal_ = false;
+                    return 1;
+                }
+                return two_phase(1);
+            }
+            if (mtp_kv_pos_ + 2 < kMtpCap) mtp_kv_pos_ += 2;
+            if (preds) {
+                preds[0] = toks[0];
+                preds[1] = toks[1];
+                preds[2] = toks[2];
+            }
+            pos_ = pos0 + 3;
+            set_pos_k<<<1, 1>>>(d_pos_, pos_);
+            snap_last_residual(3);
+            last_tok_ = best[2];
+            CUDA_CHECK(cudaMemcpy(d_best_, &last_tok_, 4, cudaMemcpyHostToDevice));
+            if (d_logits_ && vocab_ > 0)
+                CUDA_CHECK(cudaMemcpy(d_logits_, d_logits_ + static_cast<size_t>(2) * vocab_,
+                                      sizeof(float) * vocab_, cudaMemcpyDeviceToDevice));
+            for (int i = 0; i < 3; ++i) {
+                CUDA_CHECK(cudaMemcpy(d_h_, d_h_seq_ + static_cast<size_t>(i) * hidden_,
+                                      sizeof(float) * hidden_, cudaMemcpyDeviceToDevice));
+                mtp_append_hist(toks[i]);
+            }
+            return 3;
+        }
+
+        const bool fused = (T >= 2 && spec_graph_exec_);
+        if (vlog && hidden_ >= 64 && T >= 2)
+            std::fprintf(stderr, "mtp_try_chunk=%d t0=%d d1=%d kvpos=%d graph=%d\n", fused ? 1 : 0, toks[0],
+                         toks[1], mtp_kv_pos_, spec_graph_exec_ ? 1 : 0);
+        if (!fused) return two_phase(T);
+
+        const int pos0 = pos_;
+        // In-graph t0 S/conv snap replaces the pre-launch full backup. KV at
+        // pos0 is already the consumed t0 write; pos0+1 is unused on a miss.
+        if (!spec_t0_snap_) {
+            CUDA_CHECK(cudaMemcpy(d_S_bak_, d_S_, s_bytes_, cudaMemcpyDeviceToDevice));
+            if (conv_bytes_ && d_conv_ && d_conv_bak_)
+                CUDA_CHECK(cudaMemcpy(d_conv_bak_, d_conv_, conv_bytes_, cudaMemcpyDeviceToDevice));
+            CUDA_CHECK(cudaMemcpy(d_k_bak_, d_kcache_, kv_bytes_, cudaMemcpyDeviceToDevice));
+            CUDA_CHECK(cudaMemcpy(d_v_bak_, d_vcache_, kv_bytes_, cudaMemcpyDeviceToDevice));
+        }
+        const int Tc = 2;
+        if (!mtp_toks_on_dev_)
+            CUDA_CHECK(cudaMemcpy(d_toks_, toks, sizeof(int) * Tc, cudaMemcpyHostToDevice));
+        if (d_pos_b_) {
+            const int hp[2] = {pos0, pos0 + 1};
+            CUDA_CHECK(cudaMemcpy(d_pos_b_, hp, sizeof(hp), cudaMemcpyHostToDevice));
+        }
+        set_pos_k<<<1, 1>>>(d_pos_, pos0);
+        CUDA_CHECK(cudaGraphLaunch(spec_graph_exec_, cudaStreamPerThread));
+        int best[2] = {};
+        CUDA_CHECK(cudaMemcpy(best, d_best_n_, sizeof(int) * Tc, cudaMemcpyDeviceToHost));
+        int32_t d1 = toks[1];
+        if (mtp_toks_on_dev_)
+            CUDA_CHECK(cudaMemcpy(&d1, d_toks_ + 1, 4, cudaMemcpyDeviceToHost));
+        const int hit = (best[0] == d1) ? 2 : 1;
+        if (vlog && hidden_ >= 64)
+            std::fprintf(stderr, "mtp_verify t0=%d pred0=%d draft1=%d match=%d k=%d Tc=2 snap=%d\n", toks[0],
+                         best[0], toks[1], hit == 2 ? 1 : 0, hit, spec_t0_snap_ ? 1 : 0);
+        if (hit < 2) {
+            if (spec_t0_snap_) {
+                if (s_bytes_ && d_S_ && d_S_bak_)
+                    CUDA_CHECK(cudaMemcpy(d_S_, d_S_bak_, s_bytes_, cudaMemcpyDeviceToDevice));
+                if (conv_bytes_ && d_conv_ && d_conv_bak_)
+                    CUDA_CHECK(cudaMemcpy(d_conv_, d_conv_bak_, conv_bytes_, cudaMemcpyDeviceToDevice));
+                pos_ = pos0 + 1;
+                set_pos_k<<<1, 1>>>(d_pos_, pos_);
+                if (d_h_ && d_h_seq_)
+                    CUDA_CHECK(cudaMemcpy(d_h_, d_h_seq_, sizeof(float) * hidden_,
+                                          cudaMemcpyDeviceToDevice));
+                last_tok_ = best[0];
+                CUDA_CHECK(cudaMemcpy(d_best_, &last_tok_, 4, cudaMemcpyHostToDevice));
+                if (d_tok_)
+                    CUDA_CHECK(cudaMemcpy(d_tok_, &toks[0], 4, cudaMemcpyHostToDevice));
+                mtp_append_hist(toks[0]);
+                if (preds) preds[0] = toks[0];
+                mtp_has_legal_ = false;
+                if (vlog && hidden_ >= 64)
+                    std::fprintf(stderr, "mtp_miss_fast t0=%d pred0=%d\n", toks[0], best[0]);
+                return 1;
+            }
+            CUDA_CHECK(cudaMemcpy(d_S_, d_S_bak_, s_bytes_, cudaMemcpyDeviceToDevice));
+            if (conv_bytes_ && d_conv_ && d_conv_bak_)
+                CUDA_CHECK(cudaMemcpy(d_conv_, d_conv_bak_, conv_bytes_, cudaMemcpyDeviceToDevice));
+            CUDA_CHECK(cudaMemcpy(d_kcache_, d_k_bak_, kv_bytes_, cudaMemcpyDeviceToDevice));
+            CUDA_CHECK(cudaMemcpy(d_vcache_, d_v_bak_, kv_bytes_, cudaMemcpyDeviceToDevice));
+            pos_ = pos0;
+            set_pos_k<<<1, 1>>>(d_pos_, pos0);
+            mtp_has_legal_ = false;
+            decode_token(toks[0]);
+            if (preds) preds[0] = toks[0];
+            return 1;
+        }
+        if (mtp_kv_pos_ + 1 < kMtpCap) ++mtp_kv_pos_;
+        if (preds) {
+            preds[0] = toks[0];
+            preds[1] = d1;
+        }
+        pos_ = pos0 + Tc;
         set_pos_k<<<1, 1>>>(d_pos_, pos_);
-        CUDA_CHECK(cudaMemcpy(d_h_, d_h_seq_ + static_cast<size_t>(k - 1) * hidden_, sizeof(float) * hidden_,
-                              cudaMemcpyDeviceToDevice));
-        CUDA_CHECK(cudaMemcpy(d_tok_, toks + (k - 1), 4, cudaMemcpyHostToDevice));
+        snap_last_residual(Tc);
+        last_tok_ = best[1];
+        CUDA_CHECK(cudaMemcpy(d_best_, &last_tok_, 4, cudaMemcpyHostToDevice));
+        if (d_logits_ && vocab_ > 0)
+            CUDA_CHECK(cudaMemcpy(d_logits_, d_logits_ + static_cast<size_t>(Tc - 1) * vocab_,
+                                  sizeof(float) * vocab_, cudaMemcpyDeviceToDevice));
+        for (int i = 0; i < Tc; ++i) {
+            CUDA_CHECK(cudaMemcpy(d_h_, d_h_seq_ + static_cast<size_t>(i) * hidden_, sizeof(float) * hidden_,
+                                  cudaMemcpyDeviceToDevice));
+            mtp_append_hist(i == 0 ? toks[0] : d1);
+        }
+        return Tc;
+    }
+
+    int spec_verify_t0(int32_t t0, int32_t* preds) override {
+        CUDA_CHECK(cudaMemcpy(d_toks_, &t0, 4, cudaMemcpyHostToDevice));
+        if (d_best_)
+            CUDA_CHECK(cudaMemcpy(d_toks_ + 1, d_best_, 4, cudaMemcpyDeviceToDevice));
+        // Always bring the draft id back. Skipping this when spec_graph_exec_
+        // is set left toks[1]=0 in the MTP log (and hid a real d_best_).
+        int32_t d0 = 0;
+        CUDA_CHECK(cudaMemcpy(&d0, d_toks_ + 1, 4, cudaMemcpyDeviceToHost));
+        mtp_toks_on_dev_ = true;
+        int32_t toks[2] = {t0, d0};
+        const int k = spec_verify(toks, 2, preds);
+        mtp_toks_on_dev_ = false;
         return k;
     }
 
@@ -9002,7 +14189,7 @@ private:
                     const char* nm = t.quant == QuantKind::Q4_K ? "q4k"
                                      : t.quant == QuantKind::Q5_K ? "q5k"
                                                                   : "q6k";
-                    std::fprintf(stderr, "native_kquant=1 %s soa=1 (no fp8 requant)\n", nm);
+                    std::fprintf(stderr, "native_kquant=1 %s soa=1 t2_2row=1\n", nm);
                 }
                 return w;
             }
@@ -9170,22 +14357,136 @@ private:
         return static_cast<const float*>(p);
     }
 
-    void embed_launch() {
+    void embed_into(const int* d_tok, float* dst) {
         const int th = 256;
         const int bl = (hidden_ + th - 1) / th;
         switch (embed_q_) {
         case QuantKind::F32:
-            embed_f32_k<<<bl, th>>>(reinterpret_cast<const float*>(d_embed_), d_tok_, d_h_, hidden_);
+            embed_f32_k<<<bl, th>>>(reinterpret_cast<const float*>(d_embed_), d_tok, dst, hidden_);
             break;
         case QuantKind::F16:
-            embed_f16_k<<<bl, th>>>(reinterpret_cast<const __half*>(d_embed_), d_tok_, d_h_, hidden_);
+            embed_f16_k<<<bl, th>>>(reinterpret_cast<const __half*>(d_embed_), d_tok, dst, hidden_);
             break;
         case QuantKind::BF16:
-            embed_bf16_k<<<bl, th>>>(reinterpret_cast<const uint16_t*>(d_embed_), d_tok_, d_h_, hidden_);
+            embed_bf16_k<<<bl, th>>>(reinterpret_cast<const uint16_t*>(d_embed_), d_tok, dst, hidden_);
             break;
         default:
             throw std::runtime_error("unsupported embed quant on CUDA");
         }
+    }
+
+    void embed_launch() { embed_into(d_tok_, d_h_); }
+
+    void upload_mtp() {
+        const TensorDesc* fc = store_->table().find("mtp.fc");
+        const TensorDesc* nn = store_->table().find("mtp.norm");
+        const TensorDesc* nh = store_->table().find("mtp.pre_fc_norm_hidden");
+        const TensorDesc* ne = store_->table().find("mtp.pre_fc_norm_embedding");
+        const TensorDesc* wq = store_->table().find("mtp.layers[0].attn.wq");
+        if (!fc || !nn || !nh || !ne || !wq) return;
+
+        mtp_L_.kind = LayerKind::GatedAttn;
+        mtp_L_.nq = 4;
+        mtp_L_.nkv = 2;
+        mtp_L_.hd = 8;
+        mtp_L_.theta = store_->model().rope.theta;
+        mtp_L_.eps = store_->model().rms_eps;
+        for (const GpuLayer& L : layers_) {
+            if (L.kind == LayerKind::GatedAttn) {
+                mtp_L_.nq = L.nq;
+                mtp_L_.nkv = L.nkv;
+                mtp_L_.hd = L.hd;
+                mtp_L_.theta = L.theta;
+                mtp_L_.eps = L.eps;
+                break;
+            }
+        }
+        mtp_L_.rotary = std::max(2, static_cast<int>(mtp_L_.hd * store_->model().rope.partial_factor));
+
+        mtp_fc_ = upload_w(*fc, hidden_, hidden_ * 2);
+        mtp_fc_f32_ = mtp_fc_;
+        if (mtp_fc_.q == QuantKind::BF16 && mtp_fc_.data && mtp_fc_.rows > 0 && mtp_fc_.cols > 0) {
+            const size_t n = static_cast<size_t>(mtp_fc_.rows) * static_cast<size_t>(mtp_fc_.cols);
+            float* dst = static_cast<float*>(alloc(n * sizeof(float)));
+            bf16_to_f32_k<<<static_cast<unsigned>((n + 255) / 256), 256>>>(
+                reinterpret_cast<const uint16_t*>(mtp_fc_.data), dst, static_cast<int>(n));
+            CUDA_CHECK(cudaDeviceSynchronize());
+            mtp_fc_f32_.data = reinterpret_cast<const uint8_t*>(dst);
+            mtp_fc_f32_.q = QuantKind::F32;
+            mtp_fc_f32_.scale = nullptr;
+        }
+        std::fprintf(stderr, "mtp_fc_load src=%d,%d q=%d gpu=%dx%d q=%d f32=%d nbytes=%llu attn=perhead+rot_half_if_hd64 hd=%d rotary=%d\n",
+                     static_cast<int>(fc->shape[0]), static_cast<int>(fc->shape[1]),
+                     static_cast<int>(fc->quant), mtp_fc_.rows, mtp_fc_.cols, static_cast<int>(mtp_fc_.q),
+                     mtp_fc_f32_.q == QuantKind::F32 ? 1 : 0, static_cast<unsigned long long>(fc->nbytes),
+                     mtp_L_.hd, mtp_L_.rotary);
+        d_mtp_nh_ = upload_f32(*nh);
+        d_mtp_ne_ = upload_f32(*ne);
+        d_mtp_nn_ = upload_f32(*nn);
+        mtp_L_.attn_norm = upload_f32(must("mtp.layers[0].attn_norm"));
+        mtp_L_.ffn_norm = upload_f32(must("mtp.layers[0].ffn_norm"));
+        const TensorDesc& wd = must("mtp.layers[0].mlp.down");
+        mtp_L_.inter = wd.shape[1] > 0 ? static_cast<int>(wd.shape[1]) : store_->model().intermediate;
+        // Keep GGUF MTP weights packed (same GEMV as the trunk). F32 dequant
+        // of the NextN block drifted drafts away from Q4 greedy.
+        auto upload_mtp_w = [&](const TensorDesc& t, int rows, int cols) -> GpuW {
+            return upload_w(t, rows, cols);
+        };
+        mtp_L_.wg = upload_mtp_w(must("mtp.layers[0].mlp.gate"), mtp_L_.inter, hidden_);
+        mtp_L_.wu = upload_mtp_w(must("mtp.layers[0].mlp.up"), mtp_L_.inter, hidden_);
+        mtp_L_.wd = upload_mtp_w(wd, hidden_, mtp_L_.inter);
+        const int qg = mtp_L_.nq * mtp_L_.hd * 2;
+        const int kn = mtp_L_.nkv * mtp_L_.hd;
+        const int qn = mtp_L_.nq * mtp_L_.hd;
+        mtp_L_.wq = upload_mtp_w(must("mtp.layers[0].attn.wq"), qg, hidden_);
+        mtp_L_.wk = upload_mtp_w(must("mtp.layers[0].attn.wk"), kn, hidden_);
+        mtp_L_.wv = upload_mtp_w(must("mtp.layers[0].attn.wv"), kn, hidden_);
+        mtp_L_.wo_a = upload_mtp_w(must("mtp.layers[0].attn.wo"), hidden_, qn);
+        mtp_L_.q_norm = upload_f32(must("mtp.layers[0].attn.q_norm"));
+        mtp_L_.k_norm = upload_f32(must("mtp.layers[0].attn.k_norm"));
+        std::fprintf(stderr,
+                     "mtp_w q wq=%d wk=%d wv=%d wo=%d wg=%d wu=%d wd=%d km_wo=%d km_wd=%d inter=%d "
+                     "src_wq=%d src_wo=%d src_wd=%d\n",
+                     static_cast<int>(mtp_L_.wq.q), static_cast<int>(mtp_L_.wk.q), static_cast<int>(mtp_L_.wv.q),
+                     static_cast<int>(mtp_L_.wo_a.q), static_cast<int>(mtp_L_.wg.q), static_cast<int>(mtp_L_.wu.q),
+                     static_cast<int>(mtp_L_.wd.q), mtp_L_.wo_a.fp8_kmajor ? 1 : 0, mtp_L_.wd.fp8_kmajor ? 1 : 0,
+                     mtp_L_.inter, static_cast<int>(must("mtp.layers[0].attn.wq").quant),
+                     static_cast<int>(must("mtp.layers[0].attn.wo").quant),
+                     static_cast<int>(must("mtp.layers[0].mlp.down").quant));
+
+        if (mtp_L_.inter > max_inter_) {
+            max_inter_ = mtp_L_.inter;
+            d_gate_mlp_ = static_cast<float*>(alloc(sizeof(float) * max_inter_));
+            d_up_ = static_cast<float*>(alloc(sizeof(float) * max_inter_));
+        }
+        if (qn > max_qn_) {
+            max_qn_ = qn;
+            d_qg_ = static_cast<float*>(alloc(sizeof(float) * max_qn_ * 2));
+            d_q_ = static_cast<float*>(alloc(sizeof(float) * max_qn_));
+            d_gate_ = static_cast<float*>(alloc(sizeof(float) * max_qn_));
+            d_o_ = static_cast<float*>(alloc(sizeof(float) * std::max(std::max(max_z_, max_qn_), 1)));
+        }
+        if (kn > max_kn_) {
+            max_kn_ = kn;
+            d_k_ = static_cast<float*>(alloc(sizeof(float) * max_kn_));
+            d_vtmp_ = static_cast<float*>(alloc(sizeof(float) * max_kn_));
+        }
+
+        d_mtp_h_ = static_cast<float*>(alloc(sizeof(float) * hidden_));
+        d_mtp_cat_ = static_cast<float*>(alloc(sizeof(float) * hidden_ * 2));
+        d_mtp_kc_ = static_cast<float*>(alloc(sizeof(float) * kMtpCap * std::max(kn, 1)));
+        d_mtp_vc_ = static_cast<float*>(alloc(sizeof(float) * kMtpCap * std::max(kn, 1)));
+        d_mtp_hh_ = static_cast<float*>(alloc(sizeof(float) * kMtpCap * hidden_));
+        d_mtp_post_ = static_cast<float*>(alloc(sizeof(float) * hidden_));
+        d_mtp_hin_ = static_cast<float*>(alloc(sizeof(float) * hidden_));
+        d_mtp_tok_ = static_cast<int*>(alloc(4));
+        d_mtp_pos_ = static_cast<int*>(alloc(4));
+        mtp_hids_.assign(static_cast<size_t>(kMtpCap), 0);
+        mtp_hist_n_ = 0;
+        has_mtp_ = true;
+        std::fprintf(stderr, "mtp_cuda=1 nq=%d nkv=%d hd=%d inter=%d fc=%dx%d q=%d\n", mtp_L_.nq, mtp_L_.nkv,
+                     mtp_L_.hd, mtp_L_.inter, mtp_fc_.rows, mtp_fc_.cols, static_cast<int>(mtp_fc_.q));
+        maybe_capture_mtp();
     }
 
     void embed_batch(int T) {
@@ -9209,6 +14510,7 @@ private:
     }
 
     void launch_rms_batch(const float* x, const float* g, float* y, int n, int T, float eps) {
+        note_x_written();
         const int th = n >= 1024 ? 256 : 128;
         rmsnorm_batch_k<<<T, th>>>(x, g, y, n, T, eps);
     }
@@ -9219,6 +14521,7 @@ private:
             use_xe(y, T, n);
             return;
         }
+        note_x_written();
         const int th = n >= 1024 ? 256 : 128;
         rmsnorm_xe_batch_k<<<T, th>>>(x, g, y, g_xe_buf, n, T, eps);
         g_xe = g_xe_buf;
@@ -9255,11 +14558,11 @@ private:
 
     void store_tq_kv(const GpuLayer& L, const float* ksrc, const float* vsrc, int pos0, int T) {
         if (!kv_tq_ || L.hd != 256 || T <= 0) return;
-        store_k_q8_th_k<<<dim3(L.nkv, T), 256>>>(k_q8_slot(L.slot), k_sc_slot(L.slot), ksrc, pos0, T, L.nkv,
-                                                 L.hd);
+        store_k_q8_th_k<<<dim3(L.nkv, T), 256>>>(k_q8_slot(L.slot, pf_slot_), k_sc_slot(L.slot, pf_slot_), ksrc,
+                                                 pos0, T, L.nkv, L.hd);
         const int nblk = L.hd / kTqBlk;
         store_v_tq3_th_k<<<dim3(nblk, L.nkv, T), 128, kTqBlk * sizeof(float)>>>(
-            v_qs_slot(L.slot), v_sc_slot(L.slot), vsrc, pos0, T, L.nkv, L.hd);
+            v_qs_slot(L.slot, pf_slot_), v_sc_slot(L.slot, pf_slot_), vsrc, pos0, T, L.nkv, L.hd);
     }
 
     void dequant_tq_to_h(__half* kc, __half* vc, const GpuLayer& L, int tend) {
@@ -9275,6 +14578,26 @@ private:
         const ModelDesc& m = store_->model();
         embed_batch(T);
         apply_vision_chunk(pos0, T);
+        static int pf_hs_once = 0;
+        const bool dump_hs = !capturing_ && hidden_ >= 64 && T <= 8 && pos0 == 0 && pf_hs_once == 0;
+        auto hs_write = [&](const char* tag, const float* p, int n, int ntok) {
+            std::vector<float> h(static_cast<size_t>(n) * static_cast<size_t>(ntok));
+            CUDA_CHECK(cudaMemcpy(h.data(), p, sizeof(float) * h.size(), cudaMemcpyDeviceToHost));
+            for (int t = 0; t < ntok; ++t) {
+                double s = 0;
+                const float* xt = h.data() + static_cast<size_t>(t) * n;
+                for (int i = 0; i < n; ++i) s += static_cast<double>(xt[i]) * xt[i];
+                std::fprintf(stderr, "pf_hs %s t=%d n=%d l2=%.4f\n", tag, t, n, std::sqrt(s));
+            }
+            char path[256];
+            std::snprintf(path, sizeof(path), "/home/znsoft/RapidLLM/build/rl_h_%s.bin", tag);
+            if (FILE* f = std::fopen(path, "wb")) {
+                std::fwrite(h.data(), sizeof(float), h.size(), f);
+                std::fclose(f);
+            }
+        };
+        if (dump_hs) hs_write("emb", d_h_seq_, hidden_, T);
+        int li = 0;
         const bool prof = !capturing_ && std::getenv("RAPIDLLM_PF_PROFILE") &&
                           std::getenv("RAPIDLLM_PF_PROFILE")[0] == '1';
         cudaEvent_t ev0 = nullptr, ev1 = nullptr;
@@ -9296,15 +14619,21 @@ private:
         };
         for (GpuLayer& L : layers_) {
             launch_rms_xe(d_h_seq_, L.attn_norm, d_xn_seq_, hidden_, T, L.eps);
+            if (dump_hs && li == 0) hs_write("xn0", d_xn_seq_, hidden_, T);
             if (L.kind == LayerKind::GatedDeltaNet) {
                 const int qdim = L.nk * L.dk;
                 const int qkv_dim = qdim * 2 + L.nv * L.dv;
                 const int zdim = L.nv * L.dv;
                 mark(ev0);
                 launch_linear_pair(L.wqkv, L.wz, d_xn_seq_, d_qkv_seq_, d_z_seq_, T);
+                if (dump_hs && li == 0) {
+                    hs_write("qkv0", d_qkv_seq_, qkv_dim, T);
+                    hs_write("z0", d_z_seq_, zdim, T);
+                }
                 mark(ev1);
                 acc(ms_lin);
-                float* conv_st = d_conv_ + static_cast<size_t>(L.slot) * qkv_dim * L.conv_k;
+                float* conv_st =
+                    d_conv_ + (static_cast<size_t>(pf_slot_) * n_delta_ + L.slot) * qkv_dim * L.conv_k;
                 const int cth = 32;
                 const int cbl = (qkv_dim + 63) / 64;
                 const bool ov_left = T >= 256 && g_bak_stream && !capturing_;
@@ -9328,7 +14657,7 @@ private:
                     acc(ms_conv);
                 } else {
                     launch_gemm_fp8_dual(L.wa, L.wb, d_xn_seq_, d_aa_seq_, d_bb_seq_, T, 0);
-                    if (g_blas) cublasSetStream(g_blas, cudaStreamPerThread);
+                    if (g_blas && !capturing_) cublasSetStream(g_blas, cudaStreamPerThread);
                     mark(ev1);
                     acc(ms_left);
                     mark(ev0);
@@ -9341,21 +14670,26 @@ private:
                     mark(ev1);
                     acc(ms_conv);
                 }
+                if (dump_hs && li == 0) {
+                    hs_write("aa_raw", d_aa_seq_, L.nv, T);
+                    hs_write("bb_raw", d_bb_seq_, L.nv, T);
+                }
                 mark(ev0);
-                uint16_t* S = d_S_ + static_cast<size_t>(L.slot) * L.nv * L.dk * L.dv;
+                uint16_t* S =
+                    d_S_ + (static_cast<size_t>(pf_slot_) * n_delta_ + L.slot) * L.nv * L.dk * L.dv;
                 launch_gdn(d_mix_seq_, d_aa_seq_, d_bb_seq_, S, L.A_log, L.dt_bias, d_o_seq_, T, L.nk, L.nv,
                            L.dk, L.dv, qkv_dim);
-                if (T >= 16 && g_xe_buf && T * zdim <= g_xe_cap) {
-                    gated_rms_xe_batch_k<<<T, 256>>>(d_o_seq_, d_z_seq_, L.gnorm, d_og_seq_, g_xe_buf, zdim, T,
-                                                     1e-6f, L.gnorm_n);
-                    g_xe = g_xe_buf;
-                    g_xe_n = zdim;
-                    g_xe_T = T;
-                } else {
-                    gated_rms_batch_k<<<T, 256>>>(d_o_seq_, d_z_seq_, L.gnorm, d_og_seq_, zdim, T, 1e-6f,
-                                                  L.gnorm_n);
-                    use_xe(d_og_seq_, T, zdim);
+                if (dump_hs && li == 0) {
+                    hs_write("aa0", d_aa_seq_, L.nv, T);
+                    hs_write("bb0", d_bb_seq_, L.nv, T);
+                    hs_write("mix0", d_mix_seq_, qkv_dim, T);
+                    hs_write("gdn0_o", d_o_seq_, zdim, T);
+                    std::fprintf(stderr, "pf_hs gnorm_n=%d zdim=%d dv=%d nv=%d nk=%d dk=%d wa_q=%d wb_q=%d wqkv_q=%d\n",
+                                 L.gnorm_n, zdim, L.dv, L.nv, L.nk, L.dk, static_cast<int>(L.wa.q),
+                                 static_cast<int>(L.wb.q), static_cast<int>(L.wqkv.q));
                 }
+                launch_gated_rms_vec(d_o_seq_, d_z_seq_, L.gnorm, d_og_seq_, zdim, T, 1e-6f, L.gnorm_n);
+                use_xe(d_og_seq_, T, zdim);
                 mark(ev1);
                 acc(ms_gdn);
                 mark(ev0);
@@ -9371,7 +14705,7 @@ private:
                 mark(ev1);
                 acc(ms_lin);
                 dim3 sg((qn + 255) / 256, T);
-                split_qg_batch_k<<<sg, 256>>>(d_qg_seq_, d_q_seq_, d_gate_seq_, qn, T);
+                split_qg_batch_k<<<sg, 256>>>(d_qg_seq_, d_q_seq_, d_gate_seq_, L.nq, L.hd, T);
                 dim3 hg(L.nq, T);
                 head_rms_batch_k<<<hg, 32>>>(d_q_seq_, L.q_norm, L.nq, L.hd, T, L.eps);
                 dim3 hkg(L.nkv, T);
@@ -9386,9 +14720,9 @@ private:
                 const bool gqa = L.hd == 256 && T >= 32 && rep >= 2 && rep <= 8;
                 if (kv_f16_ && L.hd == 256) {
                     __half* kc = reinterpret_cast<__half*>(d_kcache_) +
-                                 static_cast<size_t>(L.slot) * kv_stride() * kn;
+                                 (static_cast<size_t>(pf_slot_) * n_attn_ + L.slot) * kv_stride() * kn;
                     __half* vc = reinterpret_cast<__half*>(d_vcache_) +
-                                 static_cast<size_t>(L.slot) * kv_stride() * kn;
+                                 (static_cast<size_t>(pf_slot_) * n_attn_ + L.slot) * kv_stride() * kn;
                     if (tend <= kv_win_) {
                         store_kv_batch_h_k<<<kg, 128>>>(kc, d_k_seq_, pos0, T, kn);
                         store_kv_batch_h_k<<<kg, 128>>>(vc, d_v_seq_, pos0, T, kn);
@@ -9397,8 +14731,12 @@ private:
                     const size_t sc_cap = static_cast<size_t>(pf_cap_) * static_cast<size_t>(std::max(L.inter, 1));
                     if (kv_tq_ && tend > kv_win_ && L.hd == 256) {
                         attn_prefill_tq_gqa_k<<<dim3(L.nkv, T), 256>>>(
-                            d_q_seq_, d_o_seq_, pos0, T, L.nq, L.nkv, L.hd, k_q8_slot(L.slot),
-                            k_sc_slot(L.slot), v_qs_slot(L.slot), v_sc_slot(L.slot));
+                            d_q_seq_, d_o_seq_, pos0, T, L.nq, L.nkv, L.hd, k_q8_slot(L.slot, pf_slot_),
+                            k_sc_slot(L.slot, pf_slot_), v_qs_slot(L.slot, pf_slot_),
+                            v_sc_slot(L.slot, pf_slot_));
+                    } else if (fi_pf_ && T >= 16 &&
+                               fi_prefill_gqa(d_q_seq_, kc, vc, d_o_seq_, T, tend, L.nq, L.nkv, L.hd,
+                                              d_gate_mlp_seq_, sc_cap)) {
                     } else if (gqa && T >= 64 &&
                         launch_attn_gqa_gemm(d_q_seq_, kc, vc, d_o_seq_, d_gate_mlp_seq_, sc_cap, d_up_seq_,
                                              sc_cap, pos0, T, L.nq, L.nkv, L.hd)) {
@@ -9416,19 +14754,14 @@ private:
                     else if (T >= 32)
                         attn_prefill_qtile_h_k<4><<<dim3(L.nq, (T + 3) / 4), 32>>>(
                             d_q_seq_, kc, vc, d_o_seq_, pos0, T, L.nq, L.nkv, L.hd);
-                    else if (tend >= 64)
-                        attn_prefill_warp_k<<<ag, 32>>>(d_q_seq_, reinterpret_cast<float*>(kc),
-                                                        reinterpret_cast<float*>(vc), d_o_seq_, pos0, T, L.nq,
-                                                        L.nkv, L.hd);
                     else {
-                        const size_t sm = tend > 8192 ? 0 : static_cast<size_t>(tend) * sizeof(float);
-                        attn_prefill_k<<<ag, tend > 8192 ? 128 : 32, sm>>>(
-                            d_q_seq_, reinterpret_cast<float*>(kc), reinterpret_cast<float*>(vc), d_o_seq_, pos0,
-                            T, L.nq, L.nkv, L.hd);
+                        const size_t sm = static_cast<size_t>(tend) * sizeof(float);
+                        attn_prefill_h_k<<<ag, 32, sm>>>(d_q_seq_, kc, vc, d_o_seq_, pos0, T, L.nq, L.nkv,
+                                                          L.hd);
                     }
                 } else {
-                float* kc = d_kcache_ + static_cast<size_t>(L.slot) * ctx_ * kn;
-                float* vc = d_vcache_ + static_cast<size_t>(L.slot) * ctx_ * kn;
+                float* kc = d_kcache_ + (static_cast<size_t>(pf_slot_) * n_attn_ + L.slot) * ctx_ * kn;
+                float* vc = d_vcache_ + (static_cast<size_t>(pf_slot_) * n_attn_ + L.slot) * ctx_ * kn;
                 store_kv_batch_k<<<kg, 128>>>(kc, d_k_seq_, pos0, T, kn);
                 store_kv_batch_k<<<kg, 128>>>(vc, d_v_seq_, pos0, T, kn);
                 if (gqa) {
@@ -9473,6 +14806,16 @@ private:
             launch_linear(L.wd, d_gate_mlp_seq_, d_h_seq_, T, 1);
             mark(ev1);
             acc(ms_mlp);
+            if (dump_hs && (li <= 7 || li == 15 || li == 31 || li == 63)) {
+                char tag[16];
+                std::snprintf(tag, sizeof(tag), "l%d", li);
+                hs_write(tag, d_h_seq_, hidden_, T);
+            }
+            ++li;
+        }
+        if (dump_hs) {
+            hs_write("lfin", d_h_seq_, hidden_, T);
+            pf_hs_once = 1;
         }
         if (prof) {
             std::fprintf(stderr,
@@ -9500,12 +14843,31 @@ private:
         if (nblk <= 0 || T <= 0) return;
         dim3 grid(nblk, T);
         argmax_partial_rows_k<<<grid, th>>>(d_logits_, vocab_, vocab_, d_amax_, d_aidx_);
-        argmax_final_rows_k<<<1, 32>>>(d_amax_, d_aidx_, nblk, T, d_best_n_);
+        const int nth = 128;
+        const int ntb = (T + nth - 1) / nth;
+        argmax_final_rows_k<<<ntb, nth>>>(d_amax_, d_aidx_, nblk, T, d_best_n_);
     }
 
     // Mid-decode T-token chunk: pos from d_pos_, always conv-upd, attn smem = ctx_.
     void launch_spec_chunk(int T) {
         const ModelDesc& m = store_->model();
+        cudaEvent_t ev0 = nullptr, ev1 = nullptr;
+        const bool prof = g_spec_prof;
+        if (prof) {
+            cudaEventCreate(&ev0);
+            cudaEventCreate(&ev1);
+        }
+        auto mark0 = [&]() {
+            if (prof) cudaEventRecord(ev0, cudaStreamPerThread);
+        };
+        auto acc = [&](float& dst) {
+            if (!prof) return;
+            cudaEventRecord(ev1, cudaStreamPerThread);
+            cudaEventSynchronize(ev1);
+            float ms = 0;
+            cudaEventElapsedTime(&ms, ev0, ev1);
+            dst += ms;
+        };
         embed_batch(T);
         for (GpuLayer& L : layers_) {
             launch_rms_batch(d_h_seq_, L.attn_norm, d_xn_seq_, hidden_, T, L.eps);
@@ -9514,45 +14876,165 @@ private:
                 const int qdim = L.nk * L.dk;
                 const int qkv_dim = qdim * 2 + L.nv * L.dv;
                 const int zdim = L.nv * L.dv;
+                mark0();
                 launch_linear_pair(L.wqkv, L.wz, d_xn_seq_, d_qkv_seq_, d_z_seq_, T);
                 launch_gemm_fp8_dual(L.wa, L.wb, d_xn_seq_, d_aa_seq_, d_bb_seq_, T, 0);
+                acc(g_spec_ms_lin);
                 float* conv_st = d_conv_ + static_cast<size_t>(L.slot) * qkv_dim * L.conv_k;
-                conv1d_upd_seq_k<<<(qkv_dim + 63) / 64, 32>>>(d_qkv_seq_, L.conv_w, conv_st, d_mix_seq_, T,
-                                                              qkv_dim, L.conv_k);
                 uint16_t* S = d_S_ + static_cast<size_t>(L.slot) * L.nv * L.dk * L.dv;
-                launch_gdn(d_mix_seq_, d_aa_seq_, d_bb_seq_, S, L.A_log, L.dt_bias, d_o_seq_, T, L.nk, L.nv,
-                           L.dk, L.dv, qkv_dim);
-                gated_rms_batch_k<<<T, 256>>>(d_o_seq_, d_z_seq_, L.gnorm, d_og_seq_, zdim, T, 1e-6f, L.gnorm_n);
+                mark0();
+                // T sequential T=1 GDN (same kernel as decode). Prefill split2/steps
+                // disagree with decode on T=3 (pred0=220) and can desync S.
+                if (L.dk == 128 && L.dv == 128 && L.conv_k == 4) {
+                    const int sm = gdn_dyn_smem(L.dk, L.dv);
+                    if (T >= 2 && T <= 6 && T != 5) {
+                        uint16_t* Sb = d_S_bak_
+                                           ? d_S_bak_ + static_cast<size_t>(L.slot) * L.nv * L.dk * L.dv
+                                           : nullptr;
+                        float* conv_b = d_conv_bak_
+                                            ? d_conv_bak_ + static_cast<size_t>(L.slot) * qkv_dim * L.conv_k
+                                            : nullptr;
+                        if (T == 2)
+                            gdn_decode_tn_k<2><<<L.nv, 256, sm>>>(
+                                d_aa_seq_, d_bb_seq_, S, L.A_log, L.dt_bias, d_o_seq_, L.nk, L.nv, d_qkv_seq_,
+                                L.conv_w, conv_st, Sb, conv_b, qkv_dim);
+                        else if (T == 3)
+                            gdn_decode_tn_k<3><<<L.nv, 256, sm>>>(
+                                d_aa_seq_, d_bb_seq_, S, L.A_log, L.dt_bias, d_o_seq_, L.nk, L.nv, d_qkv_seq_,
+                                L.conv_w, conv_st, Sb, conv_b, qkv_dim);
+                        else if (T == 4) {
+                            // Two proven T=2 GDN (mid-k failed graph capture). Mid
+                            // snap = persist S/conv after t0+d0; no T=2 replay.
+                            gdn_decode_tn_k<2><<<L.nv, 256, sm>>>(
+                                d_aa_seq_, d_bb_seq_, S, L.A_log, L.dt_bias, d_o_seq_, L.nk, L.nv, d_qkv_seq_,
+                                L.conv_w, conv_st, Sb, conv_b, qkv_dim);
+                            if (d_S_mid_ && d_conv_mid_) {
+                                uint16_t* Sm = d_S_mid_ + static_cast<size_t>(L.slot) * L.nv * L.dk * L.dv;
+                                float* Cm = d_conv_mid_ + static_cast<size_t>(L.slot) * qkv_dim * L.conv_k;
+                                const size_t s_n =
+                                    sizeof(uint16_t) * static_cast<size_t>(L.nv) * L.dk * L.dv;
+                                const size_t c_n = sizeof(float) * static_cast<size_t>(qkv_dim) * L.conv_k;
+                                CUDA_CHECK(cudaMemcpyAsync(Sm, S, s_n, cudaMemcpyDeviceToDevice,
+                                                           cudaStreamPerThread));
+                                CUDA_CHECK(cudaMemcpyAsync(Cm, conv_st, c_n, cudaMemcpyDeviceToDevice,
+                                                           cudaStreamPerThread));
+                            }
+                            gdn_decode_tn_k<2><<<L.nv, 256, sm>>>(
+                                d_aa_seq_ + static_cast<size_t>(2) * L.nv,
+                                d_bb_seq_ + static_cast<size_t>(2) * L.nv, S, L.A_log, L.dt_bias,
+                                d_o_seq_ + static_cast<size_t>(2) * zdim, L.nk, L.nv,
+                                d_qkv_seq_ + static_cast<size_t>(2) * qkv_dim, L.conv_w, conv_st, nullptr,
+                                nullptr, qkv_dim);
+                        }
+                        else
+                            gdn_decode_tn_k<6><<<L.nv, 256, sm>>>(
+                                d_aa_seq_, d_bb_seq_, S, L.A_log, L.dt_bias, d_o_seq_, L.nk, L.nv, d_qkv_seq_,
+                                L.conv_w, conv_st, Sb, conv_b, qkv_dim);
+                        if (Sb && conv_b) spec_t0_snap_ = true;
+                    } else if (T == 12) {
+                        // Two proven T=6 GDN (do not instantiate <12>). Snap only on first half.
+                        uint16_t* Sb = d_S_bak_
+                                           ? d_S_bak_ + static_cast<size_t>(L.slot) * L.nv * L.dk * L.dv
+                                           : nullptr;
+                        float* conv_b = d_conv_bak_
+                                            ? d_conv_bak_ + static_cast<size_t>(L.slot) * qkv_dim * L.conv_k
+                                            : nullptr;
+                        gdn_decode_tn_k<6><<<L.nv, 256, sm>>>(
+                            d_aa_seq_, d_bb_seq_, S, L.A_log, L.dt_bias, d_o_seq_, L.nk, L.nv, d_qkv_seq_,
+                            L.conv_w, conv_st, Sb, conv_b, qkv_dim);
+                        gdn_decode_tn_k<6><<<L.nv, 256, sm>>>(
+                            d_aa_seq_ + static_cast<size_t>(6) * L.nv, d_bb_seq_ + static_cast<size_t>(6) * L.nv,
+                            S, L.A_log, L.dt_bias, d_o_seq_ + static_cast<size_t>(6) * zdim, L.nk, L.nv,
+                            d_qkv_seq_ + static_cast<size_t>(6) * qkv_dim, L.conv_w, conv_st, nullptr, nullptr,
+                            qkv_dim);
+                        if (Sb && conv_b) spec_t0_snap_ = true;
+                    } else {
+                        // Other T: sequential T=1.
+                        for (int t = 0; t < T; ++t) {
+                            gdn_decode_t1_k<<<L.nv, 256, sm>>>(
+                                d_aa_seq_ + static_cast<size_t>(t) * L.nv,
+                                d_bb_seq_ + static_cast<size_t>(t) * L.nv, S, L.A_log, L.dt_bias,
+                                d_o_seq_ + static_cast<size_t>(t) * zdim, L.nk, L.nv,
+                                d_qkv_seq_ + static_cast<size_t>(t) * qkv_dim, L.conv_w, conv_st, nullptr, 0,
+                                0, 0, 0, 0, 0);
+                            if (t == 0 && T >= 2 && d_S_bak_ && d_conv_bak_) {
+                                uint16_t* Sb = d_S_bak_ + static_cast<size_t>(L.slot) * L.nv * L.dk * L.dv;
+                                float* conv_b = d_conv_bak_ + static_cast<size_t>(L.slot) * qkv_dim * L.conv_k;
+                                const size_t s_n = sizeof(uint16_t) * static_cast<size_t>(L.nv) * L.dk * L.dv;
+                                const size_t c_n = sizeof(float) * static_cast<size_t>(qkv_dim) * L.conv_k;
+                                CUDA_CHECK(cudaMemcpyAsync(Sb, S, s_n, cudaMemcpyDeviceToDevice,
+                                                           cudaStreamPerThread));
+                                CUDA_CHECK(cudaMemcpyAsync(conv_b, conv_st, c_n, cudaMemcpyDeviceToDevice,
+                                                           cudaStreamPerThread));
+                                spec_t0_snap_ = true;
+                            }
+                        }
+                    }
+                } else {
+                    conv1d_upd_seq_k<<<(qkv_dim + 63) / 64, 32>>>(d_qkv_seq_, L.conv_w, conv_st, d_mix_seq_, T,
+                                                                  qkv_dim, L.conv_k);
+                    launch_gdn(d_mix_seq_, d_aa_seq_, d_bb_seq_, S, L.A_log, L.dt_bias, d_o_seq_, T, L.nk,
+                               L.nv, L.dk, L.dv, qkv_dim);
+                }
+                launch_gated_rms_vec(d_o_seq_, d_z_seq_, L.gnorm, d_og_seq_, zdim, T, 1e-6f, L.gnorm_n);
+                acc(g_spec_ms_gdn);
                 use_xe(d_og_seq_, T, zdim);
+                mark0();
                 launch_linear(L.wo, d_og_seq_, d_h_seq_, T, 1);
+                acc(g_spec_ms_lin);
             } else {
                 const int qn = L.nq * L.hd;
                 const int kn = L.nkv * L.hd;
+                mark0();
                 launch_linear_pair(L.wq, L.wk, d_xn_seq_, d_qg_seq_, d_k_seq_, T);
                 launch_linear(L.wv, d_xn_seq_, d_v_seq_, T);
+                acc(g_spec_ms_lin);
                 dim3 sg((qn + 255) / 256, T);
-                split_qg_batch_k<<<sg, 256>>>(d_qg_seq_, d_q_seq_, d_gate_seq_, qn, T);
-                dim3 hg(L.nq, T);
-                head_rms_batch_k<<<hg, 32>>>(d_q_seq_, L.q_norm, L.nq, L.hd, T, L.eps);
-                dim3 hkg(L.nkv, T);
-                head_rms_batch_k<<<hkg, 32>>>(d_k_seq_, L.k_norm, L.nkv, L.hd, T, L.eps);
-                dim3 rg(2, std::max(L.nq, L.nkv), T);
-                rope_batch_dp_k<<<rg, 32>>>(d_q_seq_, d_k_seq_, L.nq, L.nkv, L.hd, L.rotary, d_pos_, T, L.theta);
-                float* kc = d_kcache_ + static_cast<size_t>(L.slot) * ctx_ * kn;
-                float* vc = d_vcache_ + static_cast<size_t>(L.slot) * ctx_ * kn;
-                dim3 kg((kn + 127) / 128, T);
-                store_kv_batch_dp_k<<<kg, 128>>>(kc, d_k_seq_, d_pos_, T, kn);
-                store_kv_batch_dp_k<<<kg, 128>>>(vc, d_v_seq_, d_pos_, T, kn);
-                const size_t sm = ctx_ > 8192 ? 0 : static_cast<size_t>(ctx_) * sizeof(float);
-                dim3 ag(L.nq, T);
-                attn_prefill_dp_k<<<ag, ctx_ > 8192 ? 128 : 32, sm>>>(d_q_seq_, kc, vc, d_o_seq_, d_pos_, T, L.nq,
-                                                                      L.nkv, L.hd);
+                split_qg_batch_k<<<sg, 256>>>(d_qg_seq_, d_q_seq_, d_gate_seq_, L.nq, L.hd, T);
+                float* kc =
+                    kv_f16_ && L.hd == 256
+                        ? reinterpret_cast<float*>(reinterpret_cast<__half*>(d_kcache_) +
+                                                   static_cast<size_t>(L.slot) * kv_stride() * kn)
+                        : d_kcache_ + static_cast<size_t>(L.slot) * kv_stride() * kn;
+                float* vc =
+                    kv_f16_ && L.hd == 256
+                        ? reinterpret_cast<float*>(reinterpret_cast<__half*>(d_vcache_) +
+                                                   static_cast<size_t>(L.slot) * kv_stride() * kn)
+                        : d_vcache_ + static_cast<size_t>(L.slot) * kv_stride() * kn;
+                const int kctx = ctx_;
+                const int kv_mode = (kv_f16_ && L.hd == 256) ? 1 : 0;
+                const size_t sm = decode_attn_smem(kctx, L.hd, kv_mode);
+                const int ath = L.hd >= 256 ? 256 : 128;
+                mark0();
+                // Device positions (filled by spec_verify). A host pos0
+                // captured into the CUDA graph was always 0 on replay.
+                for (int t = 0; t < T; ++t) {
+                    int* pt = d_pos_b_ ? (d_pos_b_ + t) : d_pos_;
+                    if (!d_pos_b_) set_pos_k<<<1, 1>>>(d_pos_, pos_ + t);
+                    if (kv_mode == 1 && flash_gqa_ok(L.nq, L.nkv, L.hd, 1)) {
+                        qk_attn_decode_gqa_k<<<dim3(L.nkv, L.nq / L.nkv), 256, sm>>>(
+                            d_q_seq_ + static_cast<size_t>(t) * qn, d_k_seq_ + static_cast<size_t>(t) * kn,
+                            d_v_seq_ + static_cast<size_t>(t) * kn, L.q_norm, L.k_norm, kc, vc,
+                            d_o_seq_ + static_cast<size_t>(t) * qn, pt, L.nq, L.nkv, L.hd, L.rotary,
+                            L.theta, L.eps, kctx);
+                        continue;
+                    }
+                    qk_attn_decode_k<<<L.nq, ath, sm>>>(
+                        d_q_seq_ + static_cast<size_t>(t) * qn, d_k_seq_ + static_cast<size_t>(t) * kn,
+                        d_v_seq_ + static_cast<size_t>(t) * kn, L.q_norm, L.k_norm, kc, vc,
+                        d_o_seq_ + static_cast<size_t>(t) * qn, pt, L.nq, L.nkv, L.hd, L.rotary, L.theta,
+                        L.eps, kctx, kv_mode, nullptr, nullptr, nullptr, nullptr, 0, 0, 0);
+                }
                 apply_gate_n_k<<<(qn * T + 255) / 256, 256>>>(d_o_seq_, d_gate_seq_, qn * T);
+                acc(g_spec_ms_attn);
                 use_xe(d_o_seq_, T, qn);
+                mark0();
                 launch_linear(L.wo_a, d_o_seq_, d_h_seq_, T, 1);
+                acc(g_spec_ms_lin);
             }
             launch_rms_batch(d_h_seq_, L.ffn_norm, d_xn_seq_, hidden_, T, m.rms_eps);
             use_xe(d_xn_seq_, T, hidden_);
+            mark0();
             if (T >= 16) {
                 launch_gemm_fp8_dual(L.wg, L.wu, d_xn_seq_, d_gate_mlp_seq_, d_up_seq_, T, 0);
                 use_swiglu_xe(d_gate_mlp_seq_, d_up_seq_, T, L.inter);
@@ -9560,11 +15042,18 @@ private:
                 launch_gemm_fp8_dual(L.wg, L.wu, d_xn_seq_, d_gate_mlp_seq_, d_up_seq_, T, 1);
             }
             launch_linear(L.wd, d_gate_mlp_seq_, d_h_seq_, T, 1);
+            acc(g_spec_ms_mlp);
         }
         launch_rms_batch(d_h_seq_, d_final_norm_, d_xn_seq_, hidden_, T, store_->model().rms_eps);
         use_xe(d_xn_seq_, T, hidden_);
+        mark0();
         launch_linear(lm_head_, d_xn_seq_, d_logits_, T);
         launch_argmax_rows(T);
+        acc(g_spec_ms_lm);
+        if (prof) {
+            cudaEventDestroy(ev0);
+            cudaEventDestroy(ev1);
+        }
     }
 
     void snap_last_residual(int last_T) {
@@ -9585,6 +15074,7 @@ private:
     }
 
     void launch_prefill(const int32_t* ids, int n) {
+        fi_pf_ = fi_available() && flash_attn_on();
         int pos0 = 0;
         int last_T = 0;
         while (pos0 < n) {
@@ -9646,26 +15136,26 @@ private:
                           : 0;
                 launch_gdn(nullptr, d_aa_, d_bb_, S, L.A_log, L.dt_bias, d_o_, 1, L.nk, L.nv, L.dk, L.dv,
                            qkv_dim, d_qkv_, L.conv_w, conv_st, L.conv_k, wo_pf, wo_pf_bytes);
-                const bool wo_grms = d_ss_ && L.wo.q == QuantKind::FP8_E4M3_B128 && L.wo.fp8_kmajor &&
-                                     L.wo.rows >= 4096 && L.wo.cols == zdim;
+                const bool per_head_grms =
+                    L.gnorm_n > 0 && L.gnorm_n < zdim && (zdim % L.gnorm_n) == 0 && zdim >= 256;
+                const bool wo_grms = !per_head_grms && d_ss_ && L.wo.q == QuantKind::FP8_E4M3_B128 &&
+                                     L.wo.fp8_kmajor && L.wo.rows >= 4096 && L.wo.cols == zdim;
                 if (wo_grms) {
                     launch_gemv(L.wo, d_o_, d_h_, 1, nullptr, L.gnorm, nullptr, 1e-6f, nullptr, nullptr, 0,
                                 d_z_, L.gnorm_n, 1);
                 } else {
-                    gated_rms_k<<<1, 256>>>(d_o_, d_z_, L.gnorm, d_og_, zdim, 1e-6f, L.gnorm_n);
+                    launch_gated_rms_vec(d_o_, d_z_, L.gnorm, d_og_, zdim, 1, 1e-6f, L.gnorm_n);
                     launch_gemv(L.wo, d_og_, d_h_, 1, nullptr, nullptr, nullptr, 0.f, nullptr, nullptr, 0,
                                 nullptr, 0, 1);
                 }
             } else {
                 const int qn = L.nq * L.hd;
                 const int kn = L.nkv * L.hd;
-                if (L.wq.q == QuantKind::FP8_E4M3_B128 && L.wq.fp8_kmajor && L.wq.rows >= 4096 &&
-                    L.wq.rows == qn * 2)
-                    launch_gemv(L.wq, xin, d_q_, 0, nullptr, xg, xss, xeps, nullptr, d_gate_, qn);
-                else {
-                    launch_gemv(L.wq, xin, d_qg_, 0, nullptr, xg, xss, xeps);
+                launch_gemv(L.wq, xin, d_qg_, 0, nullptr, xg, xss, xeps);
+                if (L.hd >= 64)
+                    split_qg_perhead_k<<<(qn + 255) / 256, 256>>>(d_qg_, d_q_, d_gate_, L.nq, L.hd);
+                else
                     split_qg_k<<<(qn + 255) / 256, 256>>>(d_qg_, d_q_, d_gate_, qn);
-                }
                 launch_gemv_dual(L.wk, L.wv, xin, d_k_, d_vtmp_, 0, xg, xss, xeps);
                 float* kc =
                     kv_f16_ && L.hd == 256
@@ -9681,16 +15171,20 @@ private:
                 // 16384 forces the online-softmax path (1 KiB smem) used at --ctx 163840.
                 // Passing kv_win_=8192 would allocate 33 KiB scores and drop occupancy.
                 const int kctx = use_win ? 16384 : ctx_;
-                const size_t sm = kctx > 8192 ? static_cast<size_t>(L.hd) * sizeof(float)
-                                              : (static_cast<size_t>(kctx) + static_cast<size_t>(L.hd)) *
-                                                    sizeof(float);
                 const int kv_mode =
                     (kv_tq_ && L.hd == 256 && !use_win) ? 3 : (kv_f16_ && L.hd == 256 ? 1 : 0);
-                qk_attn_decode_k<<<L.nq, L.hd >= 256 ? 256 : 128, sm>>>(
-                    d_q_, d_k_, d_vtmp_, L.q_norm, L.k_norm, kc, vc, d_o_, d_pos_, L.nq, L.nkv, L.hd,
-                    L.rotary, L.theta, L.eps, kctx, kv_mode, kv_tq_ ? k_q8_slot(L.slot) : nullptr,
-                    kv_tq_ ? k_sc_slot(L.slot) : nullptr, kv_tq_ ? v_qs_slot(L.slot) : nullptr,
-                    kv_tq_ ? v_sc_slot(L.slot) : nullptr);
+                const size_t sm = decode_attn_smem(kctx, L.hd, kv_mode == 1 ? 1 : 0);
+                if (kv_mode == 1 && flash_gqa_ok(L.nq, L.nkv, L.hd, 1)) {
+                    qk_attn_decode_gqa_k<<<dim3(L.nkv, L.nq / L.nkv), 256, sm>>>(
+                        d_q_, d_k_, d_vtmp_, L.q_norm, L.k_norm, kc, vc, d_o_, d_pos_, L.nq, L.nkv,
+                        L.hd, L.rotary, L.theta, L.eps, kctx);
+                } else {
+                    qk_attn_decode_k<<<L.nq, L.hd >= 256 ? 256 : 128, sm>>>(
+                        d_q_, d_k_, d_vtmp_, L.q_norm, L.k_norm, kc, vc, d_o_, d_pos_, L.nq, L.nkv, L.hd,
+                        L.rotary, L.theta, L.eps, kctx, kv_mode, kv_tq_ ? k_q8_slot(L.slot) : nullptr,
+                        kv_tq_ ? k_sc_slot(L.slot) : nullptr, kv_tq_ ? v_qs_slot(L.slot) : nullptr,
+                        kv_tq_ ? v_sc_slot(L.slot) : nullptr, 0, 0, 0);
+                }
                 if (kv_mode == 3)
                     qk_attn_decode_tq_gqa_k<<<L.nkv, 256>>>(d_q_, d_o_, d_pos_, L.nq, L.nkv, L.hd,
                                                             k_q8_slot(L.slot), k_sc_slot(L.slot),
@@ -9727,30 +15221,43 @@ private:
     void launch_decode_batch(int B) {
         embed_batch(B);
         const ModelDesc& m = store_->model();
+        // hpos0 only gates the TurboQuant F16 window. Short-ctx mixed (!kv_tq_)
+        // used to D2H-sync every step for a value it never read.
         int hpos0 = 0;
-        CUDA_CHECK(cudaMemcpy(&hpos0, d_pos_b_, 4, cudaMemcpyDeviceToHost));
+        if (kv_tq_) CUDA_CHECK(cudaMemcpy(&hpos0, d_pos_b_, 4, cudaMemcpyDeviceToHost));
         for (GpuLayer& L : layers_) {
             launch_rms_batch(d_h_seq_, L.attn_norm, d_xn_seq_, hidden_, B, L.eps);
             if (L.kind == LayerKind::GatedDeltaNet) {
                 const int qdim = L.nk * L.dk;
                 const int qkv_dim = qdim * 2 + L.nv * L.dv;
                 const int zdim = L.nv * L.dv;
-                launch_linear(L.wqkv, d_xn_seq_, d_qkv_seq_, B);
-                launch_linear(L.wz, d_xn_seq_, d_z_seq_, B);
+                launch_linear_pair(L.wqkv, L.wz, d_xn_seq_, d_qkv_seq_, d_z_seq_, B);
                 launch_gemm_fp8_dual(L.wa, L.wb, d_xn_seq_, d_aa_seq_, d_bb_seq_, B, 0);
-                for (int b = 0; b < B; ++b) {
-                    float* conv_st = d_conv_ + (static_cast<size_t>(b) * n_delta_ + L.slot) * qkv_dim * L.conv_k;
-                    conv1d_upd_k<<<(qkv_dim + 127) / 128, 128>>>(d_qkv_seq_ + static_cast<size_t>(b) * qkv_dim,
-                                                                 L.conv_w, conv_st,
-                                                                 d_mix_seq_ + static_cast<size_t>(b) * qkv_dim,
-                                                                 qkv_dim, L.conv_k);
-                    uint16_t* S = d_S_ + (static_cast<size_t>(b) * n_delta_ + L.slot) * L.nv * L.dk * L.dv;
-                    launch_gdn(d_mix_seq_ + static_cast<size_t>(b) * qkv_dim,
-                               d_aa_seq_ + static_cast<size_t>(b) * L.nv, d_bb_seq_ + static_cast<size_t>(b) * L.nv,
-                               S, L.A_log, L.dt_bias, d_o_seq_ + static_cast<size_t>(b) * zdim, 1, L.nk, L.nv,
-                               L.dk, L.dv, qkv_dim);
+                if (L.dk == 128 && L.dv == 128 && L.conv_k == 4) {
+                    const int sm = gdn_dyn_smem(L.dk, L.dv);
+                    uint16_t* S0 = d_S_ + (static_cast<size_t>(L.slot) * L.nv * L.dk * L.dv);
+                    float* conv0 = d_conv_ + (static_cast<size_t>(L.slot) * qkv_dim * L.conv_k);
+                    const int S_elems = n_delta_ * L.nv * L.dk * L.dv;
+                    const int conv_elems = n_delta_ * qkv_dim * L.conv_k;
+                    gdn_decode_t1_k<<<dim3(L.nv, B), 256, sm>>>(
+                        d_aa_seq_, d_bb_seq_, S0, L.A_log, L.dt_bias, d_o_seq_, L.nk, L.nv, d_qkv_seq_,
+                        L.conv_w, conv0, nullptr, 0, qkv_dim, L.nv, S_elems, conv_elems, zdim);
+                } else {
+                    for (int b = 0; b < B; ++b) {
+                        float* conv_st =
+                            d_conv_ + (static_cast<size_t>(b) * n_delta_ + L.slot) * qkv_dim * L.conv_k;
+                        conv1d_upd_k<<<(qkv_dim + 127) / 128, 128>>>(
+                            d_qkv_seq_ + static_cast<size_t>(b) * qkv_dim, L.conv_w, conv_st,
+                            d_mix_seq_ + static_cast<size_t>(b) * qkv_dim, qkv_dim, L.conv_k);
+                        uint16_t* S = d_S_ + (static_cast<size_t>(b) * n_delta_ + L.slot) * L.nv * L.dk * L.dv;
+                        launch_gdn(d_mix_seq_ + static_cast<size_t>(b) * qkv_dim,
+                                   d_aa_seq_ + static_cast<size_t>(b) * L.nv,
+                                   d_bb_seq_ + static_cast<size_t>(b) * L.nv, S, L.A_log, L.dt_bias,
+                                   d_o_seq_ + static_cast<size_t>(b) * zdim, 1, L.nk, L.nv, L.dk, L.dv,
+                                   qkv_dim);
+                    }
                 }
-                gated_rms_batch_k<<<B, 256>>>(d_o_seq_, d_z_seq_, L.gnorm, d_og_seq_, zdim, B, 1e-6f, L.gnorm_n);
+                launch_gated_rms_vec(d_o_seq_, d_z_seq_, L.gnorm, d_og_seq_, zdim, B, 1e-6f, L.gnorm_n);
                 launch_linear(L.wo, d_og_seq_, d_h_seq_, B, 1);
             } else {
                 const int qn = L.nq * L.hd;
@@ -9759,40 +15266,58 @@ private:
                 launch_linear(L.wk, d_xn_seq_, d_k_seq_, B);
                 launch_linear(L.wv, d_xn_seq_, d_v_seq_, B);
                 dim3 sg((qn + 255) / 256, B);
-                split_qg_batch_k<<<sg, 256>>>(d_qg_seq_, d_q_seq_, d_gate_seq_, qn, B);
+                split_qg_batch_k<<<sg, 256>>>(d_qg_seq_, d_q_seq_, d_gate_seq_, L.nq, L.hd, B);
                 const int use_win = kv_tq_ && hpos0 < kv_win_;
                 const int kctx = use_win ? 16384 : (kv_tq_ ? ctx_ : ctx_);
-                const size_t sm = kctx > 8192 ? static_cast<size_t>(L.hd) * sizeof(float)
-                                              : (static_cast<size_t>(kctx) + static_cast<size_t>(L.hd)) *
-                                                    sizeof(float);
                 const int kv_mode =
                     (kv_tq_ && L.hd == 256 && !use_win) ? 3 : (kv_f16_ && L.hd == 256 ? 1 : 0);
+                const size_t sm = decode_attn_smem(kctx, L.hd, kv_mode == 1 ? 1 : 0);
                 const int ath = L.hd >= 256 ? 256 : 128;
-                for (int b = 0; b < B; ++b) {
-                    float* kc =
-                        kv_f16_ && L.hd == 256
-                            ? reinterpret_cast<float*>(reinterpret_cast<__half*>(d_kcache_) +
-                                                       (static_cast<size_t>(b) * n_attn_ + L.slot) *
-                                                           kv_stride() * kn)
-                            : d_kcache_ + (static_cast<size_t>(b) * n_attn_ + L.slot) * kv_stride() * kn;
-                    float* vc =
-                        kv_f16_ && L.hd == 256
-                            ? reinterpret_cast<float*>(reinterpret_cast<__half*>(d_vcache_) +
-                                                       (static_cast<size_t>(b) * n_attn_ + L.slot) *
-                                                           kv_stride() * kn)
-                            : d_vcache_ + (static_cast<size_t>(b) * n_attn_ + L.slot) * kv_stride() * kn;
-                    qk_attn_decode_k<<<L.nq, ath, sm>>>(
-                        d_q_seq_ + static_cast<size_t>(b) * qn, d_k_seq_ + static_cast<size_t>(b) * kn,
-                        d_v_seq_ + static_cast<size_t>(b) * kn, L.q_norm, L.k_norm, kc, vc,
-                        d_o_seq_ + static_cast<size_t>(b) * qn, d_pos_b_ + b, L.nq, L.nkv, L.hd, L.rotary,
-                        L.theta, L.eps, kctx, kv_mode, kv_tq_ ? k_q8_slot(L.slot, b) : nullptr,
-                        kv_tq_ ? k_sc_slot(L.slot, b) : nullptr, kv_tq_ ? v_qs_slot(L.slot, b) : nullptr,
-                        kv_tq_ ? v_sc_slot(L.slot, b) : nullptr);
-                    if (kv_mode == 3)
+                // kv_mode==3 (TQ attend) still serial: compact KV strides differ per buffer.
+                // Official short mixed is kv_mode 0/1 — one grid (nq, B) instead of B launches.
+                if (kv_mode == 3) {
+                    for (int b = 0; b < B; ++b) {
+                        float* kc =
+                            kv_f16_ && L.hd == 256
+                                ? reinterpret_cast<float*>(reinterpret_cast<__half*>(d_kcache_) +
+                                                           (static_cast<size_t>(b) * n_attn_ + L.slot) *
+                                                               kv_stride() * kn)
+                                : d_kcache_ + (static_cast<size_t>(b) * n_attn_ + L.slot) * kv_stride() * kn;
+                        float* vc =
+                            kv_f16_ && L.hd == 256
+                                ? reinterpret_cast<float*>(reinterpret_cast<__half*>(d_vcache_) +
+                                                           (static_cast<size_t>(b) * n_attn_ + L.slot) *
+                                                               kv_stride() * kn)
+                                : d_vcache_ + (static_cast<size_t>(b) * n_attn_ + L.slot) * kv_stride() * kn;
+                        qk_attn_decode_k<<<L.nq, ath, sm>>>(
+                            d_q_seq_ + static_cast<size_t>(b) * qn, d_k_seq_ + static_cast<size_t>(b) * kn,
+                            d_v_seq_ + static_cast<size_t>(b) * kn, L.q_norm, L.k_norm, kc, vc,
+                            d_o_seq_ + static_cast<size_t>(b) * qn, d_pos_b_ + b, L.nq, L.nkv, L.hd, L.rotary,
+                            L.theta, L.eps, kctx, kv_mode, kv_tq_ ? k_q8_slot(L.slot, b) : nullptr,
+                            kv_tq_ ? k_sc_slot(L.slot, b) : nullptr, kv_tq_ ? v_qs_slot(L.slot, b) : nullptr,
+                            kv_tq_ ? v_sc_slot(L.slot, b) : nullptr, 0, 0, 0);
                         qk_attn_decode_tq_gqa_k<<<L.nkv, 256>>>(
                             d_q_seq_ + static_cast<size_t>(b) * qn, d_o_seq_ + static_cast<size_t>(b) * qn,
                             d_pos_b_ + b, L.nq, L.nkv, L.hd, k_q8_slot(L.slot, b), k_sc_slot(L.slot, b),
                             v_qs_slot(L.slot, b), v_sc_slot(L.slot, b));
+                    }
+                } else {
+                    float* kc0 =
+                        kv_f16_ && L.hd == 256
+                            ? reinterpret_cast<float*>(reinterpret_cast<__half*>(d_kcache_) +
+                                                       static_cast<size_t>(L.slot) * kv_stride() * kn)
+                            : d_kcache_ + static_cast<size_t>(L.slot) * kv_stride() * kn;
+                    float* vc0 =
+                        kv_f16_ && L.hd == 256
+                            ? reinterpret_cast<float*>(reinterpret_cast<__half*>(d_vcache_) +
+                                                       static_cast<size_t>(L.slot) * kv_stride() * kn)
+                            : d_vcache_ + static_cast<size_t>(L.slot) * kv_stride() * kn;
+                    const int cache_bstride = n_attn_ * kv_stride() * kn;
+                    dim3 ag(L.nq, B);
+                    qk_attn_decode_k<<<ag, ath, sm>>>(
+                        d_q_seq_, d_k_seq_, d_v_seq_, L.q_norm, L.k_norm, kc0, vc0, d_o_seq_, d_pos_b_, L.nq,
+                        L.nkv, L.hd, L.rotary, L.theta, L.eps, kctx, kv_mode, nullptr, nullptr, nullptr,
+                        nullptr, qn, kn, cache_bstride);
                 }
                 apply_gate_n_k<<<(qn * B + 255) / 256, 256>>>(d_o_seq_, d_gate_seq_, qn * B);
                 launch_linear(L.wo_a, d_o_seq_, d_h_seq_, B, 1);
@@ -9803,7 +15328,112 @@ private:
         }
         launch_rms_batch(d_h_seq_, d_final_norm_, d_xn_seq_, hidden_, B, store_->model().rms_eps);
         launch_linear(lm_head_, d_xn_seq_, d_logits_, B);
-        for (int b = 0; b < B; ++b) inc_pos_k<<<1, 1>>>(d_pos_b_ + b);
+        launch_argmax_rows(B);
+        inc_pos_n_k<<<(B + 31) / 32, 32>>>(d_pos_b_, B);
+    }
+
+    // Time-major packed mixed prefill: rows [t*B + b]. Linears see N=T*B (one W pass).
+    void launch_prefill_eq(int T, int B) {
+        const int N = T * B;
+        embed_batch(N);
+        const ModelDesc& m = store_->model();
+        for (GpuLayer& L : layers_) {
+            launch_rms_batch(d_h_seq_, L.attn_norm, d_xn_seq_, hidden_, N, L.eps);
+            if (L.kind == LayerKind::GatedDeltaNet) {
+                const int qdim = L.nk * L.dk;
+                const int qkv_dim = qdim * 2 + L.nv * L.dv;
+                const int zdim = L.nv * L.dv;
+                launch_linear_pair(L.wqkv, L.wz, d_xn_seq_, d_qkv_seq_, d_z_seq_, N);
+                launch_gemm_fp8_dual(L.wa, L.wb, d_xn_seq_, d_aa_seq_, d_bb_seq_, N, 0);
+                if (L.dk == 128 && L.dv == 128 && L.conv_k == 4) {
+                    const int sm = gdn_dyn_smem(L.dk, L.dv);
+                    uint16_t* S0 = d_S_ + (static_cast<size_t>(L.slot) * L.nv * L.dk * L.dv);
+                    float* conv0 = d_conv_ + (static_cast<size_t>(L.slot) * qkv_dim * L.conv_k);
+                    const int S_elems = n_delta_ * L.nv * L.dk * L.dv;
+                    const int conv_elems = n_delta_ * qkv_dim * L.conv_k;
+                    for (int t = 0; t < T; ++t) {
+                        gdn_decode_t1_k<<<dim3(L.nv, B), 256, sm>>>(
+                            d_aa_seq_ + static_cast<size_t>(t) * B * L.nv,
+                            d_bb_seq_ + static_cast<size_t>(t) * B * L.nv, S0, L.A_log, L.dt_bias,
+                            d_o_seq_ + static_cast<size_t>(t) * B * zdim, L.nk, L.nv,
+                            d_qkv_seq_ + static_cast<size_t>(t) * B * qkv_dim, L.conv_w, conv0, nullptr, 0,
+                            qkv_dim, L.nv, S_elems, conv_elems, zdim);
+                    }
+                } else {
+                    for (int t = 0; t < T; ++t) {
+                        for (int b = 0; b < B; ++b) {
+                            float* conv_st =
+                                d_conv_ + (static_cast<size_t>(b) * n_delta_ + L.slot) * qkv_dim * L.conv_k;
+                            conv1d_upd_k<<<(qkv_dim + 127) / 128, 128>>>(
+                                d_qkv_seq_ + static_cast<size_t>(t * B + b) * qkv_dim, L.conv_w, conv_st,
+                                d_mix_seq_ + static_cast<size_t>(t * B + b) * qkv_dim, qkv_dim, L.conv_k);
+                            uint16_t* S =
+                                d_S_ + (static_cast<size_t>(b) * n_delta_ + L.slot) * L.nv * L.dk * L.dv;
+                            launch_gdn(d_mix_seq_ + static_cast<size_t>(t * B + b) * qkv_dim,
+                                       d_aa_seq_ + static_cast<size_t>(t * B + b) * L.nv,
+                                       d_bb_seq_ + static_cast<size_t>(t * B + b) * L.nv, S, L.A_log,
+                                       L.dt_bias, d_o_seq_ + static_cast<size_t>(t * B + b) * zdim, 1, L.nk,
+                                       L.nv, L.dk, L.dv, qkv_dim);
+                        }
+                    }
+                }
+                launch_gated_rms_vec(d_o_seq_, d_z_seq_, L.gnorm, d_og_seq_, zdim, N, 1e-6f, L.gnorm_n);
+                launch_linear(L.wo, d_og_seq_, d_h_seq_, N, 1);
+            } else {
+                const int qn = L.nq * L.hd;
+                const int kn = L.nkv * L.hd;
+                launch_linear(L.wq, d_xn_seq_, d_qg_seq_, N);
+                launch_linear(L.wk, d_xn_seq_, d_k_seq_, N);
+                launch_linear(L.wv, d_xn_seq_, d_v_seq_, N);
+                dim3 sg((qn + 255) / 256, N);
+                split_qg_batch_k<<<sg, 256>>>(d_qg_seq_, d_q_seq_, d_gate_seq_, L.nq, L.hd, N);
+                const int kctx = ctx_;
+                const int kv_mode = (kv_f16_ && L.hd == 256 ? 1 : 0);
+                const size_t sm = decode_attn_smem(kctx, L.hd, kv_mode);
+                const int ath = L.hd >= 256 ? 256 : 128;
+                float* kc0 =
+                    kv_f16_ && L.hd == 256
+                        ? reinterpret_cast<float*>(reinterpret_cast<__half*>(d_kcache_) +
+                                                   static_cast<size_t>(L.slot) * kv_stride() * kn)
+                        : d_kcache_ + static_cast<size_t>(L.slot) * kv_stride() * kn;
+                float* vc0 =
+                    kv_f16_ && L.hd == 256
+                        ? reinterpret_cast<float*>(reinterpret_cast<__half*>(d_vcache_) +
+                                                   static_cast<size_t>(L.slot) * kv_stride() * kn)
+                        : d_vcache_ + static_cast<size_t>(L.slot) * kv_stride() * kn;
+                const int cache_bstride = n_attn_ * kv_stride() * kn;
+                std::vector<int> hp(static_cast<size_t>(B));
+                for (int t = 0; t < T; ++t) {
+                    for (int b = 0; b < B; ++b) hp[static_cast<size_t>(b)] = t;
+                    CUDA_CHECK(cudaMemcpy(d_pos_b_, hp.data(), sizeof(int) * B, cudaMemcpyHostToDevice));
+                    dim3 ag(L.nq, B);
+                    qk_attn_decode_k<<<ag, ath, sm>>>(
+                        d_q_seq_ + static_cast<size_t>(t) * B * qn, d_k_seq_ + static_cast<size_t>(t) * B * kn,
+                        d_v_seq_ + static_cast<size_t>(t) * B * kn, L.q_norm, L.k_norm, kc0, vc0,
+                        d_o_seq_ + static_cast<size_t>(t) * B * qn, d_pos_b_, L.nq, L.nkv, L.hd, L.rotary,
+                        L.theta, L.eps, kctx, kv_mode, nullptr, nullptr, nullptr, nullptr, qn, kn,
+                        cache_bstride);
+                }
+                apply_gate_n_k<<<(qn * N + 255) / 256, 256>>>(d_o_seq_, d_gate_seq_, qn * N);
+                launch_linear(L.wo_a, d_o_seq_, d_h_seq_, N, 1);
+            }
+            launch_rms_batch(d_h_seq_, L.ffn_norm, d_xn_seq_, hidden_, N, m.rms_eps);
+            launch_gemm_fp8_dual(L.wg, L.wu, d_xn_seq_, d_gate_mlp_seq_, d_up_seq_, N, 1);
+            launch_linear(L.wd, d_gate_mlp_seq_, d_h_seq_, N, 1);
+        }
+        launch_rms_batch(d_h_seq_ + static_cast<size_t>(T - 1) * B * hidden_, d_final_norm_,
+                         d_xn_seq_ + static_cast<size_t>(T - 1) * B * hidden_, hidden_, B,
+                         store_->model().rms_eps);
+        launch_linear(lm_head_, d_xn_seq_ + static_cast<size_t>(T - 1) * B * hidden_, d_logits_, B);
+        launch_argmax_rows(B);
+        const int last = T;
+        for (int b = 0; b < B; ++b) CUDA_CHECK(cudaMemcpy(d_pos_b_ + b, &last, 4, cudaMemcpyHostToDevice));
+    }
+
+    void copy_greedy_n(int32_t* host, int B) override {
+        if (!host || B <= 0) return;
+        const int n = std::min(B, logit_rows_);
+        CUDA_CHECK(cudaMemcpy(host, d_best_n_, sizeof(int) * n, cudaMemcpyDeviceToHost));
     }
 
     void finish_logits() {
@@ -9837,12 +15467,17 @@ private:
     }
 
     void abort_stream_capture() {
+        cudaGetLastError();
         cudaStreamCaptureStatus st = cudaStreamCaptureStatusNone;
-        if (cudaStreamIsCapturing(cudaStreamPerThread, &st) != cudaSuccess) return;
+        if (cudaStreamIsCapturing(cudaStreamPerThread, &st) != cudaSuccess) {
+            cudaGetLastError();
+            return;
+        }
         if (st == cudaStreamCaptureStatusNone) return;
         cudaGraph_t g = nullptr;
         cudaStreamEndCapture(cudaStreamPerThread, &g);
         if (g) cudaGraphDestroy(g);
+        cudaGetLastError();
     }
 
     bool instantiate_graph(cudaGraph_t g, cudaGraphExec_t* exec, const char* tag, int n) {
@@ -9953,6 +15588,41 @@ private:
         std::fprintf(stderr, "decode_cuda_graph=1\n");
     }
 
+    void maybe_capture_batch(int B) {
+        if (batch_graph_exec_ || B < 8 || vocab_ <= 256) return;
+        abort_stream_capture();
+        const cudaError_t syn = cudaDeviceSynchronize();
+        if (syn != cudaSuccess) {
+            std::fprintf(stderr, "decode_batch_capture_sync err=%s\n", cudaGetErrorString(syn));
+            cudaGetLastError();
+            batch_graph_B_ = -1;
+            return;
+        }
+        cudaError_t e = cudaStreamBeginCapture(cudaStreamPerThread, cudaStreamCaptureModeThreadLocal);
+        if (e != cudaSuccess) {
+            std::fprintf(stderr, "decode_batch_capture_begin err=%s\n", cudaGetErrorString(e));
+            batch_graph_B_ = -1;
+            return;
+        }
+        launch_decode_batch(B);
+        cudaGraph_t g = nullptr;
+        e = cudaStreamEndCapture(cudaStreamPerThread, &g);
+        if (e != cudaSuccess) {
+            std::fprintf(stderr, "decode_batch_capture_end err=%s\n", cudaGetErrorString(e));
+            abort_stream_capture();
+            batch_graph_B_ = -1;
+            return;
+        }
+        if (!instantiate_graph(g, &batch_graph_exec_, "decode_batch_capture", B)) {
+            batch_graph_B_ = -1;
+            return;
+        }
+        batch_graph_ = g;
+        batch_graph_B_ = B;
+        cudaGraphUpload(batch_graph_exec_, cudaStreamPerThread);
+        std::fprintf(stderr, "decode_batch_cuda_graph=1 B=%d\n", B);
+    }
+
     void maybe_capture_prefill(int n) {
         if (n == 256) {
             if (pf256_exec_ || pf_cap_ < 256) return;
@@ -9996,7 +15666,7 @@ private:
     }
 
     void maybe_capture_spec() {
-        if (spec_graph_exec_ || pf_cap_ < 4) return;
+        if (spec_graph_exec_ || pf_cap_ < 2) return;
         abort_stream_capture();
         cudaError_t e = cudaDeviceSynchronize();
         if (e != cudaSuccess) cudaGetLastError();
@@ -10006,7 +15676,7 @@ private:
             std::fprintf(stderr, "spec_capture_begin err=%s\n", cudaGetErrorString(e));
             return;
         }
-        launch_spec_chunk(4);
+        launch_spec_chunk(2);
         cudaGraph_t g = nullptr;
         e = cudaStreamEndCapture(cudaStreamPerThread, &g);
         if (e != cudaSuccess) {
@@ -10014,10 +15684,217 @@ private:
             abort_stream_capture();
             return;
         }
-        if (!instantiate_graph(g, &spec_graph_exec_, "spec_capture", 4)) return;
+        if (!instantiate_graph(g, &spec_graph_exec_, "spec_capture", 2)) return;
         spec_graph_ = g;
         cudaGraphUpload(spec_graph_exec_, cudaStreamPerThread);
-        std::fprintf(stderr, "spec_cuda_graph n=4\n");
+        std::fprintf(stderr, "spec_cuda_graph n=2 t0_snap=%d\n", spec_t0_snap_ ? 1 : 0);
+
+        // Official FP8 T=3/T=4 step is slower than T=2 (45.0 / 30.5 vs 46.4).
+        // lm_head may stay BF16 on official — key off layer GEMVs.
+        {
+            bool fp8_rm = lm_head_.fp8_rowmaj;
+            for (const GpuLayer& L : layers_) {
+                if (L.wqkv.fp8_rowmaj || L.wg.fp8_rowmaj || L.wo.fp8_rowmaj || L.wq.fp8_rowmaj)
+                    fp8_rm = true;
+            }
+            if (spec_graph_t3_exec_ || pf_cap_ < 3 || hidden_ < 64 || fp8_rm) return;
+        }
+        abort_stream_capture();
+        e = cudaDeviceSynchronize();
+        if (e != cudaSuccess) cudaGetLastError();
+        e = cudaStreamBeginCapture(cudaStreamPerThread, cudaStreamCaptureModeThreadLocal);
+        if (e != cudaSuccess) {
+            std::fprintf(stderr, "spec_capture_t3_begin err=%s\n", cudaGetErrorString(e));
+            return;
+        }
+        launch_spec_chunk(3);
+        g = nullptr;
+        e = cudaStreamEndCapture(cudaStreamPerThread, &g);
+        if (e != cudaSuccess) {
+            std::fprintf(stderr, "spec_capture_t3_end err=%s\n", cudaGetErrorString(e));
+            abort_stream_capture();
+            return;
+        }
+        if (!instantiate_graph(g, &spec_graph_t3_exec_, "spec_capture_t3", 3)) return;
+        spec_graph_t3_ = g;
+        cudaGraphUpload(spec_graph_t3_exec_, cudaStreamPerThread);
+        std::fprintf(stderr, "spec_cuda_graph n=3 t0_snap=%d\n", spec_t0_snap_ ? 1 : 0);
+
+        if (hidden_ >= 64 && d_S_ && d_S_bak_ && s_bytes_) {
+            CUDA_CHECK(cudaMemcpy(d_S_bak_, d_S_, s_bytes_, cudaMemcpyDeviceToDevice));
+            if (conv_bytes_ && d_conv_ && d_conv_bak_)
+                CUDA_CHECK(cudaMemcpy(d_conv_bak_, d_conv_, conv_bytes_, cudaMemcpyDeviceToDevice));
+            if (kv_bytes_ && d_kcache_ && d_k_bak_) {
+                CUDA_CHECK(cudaMemcpy(d_k_bak_, d_kcache_, kv_bytes_, cudaMemcpyDeviceToDevice));
+                CUDA_CHECK(cudaMemcpy(d_v_bak_, d_vcache_, kv_bytes_, cudaMemcpyDeviceToDevice));
+            }
+            const int pos0 = pos_;
+            g_spec_ms_lin = g_spec_ms_gdn = g_spec_ms_attn = g_spec_ms_mlp = g_spec_ms_lm = 0;
+            g_spec_prof = true;
+            launch_spec_chunk(3);
+            g_spec_prof = false;
+            std::fprintf(stderr, "spec_prof T=3 lin=%.2f gdn=%.2f attn=%.2f mlp=%.2f lm=%.2f tot=%.2f\n",
+                         g_spec_ms_lin, g_spec_ms_gdn, g_spec_ms_attn, g_spec_ms_mlp, g_spec_ms_lm,
+                         g_spec_ms_lin + g_spec_ms_gdn + g_spec_ms_attn + g_spec_ms_mlp + g_spec_ms_lm);
+            CUDA_CHECK(cudaMemcpy(d_S_, d_S_bak_, s_bytes_, cudaMemcpyDeviceToDevice));
+            if (conv_bytes_ && d_conv_ && d_conv_bak_)
+                CUDA_CHECK(cudaMemcpy(d_conv_, d_conv_bak_, conv_bytes_, cudaMemcpyDeviceToDevice));
+            if (kv_bytes_ && d_kcache_ && d_k_bak_) {
+                CUDA_CHECK(cudaMemcpy(d_kcache_, d_k_bak_, kv_bytes_, cudaMemcpyDeviceToDevice));
+                CUDA_CHECK(cudaMemcpy(d_vcache_, d_v_bak_, kv_bytes_, cudaMemcpyDeviceToDevice));
+            }
+            pos_ = pos0;
+            set_pos_k<<<1, 1>>>(d_pos_, pos0);
+        }
+
+        // T=4 Q6 ild lives in gemv_q6_t4.cu (isolated TU). Capture when pf_cap allows.
+        if (spec_graph_t4_exec_ || pf_cap_ < 4 || hidden_ < 64) return;
+        abort_stream_capture();
+        e = cudaDeviceSynchronize();
+        if (e != cudaSuccess) cudaGetLastError();
+        e = cudaStreamBeginCapture(cudaStreamPerThread, cudaStreamCaptureModeThreadLocal);
+        if (e != cudaSuccess) {
+            std::fprintf(stderr, "spec_capture_t4_begin err=%s\n", cudaGetErrorString(e));
+            return;
+        }
+        launch_spec_chunk(4);
+        g = nullptr;
+        e = cudaStreamEndCapture(cudaStreamPerThread, &g);
+        if (e != cudaSuccess) {
+            std::fprintf(stderr, "spec_capture_t4_end err=%s last=%s\n", cudaGetErrorString(e),
+                         cudaGetErrorString(cudaGetLastError()));
+            abort_stream_capture();
+            return;
+        }
+        if (!instantiate_graph(g, &spec_graph_t4_exec_, "spec_capture_t4", 4)) return;
+        spec_graph_t4_ = g;
+        cudaGraphUpload(spec_graph_t4_exec_, cudaStreamPerThread);
+        std::fprintf(stderr, "spec_cuda_graph n=4 t0_snap=%d\n", spec_t0_snap_ ? 1 : 0);
+
+        if (hidden_ >= 64 && d_S_ && d_S_bak_ && s_bytes_) {
+            CUDA_CHECK(cudaMemcpy(d_S_bak_, d_S_, s_bytes_, cudaMemcpyDeviceToDevice));
+            if (conv_bytes_ && d_conv_ && d_conv_bak_)
+                CUDA_CHECK(cudaMemcpy(d_conv_bak_, d_conv_, conv_bytes_, cudaMemcpyDeviceToDevice));
+            if (kv_bytes_ && d_kcache_ && d_k_bak_) {
+                CUDA_CHECK(cudaMemcpy(d_k_bak_, d_kcache_, kv_bytes_, cudaMemcpyDeviceToDevice));
+                CUDA_CHECK(cudaMemcpy(d_v_bak_, d_vcache_, kv_bytes_, cudaMemcpyDeviceToDevice));
+            }
+            const int pos0 = pos_;
+            g_spec_ms_lin = g_spec_ms_gdn = g_spec_ms_attn = g_spec_ms_mlp = g_spec_ms_lm = 0;
+            g_spec_prof = true;
+            launch_spec_chunk(4);
+            g_spec_prof = false;
+            std::fprintf(stderr, "spec_prof T=4 lin=%.2f gdn=%.2f attn=%.2f mlp=%.2f lm=%.2f tot=%.2f\n",
+                         g_spec_ms_lin, g_spec_ms_gdn, g_spec_ms_attn, g_spec_ms_mlp, g_spec_ms_lm,
+                         g_spec_ms_lin + g_spec_ms_gdn + g_spec_ms_attn + g_spec_ms_mlp + g_spec_ms_lm);
+            CUDA_CHECK(cudaMemcpy(d_S_, d_S_bak_, s_bytes_, cudaMemcpyDeviceToDevice));
+            if (conv_bytes_ && d_conv_ && d_conv_bak_)
+                CUDA_CHECK(cudaMemcpy(d_conv_, d_conv_bak_, conv_bytes_, cudaMemcpyDeviceToDevice));
+            if (kv_bytes_ && d_kcache_ && d_k_bak_) {
+                CUDA_CHECK(cudaMemcpy(d_kcache_, d_k_bak_, kv_bytes_, cudaMemcpyDeviceToDevice));
+                CUDA_CHECK(cudaMemcpy(d_vcache_, d_v_bak_, kv_bytes_, cudaMemcpyDeviceToDevice));
+            }
+            pos_ = pos0;
+            set_pos_k<<<1, 1>>>(d_pos_, pos0);
+        }
+
+        if (spec_graph_t6_exec_ || pf_cap_ < 6 || hidden_ < 64) return;
+        abort_stream_capture();
+        e = cudaDeviceSynchronize();
+        if (e != cudaSuccess) cudaGetLastError();
+        e = cudaStreamBeginCapture(cudaStreamPerThread, cudaStreamCaptureModeThreadLocal);
+        if (e != cudaSuccess) {
+            std::fprintf(stderr, "spec_capture_t6_begin err=%s\n", cudaGetErrorString(e));
+            return;
+        }
+        launch_spec_chunk(6);
+        g = nullptr;
+        e = cudaStreamEndCapture(cudaStreamPerThread, &g);
+        if (e != cudaSuccess) {
+            std::fprintf(stderr, "spec_capture_t6_end err=%s\n", cudaGetErrorString(e));
+            abort_stream_capture();
+            return;
+        }
+        if (!instantiate_graph(g, &spec_graph_t6_exec_, "spec_capture_t6", 6)) return;
+        spec_graph_t6_ = g;
+        cudaGraphUpload(spec_graph_t6_exec_, cudaStreamPerThread);
+        std::fprintf(stderr, "spec_cuda_graph n=6 t0_snap=%d\n", spec_t0_snap_ ? 1 : 0);
+
+        if (hidden_ >= 64 && d_S_ && d_S_bak_ && s_bytes_) {
+            CUDA_CHECK(cudaMemcpy(d_S_bak_, d_S_, s_bytes_, cudaMemcpyDeviceToDevice));
+            if (conv_bytes_ && d_conv_ && d_conv_bak_)
+                CUDA_CHECK(cudaMemcpy(d_conv_bak_, d_conv_, conv_bytes_, cudaMemcpyDeviceToDevice));
+            if (kv_bytes_ && d_kcache_ && d_k_bak_) {
+                CUDA_CHECK(cudaMemcpy(d_k_bak_, d_kcache_, kv_bytes_, cudaMemcpyDeviceToDevice));
+                CUDA_CHECK(cudaMemcpy(d_v_bak_, d_vcache_, kv_bytes_, cudaMemcpyDeviceToDevice));
+            }
+            const int pos0 = pos_;
+            g_spec_ms_lin = g_spec_ms_gdn = g_spec_ms_attn = g_spec_ms_mlp = g_spec_ms_lm = 0;
+            g_spec_prof = true;
+            launch_spec_chunk(6);
+            g_spec_prof = false;
+            std::fprintf(stderr, "spec_prof T=6 lin=%.2f gdn=%.2f attn=%.2f mlp=%.2f lm=%.2f tot=%.2f\n",
+                         g_spec_ms_lin, g_spec_ms_gdn, g_spec_ms_attn, g_spec_ms_mlp, g_spec_ms_lm,
+                         g_spec_ms_lin + g_spec_ms_gdn + g_spec_ms_attn + g_spec_ms_mlp + g_spec_ms_lm);
+            CUDA_CHECK(cudaMemcpy(d_S_, d_S_bak_, s_bytes_, cudaMemcpyDeviceToDevice));
+            if (conv_bytes_ && d_conv_ && d_conv_bak_)
+                CUDA_CHECK(cudaMemcpy(d_conv_, d_conv_bak_, conv_bytes_, cudaMemcpyDeviceToDevice));
+            if (kv_bytes_ && d_kcache_ && d_k_bak_) {
+                CUDA_CHECK(cudaMemcpy(d_kcache_, d_k_bak_, kv_bytes_, cudaMemcpyDeviceToDevice));
+                CUDA_CHECK(cudaMemcpy(d_vcache_, d_v_bak_, kv_bytes_, cudaMemcpyDeviceToDevice));
+            }
+            pos_ = pos0;
+            set_pos_k<<<1, 1>>>(d_pos_, pos0);
+        }
+
+        if (spec_graph_t12_exec_ || pf_cap_ < 12 || hidden_ < 64) return;
+        abort_stream_capture();
+        e = cudaDeviceSynchronize();
+        if (e != cudaSuccess) cudaGetLastError();
+        e = cudaStreamBeginCapture(cudaStreamPerThread, cudaStreamCaptureModeThreadLocal);
+        if (e != cudaSuccess) {
+            std::fprintf(stderr, "spec_capture_t12_begin err=%s\n", cudaGetErrorString(e));
+            return;
+        }
+        launch_spec_chunk(12);
+        g = nullptr;
+        e = cudaStreamEndCapture(cudaStreamPerThread, &g);
+        if (e != cudaSuccess) {
+            std::fprintf(stderr, "spec_capture_t12_end err=%s\n", cudaGetErrorString(e));
+            abort_stream_capture();
+            return;
+        }
+        if (!instantiate_graph(g, &spec_graph_t12_exec_, "spec_capture_t12", 12)) return;
+        spec_graph_t12_ = g;
+        cudaGraphUpload(spec_graph_t12_exec_, cudaStreamPerThread);
+        std::fprintf(stderr, "spec_cuda_graph n=12 t0_snap=%d\n", spec_t0_snap_ ? 1 : 0);
+
+        if (hidden_ >= 64 && d_S_ && d_S_bak_ && s_bytes_) {
+            CUDA_CHECK(cudaMemcpy(d_S_bak_, d_S_, s_bytes_, cudaMemcpyDeviceToDevice));
+            if (conv_bytes_ && d_conv_ && d_conv_bak_)
+                CUDA_CHECK(cudaMemcpy(d_conv_bak_, d_conv_, conv_bytes_, cudaMemcpyDeviceToDevice));
+            if (kv_bytes_ && d_kcache_ && d_k_bak_) {
+                CUDA_CHECK(cudaMemcpy(d_k_bak_, d_kcache_, kv_bytes_, cudaMemcpyDeviceToDevice));
+                CUDA_CHECK(cudaMemcpy(d_v_bak_, d_vcache_, kv_bytes_, cudaMemcpyDeviceToDevice));
+            }
+            const int pos0 = pos_;
+            g_spec_ms_lin = g_spec_ms_gdn = g_spec_ms_attn = g_spec_ms_mlp = g_spec_ms_lm = 0;
+            g_spec_prof = true;
+            launch_spec_chunk(12);
+            g_spec_prof = false;
+            std::fprintf(stderr, "spec_prof T=12 lin=%.2f gdn=%.2f attn=%.2f mlp=%.2f lm=%.2f tot=%.2f\n",
+                         g_spec_ms_lin, g_spec_ms_gdn, g_spec_ms_attn, g_spec_ms_mlp, g_spec_ms_lm,
+                         g_spec_ms_lin + g_spec_ms_gdn + g_spec_ms_attn + g_spec_ms_mlp + g_spec_ms_lm);
+            CUDA_CHECK(cudaMemcpy(d_S_, d_S_bak_, s_bytes_, cudaMemcpyDeviceToDevice));
+            if (conv_bytes_ && d_conv_ && d_conv_bak_)
+                CUDA_CHECK(cudaMemcpy(d_conv_, d_conv_bak_, conv_bytes_, cudaMemcpyDeviceToDevice));
+            if (kv_bytes_ && d_kcache_ && d_k_bak_) {
+                CUDA_CHECK(cudaMemcpy(d_kcache_, d_k_bak_, kv_bytes_, cudaMemcpyDeviceToDevice));
+                CUDA_CHECK(cudaMemcpy(d_vcache_, d_v_bak_, kv_bytes_, cudaMemcpyDeviceToDevice));
+            }
+            pos_ = pos0;
+            set_pos_k<<<1, 1>>>(d_pos_, pos0);
+        }
     }
 
     int32_t greedy_host() const {
@@ -10070,9 +15947,12 @@ private:
         const TensorDesc& lh = must("lm_head");
         int lh_rows = lh.shape[0] > 0 ? static_cast<int>(lh.shape[0]) : vocab_;
         int lh_cols = lh.shape[1] > 0 ? static_cast<int>(lh.shape[1]) : hidden_;
-        const char* keep_bf16 = std::getenv("RAPIDLLM_BF16_LMHEAD");
+        // Official Qwen3.8 lm_head is BF16. Requantizing it to e4m3 flipped
+        // the 1,2,3 first token from 4 (HF/vLLM) to 0 (gap 0.38). Keep BF16
+        // unless RAPIDLLM_FP8_LMHEAD=1 opts back into the old pack.
+        const char* force_fp8 = std::getenv("RAPIDLLM_FP8_LMHEAD");
         if (lh.quant == QuantKind::BF16 && lh_rows >= 4096 && (lh_cols % 128) == 0 &&
-            !(keep_bf16 && keep_bf16[0] == '1'))
+            force_fp8 && force_fp8[0] == '1')
             lm_head_ = upload_bf16_as_fp8(lh, lh_rows, lh_cols);
         else
             lm_head_ = upload_w(lh, lh_rows, lh_cols);
@@ -10144,6 +16024,11 @@ private:
             }
             layers_.push_back(L);
         }
+        {
+            const int tiled = store_->model().gdn_v_tiled ? 1 : 0;
+            set_gdn_v_tiled(tiled);
+            if (tiled) std::fprintf(stderr, "cuda_gdn_v_tiled=1\n");
+        }
         n_delta_ = n_delta;
         n_attn_ = n_attn;
         max_qkv_ = max_qkv;
@@ -10152,15 +16037,15 @@ private:
         max_inter_ = max_inter;
         max_qn_ = max_qn;
         max_kn_ = max_kn;
-        // Short ctx keeps T<=32 so existing n=2..4 prefill graphs stay valid.
-        // Long ctx uses T<=256 so 128k/200k prefill is not 4k serial chunks.
-        // 1024-token prefill chunks: one weight pass per chunk after mt GEMM.
-        // 256 was 4x more chunks (and used to be 64x more GEMM passes at T=4).
-        pf_cap_ = std::max(1, std::min(ctx_, ctx_ > 4096 ? 1024 : 32));
+        // ctx<=4096 one-shots official --ctx 256 prompts (n=76 used to leftover
+        // T=12 and hit F16-KV via the T<32 float* attn fallback → invalid arg).
+        // Long ctx still chunks at 1024.
+        pf_cap_ = std::max(1, std::min(ctx_, ctx_ > 4096 ? 1024 : 256));
         max_batch_ = 1;
         if (const char* e = std::getenv("RAPIDLLM_MAX_BATCH")) {
             const int v = std::atoi(e);
-            if (v > 1) max_batch_ = std::min(v, pf_cap_);
+            // Prefill graphs stay at pf_cap_; decode batch can go higher on short ctx.
+            if (v > 1) max_batch_ = std::min(v, std::min(ctx_, 128));
         }
 
         d_h_ = static_cast<float*>(alloc(sizeof(float) * hidden_));
@@ -10187,7 +16072,7 @@ private:
         d_vtmp_ = static_cast<float*>(alloc(sizeof(float) * std::max(max_kn, 1)));
         d_gate_mlp_ = static_cast<float*>(alloc(sizeof(float) * std::max(max_inter, 1)));
         d_up_ = static_cast<float*>(alloc(sizeof(float) * std::max(max_inter, 1)));
-        logit_rows_ = std::max(max_batch_, 8);
+        logit_rows_ = std::max(max_batch_, 12);
         d_logits_ = static_cast<float*>(alloc(sizeof(float) * static_cast<size_t>(vocab_) * logit_rows_));
         d_tok_ = static_cast<int*>(alloc(4));
         d_pos_ = static_cast<int*>(alloc(4));
@@ -10227,6 +16112,8 @@ private:
         d_conv_ = static_cast<float*>(alloc(conv_bytes_));
         d_S_bak_ = static_cast<uint16_t*>(alloc(s_bytes_));
         d_conv_bak_ = static_cast<float*>(alloc(conv_bytes_));
+        d_S_mid_ = static_cast<uint16_t*>(alloc(s_bytes_));
+        d_conv_mid_ = static_cast<float*>(alloc(conv_bytes_));
         d_kcache_ = static_cast<float*>(alloc(kv_bytes_));
         d_k_bak_ = kv_bytes_ ? static_cast<float*>(alloc(kv_bytes_)) : nullptr;
         d_v_bak_ = kv_bytes_ ? static_cast<float*>(alloc(kv_bytes_)) : nullptr;
@@ -10265,31 +16152,50 @@ private:
         }
         {
             size_t free_b = 0, tot_b = 0;
-            if (cudaMemGetInfo(&free_b, &tot_b) == cudaSuccess)
+            if (cudaMemGetInfo(&free_b, &tot_b) == cudaSuccess) {
                 std::fprintf(stderr, "cuda_mem used=%zuMiB free=%zuMiB total=%zuMiB max_batch=%d\n",
                              (tot_b - free_b) / (1024 * 1024), free_b / (1024 * 1024), tot_b / (1024 * 1024),
                              max_batch_);
+                // 163840 F16 KV leaves ~200 MiB. seq_cap=1024 activations OOM;
+                // 256 still one-shots the official --prompt-n 256 fill.
+                if (free_b < (768ull << 20) && pf_cap_ > 256) {
+                    std::fprintf(stderr, "shrink_pf_cap %d->256 free=%zuMiB\n", pf_cap_,
+                                 free_b / (1024 * 1024));
+                    pf_cap_ = 256;
+                }
+            }
         }
+        // Equal-length mixed prefill packs time-major T×B rows. Official
+        // mixed is T=3; 4 tokens of headroom lets one W pass fit.
+        const int eq_rows = max_batch_ > 1 ? max_batch_ * 4 : max_batch_;
+        const int seq_cap = std::max(pf_cap_, eq_rows);
+        seq_cap_ = seq_cap;
+        // seq_cap is the allocated KV/session window (ctx). act_cap is the
+        // tiled prefill activation buffer (1024 when ctx>4096).
+        std::fprintf(stderr, "seq_cap=%d pf_cap=%d max_batch=%d act_cap=%d\n", ctx_, pf_cap_, max_batch_,
+                     seq_cap_);
 
-        d_h_seq_ = static_cast<float*>(alloc(sizeof(float) * pf_cap_ * hidden_));
-        d_xn_seq_ = static_cast<float*>(alloc(sizeof(float) * pf_cap_ * hidden_));
-        d_y_seq_ = static_cast<float*>(alloc(sizeof(float) * pf_cap_ * hidden_));
-        d_qkv_seq_ = static_cast<float*>(alloc(sizeof(float) * pf_cap_ * std::max(max_qkv, 1)));
-        d_mix_seq_ = static_cast<float*>(alloc(sizeof(float) * pf_cap_ * std::max(max_qkv, 1)));
-        d_z_seq_ = static_cast<float*>(alloc(sizeof(float) * pf_cap_ * std::max(max_z, 1)));
-        d_aa_seq_ = static_cast<float*>(alloc(sizeof(float) * pf_cap_ * std::max(max_nv, 1)));
-        d_bb_seq_ = static_cast<float*>(alloc(sizeof(float) * pf_cap_ * std::max(max_nv, 1)));
-        d_og_seq_ = static_cast<float*>(alloc(sizeof(float) * pf_cap_ * std::max(max_z, 1)));
-        d_qg_seq_ = static_cast<float*>(alloc(sizeof(float) * pf_cap_ * std::max(max_qn * 2, 1)));
-        d_q_seq_ = static_cast<float*>(alloc(sizeof(float) * pf_cap_ * std::max(max_qn, 1)));
-        d_gate_seq_ = static_cast<float*>(alloc(sizeof(float) * pf_cap_ * std::max(max_qn, 1)));
-        d_k_seq_ = static_cast<float*>(alloc(sizeof(float) * pf_cap_ * std::max(max_kn, 1)));
-        d_v_seq_ = static_cast<float*>(alloc(sizeof(float) * pf_cap_ * std::max(max_kn, 1)));
-        d_o_seq_ = static_cast<float*>(alloc(sizeof(float) * pf_cap_ * std::max(std::max(max_z, max_qn), 1)));
-        d_gate_mlp_seq_ = static_cast<float*>(alloc(sizeof(float) * pf_cap_ * std::max(max_inter, 1)));
-        d_up_seq_ = static_cast<float*>(alloc(sizeof(float) * pf_cap_ * std::max(max_inter, 1)));
-        d_toks_ = static_cast<int*>(alloc(sizeof(int) * pf_cap_));
-        const int xf16_n = pf_cap_ * std::max({hidden_, std::max(max_inter, 1), std::max(max_qkv, 1),
+        d_h_seq_ = static_cast<float*>(alloc(sizeof(float) * seq_cap * hidden_));
+        d_xn_seq_ = static_cast<float*>(alloc(sizeof(float) * seq_cap * hidden_));
+        d_y_seq_ = static_cast<float*>(alloc(sizeof(float) * seq_cap * hidden_));
+        g_yadd = d_y_seq_;
+        g_yadd_n = seq_cap * hidden_;
+        d_qkv_seq_ = static_cast<float*>(alloc(sizeof(float) * seq_cap * std::max(max_qkv, 1)));
+        d_mix_seq_ = static_cast<float*>(alloc(sizeof(float) * seq_cap * std::max(max_qkv, 1)));
+        d_z_seq_ = static_cast<float*>(alloc(sizeof(float) * seq_cap * std::max(max_z, 1)));
+        d_aa_seq_ = static_cast<float*>(alloc(sizeof(float) * seq_cap * std::max(max_nv, 1)));
+        d_bb_seq_ = static_cast<float*>(alloc(sizeof(float) * seq_cap * std::max(max_nv, 1)));
+        d_og_seq_ = static_cast<float*>(alloc(sizeof(float) * seq_cap * std::max(max_z, 1)));
+        d_qg_seq_ = static_cast<float*>(alloc(sizeof(float) * seq_cap * std::max(max_qn * 2, 1)));
+        d_q_seq_ = static_cast<float*>(alloc(sizeof(float) * seq_cap * std::max(max_qn, 1)));
+        d_gate_seq_ = static_cast<float*>(alloc(sizeof(float) * seq_cap * std::max(max_qn, 1)));
+        d_k_seq_ = static_cast<float*>(alloc(sizeof(float) * seq_cap * std::max(max_kn, 1)));
+        d_v_seq_ = static_cast<float*>(alloc(sizeof(float) * seq_cap * std::max(max_kn, 1)));
+        d_o_seq_ = static_cast<float*>(alloc(sizeof(float) * seq_cap * std::max(std::max(max_z, max_qn), 1)));
+        d_gate_mlp_seq_ = static_cast<float*>(alloc(sizeof(float) * seq_cap * std::max(max_inter, 1)));
+        d_up_seq_ = static_cast<float*>(alloc(sizeof(float) * seq_cap * std::max(max_inter, 1)));
+        d_toks_ = static_cast<int*>(alloc(sizeof(int) * seq_cap));
+        const int xf16_n = seq_cap * std::max({hidden_, std::max(max_inter, 1), std::max(max_qkv, 1),
                                                std::max(max_z, 1), std::max(max_qn * 2, 1), std::max(max_kn, 1)});
         d_xf16_ = static_cast<__half*>(alloc(sizeof(__half) * xf16_n));
         g_xf16 = d_xf16_;
@@ -10300,6 +16206,12 @@ private:
         g_xe = nullptr;
         g_xe_n = 0;
         g_xe_T = 0;
+        // T=12 needs 12*cols Q8 x. Tiny (hidden<64) stays 4× so goldens heap
+        // matches the last passing T=3 suite.
+        g_xq_n = (hidden_ >= 64 ? 13 : 4) * std::max(max_inter, std::max(hidden_, 17408));
+        if (g_xq_n & 31) g_xq_n = (g_xq_n + 31) & ~31;
+        g_xq = static_cast<int8_t*>(alloc(static_cast<size_t>(g_xq_n)));
+        g_xsc = static_cast<__half*>(alloc(sizeof(__half) * static_cast<size_t>(g_xq_n / 32)));
         {
             size_t persist = 16 * 1024 * 1024;
             if (cudaDeviceSetLimit(cudaLimitPersistingL2CacheSize, persist) != cudaSuccess) cudaGetLastError();
@@ -10315,13 +16227,28 @@ private:
                 cudaGetLastError();
         }
         {
-            const size_t kmax = static_cast<size_t>(
-                std::max({hidden_, std::max(max_inter, 1), std::max(max_qkv, 1), std::max(max_qn * 2, 1)}));
-            const size_t nmax = static_cast<size_t>(
-                std::max({hidden_, std::max(max_inter, 1), std::max(max_qkv, 1), std::max(max_qn * 2, 1)}));
-            g_wf16_n = 2 * kmax * nmax;
-            d_wf16_ = static_cast<__half*>(alloc(sizeof(__half) * g_wf16_n));
-            g_wf16 = d_wf16_;
+            auto needs_wf16 = [](const GpuW& w) { return w.q == QuantKind::Q8_0; };
+            bool want = needs_wf16(lm_head_);
+            for (const GpuLayer& L : layers_) {
+                const GpuW* ws[] = {&L.wqkv, &L.wz, &L.wa, &L.wb, &L.wo, &L.wq, &L.wk, &L.wv, &L.wo_a,
+                                    &L.wg,   &L.wu, &L.wd};
+                for (const GpuW* p : ws)
+                    if (needs_wf16(*p)) want = true;
+            }
+            if (want) {
+                const size_t kmax = static_cast<size_t>(
+                    std::max({hidden_, std::max(max_inter, 1), std::max(max_qkv, 1), std::max(max_qn * 2, 1)}));
+                const size_t nmax = static_cast<size_t>(
+                    std::max({hidden_, std::max(max_inter, 1), std::max(max_qkv, 1), std::max(max_qn * 2, 1)}));
+                g_wf16_n = 2 * kmax * nmax;
+                d_wf16_ = static_cast<__half*>(alloc(sizeof(__half) * g_wf16_n));
+                g_wf16 = d_wf16_;
+            } else {
+                g_wf16 = nullptr;
+                g_wf16_n = 0;
+                d_wf16_ = nullptr;
+                std::fprintf(stderr, "skip_wf16=1 (no Q8 / kmajor-dequant W)\n");
+            }
         }
 
         h_logits_.assign(static_cast<size_t>(vocab_), 0.f);
@@ -10349,7 +16276,7 @@ private:
                 return false;
             };
             auto warm = [&](const GpuW& w, int T) {
-                if (!w.fp8_rowmaj || T < 16) return;
+                if (!w.fp8_rowmaj || (T < 16 && T != 2)) return;
                 float* X = w.cols > hidden_ ? d_gate_mlp_seq_ : d_xn_seq_;
                 float* Y = w.rows > hidden_ ? d_up_seq_ : d_h_seq_;
                 if (!X || !Y) return;
@@ -10369,19 +16296,20 @@ private:
                                  ms);
                     if (ok) {
                         ++nrm;
-                        if (T >= 256) lt_tune(w, X, Y, T, 0);
+                        if (T == 2 || T >= 256) lt_tune(w, X, Y, T, 0);
                     }
                 }
                 if (!cached(w.rows, T, w.cols, 1)) {
                     launch_cublas_fp8_e4(w, X, Y, T, 1);
-                    if (T >= 256) lt_tune(w, X, Y, T, 1);
+                    if (T == 2 || T >= 256) lt_tune(w, X, Y, T, 1);
                 }
             };
-            const int ts[2] = {std::min(256, pf_cap_), pf_cap_};
-            for (int ti = 0; ti < 2; ++ti) {
+            const int ts[4] = {2, std::min(256, pf_cap_), pf_cap_, std::max(max_batch_, 16)};
+            for (int ti = 0; ti < 4; ++ti) {
                 const int T = ts[ti];
-                if (T < 16) continue;
-                if (ti == 1 && T == ts[0]) continue;
+                if (T != 2 && T < 16) continue;
+                if (ti == 2 && T == ts[1]) continue;
+                if (T == 2) g_lt_min_T = 2;
                 for (const GpuLayer& L : layers_) {
                     warm(L.wqkv, T);
                     warm(L.wz, T);
@@ -10394,6 +16322,8 @@ private:
                     warm(L.wu, T);
                     warm(L.wd, T);
                 }
+                warm(lm_head_, T);
+                if (T == 2) g_lt_min_T = 8;
             }
             CUDA_CHECK(cudaDeviceSynchronize());
             int n_rm = 0, n_km = 0;
@@ -10431,8 +16361,40 @@ private:
             CUDA_CHECK(cudaMemcpy(d_pos_, &zero, 4, cudaMemcpyHostToDevice));
             CUDA_CHECK(cudaMemcpy(d_tok_, &zero, 4, cudaMemcpyHostToDevice));
             CUDA_CHECK(cudaDeviceSynchronize());
-            if (vocab_ > 256) maybe_capture();
-            skip_pf_graph_ = vocab_ <= 256;
+            bool packed_gemv = false;
+            for (const GpuLayer& L : layers_) {
+                const QuantKind q = L.wg.q;
+                if (q == QuantKind::Q8_0 || q == QuantKind::Q4_K || q == QuantKind::Q5_K || q == QuantKind::Q6_K) {
+                    packed_gemv = true;
+                    break;
+                }
+            }
+            size_t cap_free = 0, cap_tot = 0;
+            const bool low_mem =
+                cudaMemGetInfo(&cap_free, &cap_tot) == cudaSuccess && cap_free < (512ull << 20);
+            if (low_mem)
+                std::fprintf(stderr, "skip_graphs=1 free=%zuMiB\n", cap_free / (1024 * 1024));
+            {
+                const int flash = flash_attn_on() ? 1 : 0;
+                set_flash_attn(flash);
+                int gqa = 0;
+                for (const GpuLayer& L : layers_) {
+                    if (L.kind != LayerKind::GatedDeltaNet && flash_gqa_ok(L.nq, L.nkv, L.hd, 1)) {
+                        gqa = L.nq / L.nkv;
+                        break;
+                    }
+                }
+                std::fprintf(stderr, "flashinfer_prefill=%d flash_decode=%d flash_gqa6=%d fi_min_T=%d\n",
+                             (fi_available() && flash) ? 1 : 0, flash, (flash && gqa == 6) ? 1 : 0, 16);
+            }
+            if (vocab_ > 256 && !low_mem) maybe_capture();
+            if (vocab_ > 256 && !low_mem && max_batch_ >= 8) maybe_capture_batch(max_batch_);
+            if (!graph_exec_) {
+                abort_stream_capture();
+                cudaDeviceSynchronize();
+                cudaGetLastError();
+            }
+            skip_pf_graph_ = vocab_ <= 256 || packed_gemv;
             for (const GpuLayer& L : layers_) {
                 if (L.wqkv.fp8_rowmaj || L.wg.fp8_rowmaj || L.wq.fp8_rowmaj || L.wo.fp8_rowmaj) {
                     skip_pf_graph_ = true;
@@ -10440,10 +16402,13 @@ private:
                 }
             }
             if (lm_head_.fp8_rowmaj) skip_pf_graph_ = true;
-            if (!skip_pf_graph_) {
-                for (int t = 2; t <= 4; ++t) maybe_capture_prefill(t);
+            // Q4/Q6 skip long prefill graphs (packed GEMV capture is huge) but
+            // n=2/3/4 is one W pass — same kernels as eager, graph the launches.
+            if (vocab_ > 256) {
+                rapidllm::cuda_gemv::warmup_gdn_decode_t12();
+                maybe_capture_spec();
             }
-            if (vocab_ > 256) maybe_capture_spec();
+            if (vocab_ > 256) maybe_capture_mtp();
             if (pf_cap_ >= 1024 && vocab_ > 256) {
                 maybe_capture_pf_tile(0, 1024);
                 maybe_capture_pf_tile(1024, 1024);
@@ -10454,9 +16419,17 @@ private:
             if (cudaMemGetInfo(&free_b, &tot_b) == cudaSuccess)
                 std::fprintf(stderr, "cuda_mem_ready used=%zuMiB free=%zuMiB max_batch=%d\n",
                              (tot_b - free_b) / (1024 * 1024), free_b / (1024 * 1024), max_batch_);
+            std::fprintf(stderr, "cuda_flash_ready=1\n");
+        }
+        {
+            size_t free_b = 0, tot_b = 0;
+            if (cudaMemGetInfo(&free_b, &tot_b) != cudaSuccess || free_b > (256ull << 20))
+                upload_mtp();
+            else
+                std::fprintf(stderr, "skip_mtp=1 free=%zuMiB\n", free_b / (1024 * 1024));
         }
         for (auto& [_, t] : store_->table().tensors) {
-            // Host MTP draft needs embed + lm_head + mtp.* after GPU upload.
+            // Host MTP fallback still needs embed + lm_head + mtp.* after GPU upload.
             if (t.ir_name == "embed" || t.ir_name == "lm_head" || t.ir_name.rfind("mtp.", 0) == 0)
                 continue;
             t.data.clear();
@@ -10481,8 +16454,22 @@ private:
         }
         if (graph_exec_) cudaGraphExecDestroy(graph_exec_);
         if (graph_) cudaGraphDestroy(graph_);
+        if (batch_graph_exec_) cudaGraphExecDestroy(batch_graph_exec_);
+        if (batch_graph_) cudaGraphDestroy(batch_graph_);
         if (spec_graph_exec_) cudaGraphExecDestroy(spec_graph_exec_);
         if (spec_graph_) cudaGraphDestroy(spec_graph_);
+        if (spec_graph_t3_exec_) cudaGraphExecDestroy(spec_graph_t3_exec_);
+        if (spec_graph_t3_) cudaGraphDestroy(spec_graph_t3_);
+        if (spec_graph_t4_exec_) cudaGraphExecDestroy(spec_graph_t4_exec_);
+        if (spec_graph_t4_) cudaGraphDestroy(spec_graph_t4_);
+        if (spec_graph_t6_exec_) cudaGraphExecDestroy(spec_graph_t6_exec_);
+        if (spec_graph_t6_) cudaGraphDestroy(spec_graph_t6_);
+        if (spec_graph_t12_exec_) cudaGraphExecDestroy(spec_graph_t12_exec_);
+        if (spec_graph_t12_) cudaGraphDestroy(spec_graph_t12_);
+        if (mtp_graph_exec_) cudaGraphExecDestroy(mtp_graph_exec_);
+        if (mtp_t2_exec_) cudaGraphExecDestroy(mtp_t2_exec_);
+        if (mtp_t2_graph_) cudaGraphDestroy(mtp_t2_graph_);
+        if (mtp_graph_) cudaGraphDestroy(mtp_graph_);
         if (pf256_exec_) cudaGraphExecDestroy(pf256_exec_);
         if (pf256_graph_) cudaGraphDestroy(pf256_graph_);
         for (int i = 0; i < 2; ++i) {
@@ -10499,6 +16486,9 @@ private:
         g_xe_n = 0;
         g_xe_T = 0;
         g_xe_cap = 0;
+        g_xq = nullptr;
+        g_xsc = nullptr;
+        g_xq_n = 0;
         lt_cache_clear();
         for (int i = 0; i <= kPfGraphMax; ++i) {
             if (pf_graph_execs_[i]) cudaGraphExecDestroy(pf_graph_execs_[i]);
@@ -10509,9 +16499,10 @@ private:
     }
 
     WeightStore* store_ = nullptr;
-    int ctx_ = 0, hidden_ = 0, vocab_ = 0, pos_ = 0, last_tok_ = 0;
+    int ctx_ = 0, hidden_ = 0, vocab_ = 0, pos_ = 0, last_tok_ = 0, pf_slot_ = 0;
     int n_delta_ = 0, n_attn_ = 0;
     int pf_cap_ = 1;
+    int seq_cap_ = 1;
     bool skip_pf_graph_ = false;
     bool kv_f16_ = false;
     bool kv_tq_ = false;
@@ -10534,6 +16525,28 @@ private:
     int vis_off_ = -1;
     GpuW lm_head_{};
     const float* d_final_norm_ = nullptr;
+    bool has_mtp_ = false;
+    GpuW mtp_fc_{};
+    GpuW mtp_fc_f32_{};
+    GpuLayer mtp_L_{};
+    const float* d_mtp_nh_ = nullptr;
+    const float* d_mtp_ne_ = nullptr;
+    const float* d_mtp_nn_ = nullptr;
+    float *d_mtp_h_ = nullptr, *d_mtp_cat_ = nullptr, *d_mtp_kc_ = nullptr, *d_mtp_vc_ = nullptr;
+    int *d_mtp_tok_ = nullptr, *d_mtp_pos_ = nullptr;
+    static constexpr int kMtpCap = 256;
+    float* d_mtp_hh_ = nullptr;
+    float* d_mtp_post_ = nullptr;
+    float* d_mtp_hin_ = nullptr;
+    std::vector<int32_t> mtp_hids_;
+    int mtp_hist_n_ = 0;
+    bool mtp_diag_done_ = false;
+    int32_t mtp_legal_t0_ = 0, mtp_legal_t1_ = 0;
+    bool mtp_has_legal_ = false;
+    int mtp_kv_pos_ = 0;
+    int mtp_stream_n_ = 0;
+    bool mtp_toks_on_dev_ = false;
+    bool spec_t0_snap_ = false;
     std::vector<GpuLayer> layers_;
     std::vector<void*> allocs_;
     float *d_h_ = nullptr, *d_xn_ = nullptr, *d_y_ = nullptr, *d_ss_ = nullptr;
@@ -10542,10 +16555,10 @@ private:
     float *d_o_ = nullptr, *d_og_ = nullptr;
     float *d_qg_ = nullptr, *d_q_ = nullptr, *d_gate_ = nullptr, *d_k_ = nullptr, *d_vtmp_ = nullptr;
     float *d_gate_mlp_ = nullptr, *d_up_ = nullptr, *d_logits_ = nullptr;
-    uint16_t *d_S_ = nullptr, *d_S_bak_ = nullptr;
+    uint16_t *d_S_ = nullptr, *d_S_bak_ = nullptr, *d_S_mid_ = nullptr;
     float *d_conv_ = nullptr, *d_kcache_ = nullptr, *d_vcache_ = nullptr;
     float *d_k_bak_ = nullptr, *d_v_bak_ = nullptr;
-    float *d_conv_bak_ = nullptr;
+    float *d_conv_bak_ = nullptr, *d_conv_mid_ = nullptr;
     float *d_amax_ = nullptr;
     int *d_tok_ = nullptr, *d_pos_ = nullptr, *d_pos_b_ = nullptr, *d_best_ = nullptr, *d_best_n_ = nullptr,
         *d_aidx_ = nullptr, *d_gen_out_ = nullptr, *d_gen_n_ = nullptr;
@@ -10567,14 +16580,30 @@ private:
     static constexpr int kPfGraphMax = 8;
     static constexpr int kGenCap = 64;
     bool capturing_ = false;
+    bool fi_pf_ = true;
     cudaGraph_t pf256_graph_ = nullptr;
     cudaGraphExec_t pf256_exec_ = nullptr;
     cudaGraph_t pf1024_graph_[2] = {};
     cudaGraphExec_t pf1024_exec_[2] = {};
     cudaGraph_t graph_ = nullptr;
     cudaGraphExec_t graph_exec_ = nullptr;
+    cudaGraph_t batch_graph_ = nullptr;
+    cudaGraphExec_t batch_graph_exec_ = nullptr;
+    int batch_graph_B_ = 0;
     cudaGraph_t spec_graph_ = nullptr;
     cudaGraphExec_t spec_graph_exec_ = nullptr;
+    cudaGraph_t spec_graph_t3_ = nullptr;
+    cudaGraphExec_t spec_graph_t3_exec_ = nullptr;
+    cudaGraph_t spec_graph_t4_ = nullptr;
+    cudaGraphExec_t spec_graph_t4_exec_ = nullptr;
+    cudaGraph_t spec_graph_t6_ = nullptr;
+    cudaGraphExec_t spec_graph_t6_exec_ = nullptr;
+    cudaGraph_t spec_graph_t12_ = nullptr;
+    cudaGraphExec_t spec_graph_t12_exec_ = nullptr;
+    cudaGraph_t mtp_graph_ = nullptr;
+    cudaGraphExec_t mtp_graph_exec_ = nullptr;
+    cudaGraph_t mtp_t2_graph_ = nullptr;
+    cudaGraphExec_t mtp_t2_exec_ = nullptr;
     cudaStream_t bak_stream_ = nullptr;
     cudaGraph_t pf_graphs_[kPfGraphMax + 1] = {};
     cudaGraphExec_t pf_graph_execs_[kPfGraphMax + 1] = {};

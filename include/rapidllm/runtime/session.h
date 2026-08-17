@@ -13,7 +13,7 @@
 
 namespace rapidllm {
 
-enum class SpecKind { Off = 0, Ngram = 1, Mtp = 2, Auto = 3, Draft = 4 };
+enum class SpecKind { Off = 0, Ngram = 1, Mtp = 2, Auto = 3 };
 
 struct SpecStats {
     int proposed = 0;
@@ -43,7 +43,7 @@ public:
     double last_decode_sec() const { return last_decode_sec_; }
     int last_decode_tokens() const { return last_decode_tokens_; }
 
-    void prefill(const int32_t* ids, int n);
+    void prefill(const int32_t* ids, int n, bool host_io = true);
     // Encode PATH through the ViT and keep [n_vis, hidden] to splice over image-pad tokens.
     int load_image(const std::string& path);
     void set_vision_embeds(const float* embeds, int n_vis, int placeholder_id = -1);
@@ -66,9 +66,6 @@ public:
     SpecStats spec_stats() const { return spec_stats_; }
     int mtp_draft(int32_t first, int n, int32_t* out);
     int ngram_draft(const int32_t* ctx, int ctx_n, int32_t first, int n, int32_t* out) const;
-    // Smaller same-vocab model used as speculative draft. Not owned.
-    void set_draft(Session* draft);
-    Session* draft() const { return draft_; }
 
 private:
     void forward_hidden(const float* x_in, float* x_out, bool is_prefill, int seq, int token_pos);
@@ -79,12 +76,12 @@ private:
     const TensorDesc& must(std::string_view ir) const;
     const TensorDesc* find_w(std::string_view ir) const;
     SpecKind resolve_spec(SpecKind s) const;
-
-    int draft_tokens(int take, int32_t* out);
+    bool use_vulkan() const { return dev_ && dev_->kind() == DeviceKind::Vulkan; }
+    void dev_linear(const TensorDesc& W, const float* x, float* y, int rows, int cols);
+    void dev_rms(const float* x, const float* g, float* y, int n, float eps);
 
     Device* dev_ = nullptr;
     WeightStore* store_ = nullptr;
-    Session* draft_ = nullptr;
     std::unique_ptr<cuda_gen::Engine> gpu_;
     std::unique_ptr<DualCache> cache_;
     std::vector<float> hidden_;
@@ -93,6 +90,8 @@ private:
     std::vector<float> last_hidden_;
     std::vector<float> mtp_k_;
     std::vector<float> mtp_v_;
+    std::vector<float> mtp_hh_;
+    std::vector<int32_t> mtp_hids_;
     std::vector<int32_t> ctx_tokens_;
     std::vector<float> vis_embeds_;
     int vis_n_ = 0;
@@ -106,6 +105,11 @@ private:
     double last_prefill_sec_ = 0;
     double last_decode_sec_ = 0;
     int last_decode_tokens_ = 0;
+    std::unique_ptr<Buffer> vk_w_;
+    std::unique_ptr<Buffer> vk_x_;
+    std::unique_ptr<Buffer> vk_y_;
+    std::unique_ptr<Buffer> vk_g_;
+    std::unique_ptr<Stream> vk_stream_;
 };
 
 } // namespace rapidllm

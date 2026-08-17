@@ -145,6 +145,7 @@ public:
         };
         std::string architecture;
         int64_t block_count = -1;
+        int64_t nextn_layers = -1;
         int64_t n_embd = -1;
         int64_t n_vocab = -1;
         for (uint64_t i = 0; i < n_kv; ++i) {
@@ -152,6 +153,9 @@ public:
             const uint32_t vt = r.rd<uint32_t>();
             if (key == "general.architecture" && vt == GGUF_STR) {
                 architecture = r.rd_str();
+            } else if (key.find("nextn_predict_layers") != std::string::npos &&
+                       (vt == GGUF_U32 || vt == GGUF_I32 || vt == GGUF_U64 || vt == GGUF_I64)) {
+                nextn_layers = rd_int(vt);
             } else if (key.find("block_count") != std::string::npos &&
                        (vt == GGUF_U32 || vt == GGUF_I32 || vt == GGUF_U64 || vt == GGUF_I64)) {
                 block_count = rd_int(vt);
@@ -196,6 +200,7 @@ public:
         table.model = make_tiny_hybrid_desc(); // overwritten after probe
 
         int max_blk = -1;
+        int mtp_blk = -1;
         int n_delta = 0, n_attn = 0;
         std::vector<int> kind(256, -1);
         for (const Meta& m : metas) {
@@ -203,6 +208,7 @@ public:
             if (m.name.rfind("blk.", 0) == 0) {
                 const int blk = std::stoi(m.name.substr(4));
                 max_blk = std::max(max_blk, blk);
+                if (m.name.find(".nextn.") != std::string::npos) mtp_blk = std::max(mtp_blk, blk);
                 if (m.name.find("ssm_") != std::string::npos || m.name.find("linear_attn") != std::string::npos ||
                     m.name.find("A_log") != std::string::npos || m.name.find("attn_qkv") != std::string::npos)
                     kind[static_cast<size_t>(blk)] = 0; // Gated DeltaNet (attn_qkv != attn_q)
@@ -212,8 +218,14 @@ public:
             }
         }
         if (max_blk < 0) throw LoadError("GGUF has no blk.* tensors; architecture=" + architecture);
+        if (mtp_blk < 0 && nextn_layers > 0) mtp_blk = max_blk;
 
-        const int n_layers = max_blk + 1;
+        int n_layers = max_blk + 1;
+        int n_mtp = 0;
+        if (mtp_blk >= 0 && mtp_blk == max_blk) {
+            n_mtp = 1;
+            n_layers = mtp_blk; // peel NextN block off the main stack
+        }
         for (int i = 0; i < n_layers; ++i) {
             if (kind[static_cast<size_t>(i)] == 0) ++n_delta;
             else if (kind[static_cast<size_t>(i)] == 1) ++n_attn;
@@ -254,7 +266,7 @@ public:
                 table.model.layers[static_cast<size_t>(i)].kind = LayerKind::GatedDeltaNet;
         }
         if (n_embd > 0) table.model.hidden = static_cast<int>(n_embd);
-        if (block_count > 0 && block_count != n_layers) {
+        if (block_count > 0 && block_count != n_layers && block_count != n_layers + n_mtp) {
             throw LoadError("GGUF block_count mismatch");
         }
 
@@ -352,6 +364,24 @@ public:
         if (opt.max_layers > 0 && opt.max_layers < table.model.n_layers) {
             table.model.n_layers = opt.max_layers;
             table.model.layers.resize(static_cast<size_t>(opt.max_layers));
+        }
+        if (mtp_blk >= 0) {
+            const std::string pref = "layers[" + std::to_string(mtp_blk) + "].";
+            std::vector<std::pair<std::string, TensorDesc>> moved;
+            for (auto it = table.tensors.begin(); it != table.tensors.end();) {
+                if (it->first.rfind(pref, 0) == 0) {
+                    TensorDesc td = std::move(it->second);
+                    td.ir_name = "mtp.layers[0]." + it->first.substr(pref.size());
+                    moved.emplace_back(td.ir_name, std::move(td));
+                    it = table.tensors.erase(it);
+                } else {
+                    ++it;
+                }
+            }
+            for (auto& p : moved) table.tensors.emplace(std::move(p.first), std::move(p.second));
+            if (!moved.empty())
+                std::fprintf(stderr, "gguf_mtp_blk=%d peeled=%zu n_layers=%d\n", mtp_blk, moved.size(),
+                             table.model.n_layers);
         }
         table.model.has_mtp = table.find("mtp.fc") != nullptr && table.find("mtp.norm") != nullptr;
         for (int i = 0; i < table.model.n_layers; ++i) {

@@ -7,8 +7,10 @@ namespace rapidllm {
 
 int ngram_draft_tokens(const int32_t* ctx, int ctx_n, int32_t first, int n, int32_t* out) {
     if (n <= 0 || ctx_n <= 0 || !ctx || !out) return 0;
-    std::vector<int32_t> hay(ctx, ctx + ctx_n);
-    if (hay.back() != first) hay.push_back(first);
+    std::vector<int32_t> hay;
+    hay.reserve(static_cast<size_t>(ctx_n + 1));
+    hay.insert(hay.end(), ctx, ctx + ctx_n);
+    if (hay.empty() || hay.back() != first) hay.push_back(first);
     const int hn = static_cast<int>(hay.size());
     auto try_ng = [&](int ng) -> int {
         if (ng < 1 || hn <= ng) return 0;

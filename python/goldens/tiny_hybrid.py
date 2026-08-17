@@ -321,6 +321,7 @@ def forward(W, kinds, ids, n_new):
         return [x[d] + y[d] for d in range(H)]
 
     last_h = [0.0] * H
+    all_h = []
 
     def step(tok, pos):
         nonlocal last_h
@@ -331,9 +332,10 @@ def forward(W, kinds, ids, n_new):
             else:
                 x = one_layer_attn(i, x, pos)
             x = mlp(i, x)
-        x = rmsnorm(x, W["final_norm"])
-        last_h = x[:]
-        logits = gemv(W["lm_head"], x)
+        all_h.append(x[:])  # last-layer residual for MTP hist
+        xn = rmsnorm(x, W["final_norm"])
+        last_h = xn[:]
+        logits = gemv(W["lm_head"], xn)
         return logits
 
     # token-by-token prefill so conv/attn caches stay aligned with C++ decode path
@@ -341,6 +343,7 @@ def forward(W, kinds, ids, n_new):
     for t, tok in enumerate(ids):
         logits = step(tok, t)
     hidden_after_prompt = last_h[:]
+    prompt_h = [row[:] for row in all_h]
     pos = len(ids)
     out = []
     for _ in range(n_new):
@@ -348,10 +351,10 @@ def forward(W, kinds, ids, n_new):
         out.append(best)
         logits = step(best, pos)
         pos += 1
-    return out, hidden_after_prompt
+    return out, hidden_after_prompt, prompt_h, list(ids)
 
 
-def mtp_draft_py(W, hidden, first, n_draft=3):
+def mtp_draft_py(W, hidden, first, n_draft=3, hists=None, toks=None):
     """Match Session::mtp_draft (Qwen3.5 NextN: norm+concat+fc+attn/ffn+lm_head)."""
     h = hidden[:]
     token = first
@@ -399,12 +402,27 @@ def mtp_draft_py(W, hidden, first, n_draft=3):
         y = gemv(W["mtp.down"], hh)
         return [x[d] + y[d] for d in range(H)]
 
-    for i in range(n_draft):
-        eh = rmsnorm(h, W["mtp.pre_h"])
-        ee = rmsnorm(W["embed"][token], W["mtp.pre_e"])
-        cat = eh + ee
-        h = gemv(W["mtp.fc"], cat)
-        h = attn_mlp(h, i)
+    def fuse_layer(href, tok, p):
+        eh = rmsnorm(href, W["mtp.pre_h"])
+        ee = rmsnorm(W["embed"][tok], W["mtp.pre_e"])
+        cat = ee + eh  # NextN: concat(norm(embed), norm(hidden))
+        # Stem only: skip the 1-layer decoder (matches Session::mtp_draft).
+        return gemv(W["mtp.fc"], cat)
+
+    # Stem, pre-final-norm residual. d0 last-hist; d1+ previous hist slot.
+    n_hist = min(len(hists), len(toks)) if hists and toks else 0
+    h_last = hists[n_hist - 1] if n_hist > 0 else hidden
+    h_prev = hists[n_hist - 2] if n_hist > 1 else h_last
+    h_d0 = h_last
+    h_rest = h_prev
+    if n_draft > 0:
+        h = fuse_layer(h_d0, token, 0)
+        hn = rmsnorm(h, W["mtp.norm"])
+        logits = gemv(W["lm_head"], hn)
+        token = max(range(V), key=lambda j: logits[j])
+        drafts.append(token)
+    while len(drafts) < n_draft:
+        h = fuse_layer(h_rest, token, len(drafts))
         hn = rmsnorm(h, W["mtp.norm"])
         logits = gemv(W["lm_head"], hn)
         token = max(range(V), key=lambda j: logits[j])
@@ -703,8 +721,8 @@ def main():
 
     r = rng()
     W, kinds = make_weights(r)
-    golden, h_prompt = forward(W, kinds, PROMPT, N_NEW)
-    mtp_ids = mtp_draft_py(W, h_prompt, golden[0], 3)
+    golden, h_prompt, prompt_h, prompt_toks = forward(W, kinds, PROMPT, N_NEW)
+    mtp_ids = mtp_draft_py(W, h_prompt, golden[0], 3, prompt_h, prompt_toks)
 
     cfg = {
         "architectures": ["Qwen3_5ForConditionalGeneration"],

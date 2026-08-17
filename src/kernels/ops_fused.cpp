@@ -115,7 +115,7 @@ void fused_delta_decode(const FusedDeltaArgs& a) {
     float* beta = sc.alloc(static_cast<size_t>(a.nv));
     float* glog = sc.alloc(static_cast<size_t>(a.nv));
     for (int h = 0; h < a.nv; ++h) {
-        const int src = h / rep;
+        const int src = a.v_tiled ? (h % a.nk) : (h / rep);
         std::memcpy(qh + h * a.dk, Q + src * a.dk, sizeof(float) * a.dk);
         std::memcpy(kh + h * a.dk, K + src * a.dk, sizeof(float) * a.dk);
         std::memcpy(vh + h * a.dv, V + h * a.dv, sizeof(float) * a.dv);
@@ -151,9 +151,20 @@ void fused_attn_decode(const FusedAttnArgs& a) {
     gemv_w(a.use_simd, a.Wq, xn, qg, qg_n, a.hidden);
     gemv_w(a.use_simd, a.Wk, xn, k, kn, a.hidden);
     gemv_w(a.use_simd, a.Wv, xn, v, kn, a.hidden);
-    for (int j = 0; j < qn; ++j) {
-        q[j] = qg[j];
-        gate[j] = qg[qn + j];
+    if (a.head_dim >= 64) {
+        for (int h = 0; h < a.n_q; ++h) {
+            const int qd = h * a.head_dim;
+            const int src = h * a.head_dim * 2;
+            for (int d = 0; d < a.head_dim; ++d) {
+                q[qd + d] = qg[src + d];
+                gate[qd + d] = qg[src + a.head_dim + d];
+            }
+        }
+    } else {
+        for (int j = 0; j < qn; ++j) {
+            q[j] = qg[j];
+            gate[j] = qg[qn + j];
+        }
     }
     for (int h = 0; h < a.n_q; ++h)
         qwen3_rmsnorm(q + h * a.head_dim, a.q_norm, q + h * a.head_dim, a.head_dim, a.eps);

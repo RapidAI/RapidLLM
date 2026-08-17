@@ -170,6 +170,22 @@ std::string map_gguf_name(std::string_view src) {
         auto ir = map_mtp_rest(rest);
         if (!ir.empty()) return ir;
     }
+    // Jackrong / llama.cpp qwen35 MTP-GGUF: last block is the NextN layer.
+    // blk.64.nextn.eh_proj / enorm / hnorm / shared_head_norm.
+    {
+        std::smatch nm;
+        static const std::regex re_blk_nextn(R"(blk\.(\d+)\.nextn\.(.+))");
+        if (std::regex_match(s, nm, re_blk_nextn)) {
+            const std::string tail = nm[2].str();
+            if (tail == "eh_proj.weight" || tail == "eh_proj") return "mtp.fc";
+            if (tail == "enorm.weight" || tail == "enorm") return "mtp.pre_fc_norm_embedding";
+            if (tail == "hnorm.weight" || tail == "hnorm") return "mtp.pre_fc_norm_hidden";
+            if (tail == "shared_head_norm.weight" || tail == "shared_head_norm") return "mtp.norm";
+            // blk.N.nextn.attn_q / ffn_* live on the NextN block in some GGUFs.
+            auto ir = map_mtp_rest(std::string("0.") + tail);
+            if (!ir.empty()) return ir;
+        }
+    }
     if (s == "token_embd.weight") return "embed";
     if (s == "output.weight") return "lm_head";
     if (s == "output_norm.weight") return "final_norm";

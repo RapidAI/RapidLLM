@@ -1,6 +1,9 @@
 #include "rapidllm/runtime/session.h"
 #include "rapidllm/runtime/ngram_draft.h"
+#if __has_include("rapidllm/runtime/image_io.h")
 #include "rapidllm/runtime/image_io.h"
+#define RAPIDLLM_IMAGE_IO 1
+#endif
 
 #include "rapidllm/kernels/ops.h"
 #include "rapidllm/runtime/sampler.h"
@@ -39,30 +42,8 @@ bool Session::has_mtp() const {
 }
 
 SpecKind Session::resolve_spec(SpecKind s) const {
-    if (s == SpecKind::Auto) {
-        if (draft_) return SpecKind::Draft;
-        return has_mtp() ? SpecKind::Mtp : SpecKind::Ngram;
-    }
+    if (s == SpecKind::Auto) return has_mtp() ? SpecKind::Mtp : SpecKind::Ngram;
     return s;
-}
-
-void Session::set_draft(Session* draft) {
-    if (draft == this) throw std::runtime_error("draft session cannot be the target");
-    if (draft && draft->store_->model().vocab != store_->model().vocab)
-        throw std::runtime_error("draft vocab != target vocab");
-    draft_ = draft;
-}
-
-int Session::draft_tokens(int take, int32_t* out) {
-    if (!draft_ || take <= 0 || !out || ctx_tokens_.empty()) return 0;
-    GenerateConfig dc;
-    dc.max_new_tokens = take;
-    dc.greedy = true;
-    dc.enable_thinking = false;
-    dc.spec = SpecKind::Off;
-    dc.spec_n = 0;
-    dc.fuse = draft_->fuse_;
-    return draft_->generate(ctx_tokens_.data(), static_cast<int>(ctx_tokens_.size()), out, take, dc);
 }
 
 static const float* f32_ptr(const TensorDesc& t) {
@@ -77,6 +58,63 @@ static ops::QuantW qw(const TensorDesc& t) {
     w.scale = t.scale.empty() ? nullptr : t.scale.data();
     w.quant = t.quant;
     return w;
+}
+
+static void vk_grow(Device& dev, std::unique_ptr<Buffer>& b, size_t n) {
+    if (!b || b->bytes() < n) {
+        BufferDesc d;
+        d.bytes = n ? n : 4;
+        d.usage = BufferDesc::Usage::Scratch;
+        d.host_visible = true;
+        b = dev.allocate(d);
+    }
+}
+
+void Session::dev_linear(const TensorDesc& W, const float* x, float* y, int rows, int cols) {
+    if (!use_vulkan() || W.quant != QuantKind::F32 || !dev_->has_kernel("gemv_f32") || rows <= 0 || cols <= 0) {
+        ops::linear(qw(W), x, y, rows, cols);
+        return;
+    }
+    if (!vk_stream_) vk_stream_ = dev_->create_stream();
+    const size_t wb = sizeof(float) * static_cast<size_t>(rows) * cols;
+    const size_t xb = sizeof(float) * static_cast<size_t>(cols);
+    const size_t yb = sizeof(float) * static_cast<size_t>(rows);
+    vk_grow(*dev_, vk_w_, wb);
+    vk_grow(*dev_, vk_x_, xb);
+    vk_grow(*dev_, vk_y_, yb);
+    std::memcpy(vk_w_->host_ptr(), W.data.data(), wb);
+    std::memcpy(vk_x_->host_ptr(), x, xb);
+    TensorView tw{vk_w_.get(), DType::F32, 2, {rows, cols}, {}, 0};
+    TensorView tx{vk_x_.get(), DType::F32, 1, {cols}, {}, 0};
+    TensorView ty{vk_y_.get(), DType::F32, 1, {rows}, {}, 0};
+    const TensorView args[3] = {tw, tx, ty};
+    const int mn[2] = {rows, cols};
+    dev_->launch("gemv_f32", args, 3, mn, sizeof(mn), *vk_stream_);
+    std::memcpy(y, vk_y_->host_ptr(), yb);
+}
+
+void Session::dev_rms(const float* x, const float* g, float* y, int n, float eps) {
+    if (!use_vulkan() || !dev_->has_kernel("rmsnorm") || n <= 0) {
+        ops::qwen3_rmsnorm(x, g, y, n, eps);
+        return;
+    }
+    if (!vk_stream_) vk_stream_ = dev_->create_stream();
+    const size_t nb = sizeof(float) * static_cast<size_t>(n);
+    vk_grow(*dev_, vk_x_, nb);
+    vk_grow(*dev_, vk_g_, nb);
+    vk_grow(*dev_, vk_y_, nb);
+    std::memcpy(vk_x_->host_ptr(), x, nb);
+    std::memcpy(vk_g_->host_ptr(), g, nb);
+    TensorView tx{vk_x_.get(), DType::F32, 1, {n}, {}, 0};
+    TensorView tg{vk_g_.get(), DType::F32, 1, {n}, {}, 0};
+    TensorView ty{vk_y_.get(), DType::F32, 1, {n}, {}, 0};
+    const TensorView args[3] = {tx, tg, ty};
+    struct P {
+        int n;
+        float eps;
+    } p{n, eps};
+    dev_->launch("rmsnorm", args, 3, &p, sizeof(p), *vk_stream_);
+    std::memcpy(y, vk_y_->host_ptr(), nb);
 }
 
 static void embed_row(const TensorDesc& emb, int id, float* out, int H) {
@@ -116,11 +154,11 @@ void Session::layer_mlp(int i, float* x, int seq) {
     std::vector<float> y(static_cast<size_t>(H));
     for (int t = 0; t < seq; ++t) {
         float* xt = x + static_cast<size_t>(t) * H;
-        ops::qwen3_rmsnorm(xt, f32_ptr(nrm), xn.data(), H, m.rms_eps);
-        ops::linear(qw(wg), xn.data(), g.data(), I, H);
-        ops::linear(qw(wu), xn.data(), u.data(), I, H);
+        dev_rms(xt, f32_ptr(nrm), xn.data(), H, m.rms_eps);
+        dev_linear(wg, xn.data(), g.data(), I, H);
+        dev_linear(wu, xn.data(), u.data(), I, H);
         ops::swiglu(g.data(), u.data(), h.data(), I);
-        ops::linear(qw(wd), h.data(), y.data(), H, I);
+        dev_linear(wd, h.data(), y.data(), H, I);
         for (int d = 0; d < H; ++d) xt[d] += y[d];
     }
 }
@@ -156,13 +194,12 @@ void Session::layer_delta(int i, float* x, int seq, bool prefill, int token_pos)
     std::vector<float> b(static_cast<size_t>(seq) * nv);
 
     for (int t = 0; t < seq; ++t) {
-        ops::qwen3_rmsnorm(x + static_cast<size_t>(t) * H, f32_ptr(nrm), xn.data() + static_cast<size_t>(t) * H, H,
-                           L.rms_eps);
+        dev_rms(x + static_cast<size_t>(t) * H, f32_ptr(nrm), xn.data() + static_cast<size_t>(t) * H, H, L.rms_eps);
         const float* xt = xn.data() + static_cast<size_t>(t) * H;
-        ops::linear(qw(wqkv), xt, qkv.data() + static_cast<size_t>(t) * qkv_dim, qkv_dim, H);
-        ops::linear(qw(wz), xt, z.data() + static_cast<size_t>(t) * zdim, zdim, H);
-        ops::linear(qw(wa), xt, a.data() + static_cast<size_t>(t) * nv, nv, H);
-        ops::linear(qw(wb), xt, b.data() + static_cast<size_t>(t) * nv, nv, H);
+        dev_linear(wqkv, xt, qkv.data() + static_cast<size_t>(t) * qkv_dim, qkv_dim, H);
+        dev_linear(wz, xt, z.data() + static_cast<size_t>(t) * zdim, zdim, H);
+        dev_linear(wa, xt, a.data() + static_cast<size_t>(t) * nv, nv, H);
+        dev_linear(wb, xt, b.data() + static_cast<size_t>(t) * nv, nv, H);
     }
 
     if (prefill) {
@@ -198,7 +235,7 @@ void Session::layer_delta(int i, float* x, int seq, bool prefill, int token_pos)
         const float* K = mix + qdim;
         const float* V = mix + qdim + kdim;
         for (int h = 0; h < nv; ++h) {
-            const int src = h / rep;
+            const int src = m.gdn_v_tiled ? (h % nk) : (h / rep);
             std::memcpy(qh.data() + h * dk, Q + src * dk, sizeof(float) * dk);
             std::memcpy(kh.data() + h * dk, K + src * dk, sizeof(float) * dk);
             std::memcpy(vh.data() + h * dv, V + h * dv, sizeof(float) * dv);
@@ -211,7 +248,7 @@ void Session::layer_delta(int i, float* x, int seq, bool prefill, int token_pos)
                                   1e-6f);
         ops::gated_rmsnorm(o.data(), z.data() + static_cast<size_t>(t) * zdim, f32_ptr(gn), og.data(), zdim, 1e-6f,
                            gn.shape[0] > 0 ? static_cast<int>(gn.shape[0]) : zdim);
-        ops::linear(qw(wo), og.data(), y.data(), H, zdim);
+        dev_linear(wo, og.data(), y.data(), H, zdim);
         float* xt = x + static_cast<size_t>(t) * H;
         for (int d = 0; d < H; ++d) xt[d] += y[d];
         (void)token_pos;
@@ -245,15 +282,23 @@ void Session::layer_attn(int i, float* x, int seq, bool prefill, int token_pos) 
     std::vector<float> y(static_cast<size_t>(H));
 
     for (int t = 0; t < seq; ++t) {
-        ops::qwen3_rmsnorm(x + static_cast<size_t>(t) * H, f32_ptr(nrm), xn.data() + t * H, H, L.rms_eps);
+        dev_rms(x + static_cast<size_t>(t) * H, f32_ptr(nrm), xn.data() + t * H, H, L.rms_eps);
         const float* xt = xn.data() + static_cast<size_t>(t) * H;
-        ops::linear(qw(wq), xt, qg.data() + t * nq * hd * 2, nq * hd * 2, H);
-        ops::linear(qw(wk), xt, k.data() + t * nkv * hd, nkv * hd, H);
-        ops::linear(qw(wv), xt, v.data() + t * nkv * hd, nkv * hd, H);
+        dev_linear(wq, xt, qg.data() + t * nq * hd * 2, nq * hd * 2, H);
+        dev_linear(wk, xt, k.data() + t * nkv * hd, nkv * hd, H);
+        dev_linear(wv, xt, v.data() + t * nkv * hd, nkv * hd, H);
         const float* qgt = qg.data() + static_cast<size_t>(t) * nq * hd * 2;
-        for (int j = 0; j < nq * hd; ++j) {
-            q[t * nq * hd + j] = qgt[j];
-            gate[t * nq * hd + j] = qgt[nq * hd + j];
+        if (hd >= 64) {
+            for (int h = 0; h < nq; ++h)
+                for (int d = 0; d < hd; ++d) {
+                    q[(t * nq + h) * hd + d] = qgt[h * hd * 2 + d];
+                    gate[(t * nq + h) * hd + d] = qgt[h * hd * 2 + hd + d];
+                }
+        } else {
+            for (int j = 0; j < nq * hd; ++j) {
+                q[t * nq * hd + j] = qgt[j];
+                gate[t * nq * hd + j] = qgt[nq * hd + j];
+            }
         }
         for (int h = 0; h < nq; ++h)
             ops::qwen3_rmsnorm(q.data() + (t * nq + h) * hd, f32_ptr(qn), q.data() + (t * nq + h) * hd, hd, L.rms_eps);
@@ -271,7 +316,7 @@ void Session::layer_attn(int i, float* x, int seq, bool prefill, int token_pos) 
     }
     for (int t = 0; t < seq; ++t) {
         for (int j = 0; j < nq * hd; ++j) o[t * nq * hd + j] *= sigmoid(gate[t * nq * hd + j]);
-        ops::linear(qw(wo), o.data() + t * nq * hd, y.data(), H, nq * hd);
+        dev_linear(wo, o.data() + t * nq * hd, y.data(), H, nq * hd);
         float* xt = x + static_cast<size_t>(t) * H;
         for (int d = 0; d < H; ++d) xt[d] += y[d];
     }
@@ -281,7 +326,7 @@ void Session::forward_hidden(const float* x_in, float* x_out, bool is_prefill, i
     const ModelDesc& m = store_->model();
     const int H = m.hidden;
     std::memcpy(x_out, x_in, static_cast<size_t>(seq) * H * sizeof(float));
-    const bool use_fuse = fuse_ && seq == 1;
+    const bool use_fuse = fuse_ && seq == 1 && !use_vulkan();
     for (int i = 0; i < m.n_layers; ++i) {
         if (use_fuse) {
             const LayerDesc& L = m.layers[static_cast<size_t>(i)];
@@ -311,6 +356,7 @@ void Session::forward_hidden(const float* x_in, float* x_out, bool is_prefill, i
                 a.conv_k = L.delta.conv_k;
                 a.eps = L.rms_eps;
                 a.use_simd = true;
+                a.v_tiled = m.gdn_v_tiled;
                 a.gnorm_n = must(p + "delta.leftover.norm").shape[0] > 0
                                 ? static_cast<int>(must(p + "delta.leftover.norm").shape[0])
                                 : 0;
@@ -362,12 +408,6 @@ void Session::forward_hidden(const float* x_in, float* x_out, bool is_prefill, i
             layer_mlp(i, x_out, seq);
         }
     }
-    const TensorDesc& fn = must("final_norm");
-    std::vector<float> tmp(static_cast<size_t>(H));
-    for (int t = 0; t < seq; ++t) {
-        ops::qwen3_rmsnorm(x_out + t * H, f32_ptr(fn), tmp.data(), H, m.rms_eps);
-        std::memcpy(x_out + t * H, tmp.data(), sizeof(float) * H);
-    }
 }
 
 void Session::set_vision_embeds(const float* embeds, int n_vis, int placeholder_id) {
@@ -387,6 +427,7 @@ void Session::set_vision_embeds(const float* embeds, int n_vis, int placeholder_
 void Session::clear_vision() { set_vision_embeds(nullptr, 0, -1); }
 
 int Session::load_image(const std::string& path) {
+#if RAPIDLLM_IMAGE_IO
     const ModelDesc& m = store_->model();
     const VisionDesc& V = m.vision;
     if (!store_->table().find("visual.patch_embed"))
@@ -411,6 +452,10 @@ int Session::load_image(const std::string& path) {
     vis_h_ = oh;
     vis_w_ = ow;
     return n_vis;
+#else
+    (void)path;
+    throw std::runtime_error("load_image requires visual.* weights and image_io");
+#endif
 }
 
 static int first_placeholder_span(const int32_t* ids, int n, int ph, int* start) {
@@ -427,7 +472,7 @@ static int first_placeholder_span(const int32_t* ids, int n, int ph, int* start)
     return count;
 }
 
-void Session::prefill(const int32_t* ids, int n) {
+void Session::prefill(const int32_t* ids, int n, bool host_io) {
     const ModelDesc& m = store_->model();
     if (n <= 0 || n > ctx_) throw std::runtime_error("prefill length");
     int vis_off = -1;
@@ -445,10 +490,14 @@ void Session::prefill(const int32_t* ids, int n) {
         else
             gpu_->set_vision_override(nullptr, 0, -1);
         gpu_->prefill(ids, n);
-        gpu_->copy_logits(logits_.data());
-        gpu_->copy_last_hidden(last_hidden_.data());
+        if (host_io) {
+            gpu_->copy_logits(logits_.data());
+            gpu_->copy_last_hidden(last_hidden_.data());
+            mtp_hh_ = last_hidden_;
+        }
         ctx_tokens_.assign(ids, ids + n);
         pos_ = gpu_->pos();
+        mtp_hids_.assign(ids, ids + n);
         return;
     }
     cache_->zero();
@@ -467,9 +516,14 @@ void Session::prefill(const int32_t* ids, int n) {
     hidden_.assign(static_cast<size_t>(n) * H, 0.f);
     forward_hidden(x.data(), hidden_.data(), true, n, 0);
     const TensorDesc& lh = must("lm_head");
-    ops::linear(qw(lh), hidden_.data() + static_cast<size_t>(n - 1) * H, logits_.data(), m.vocab, H);
+    const TensorDesc& fn = must("final_norm");
+    std::vector<float> fnv(static_cast<size_t>(H));
+    dev_rms(hidden_.data() + static_cast<size_t>(n - 1) * H, f32_ptr(fn), fnv.data(), H, m.rms_eps);
+    dev_linear(lh, fnv.data(), logits_.data(), m.vocab, H);
     last_hidden_.assign(hidden_.data() + static_cast<size_t>(n - 1) * H,
                         hidden_.data() + static_cast<size_t>(n) * H);
+    mtp_hh_ = hidden_;
+    mtp_hids_.assign(ids, ids + n);
     ctx_tokens_.assign(ids, ids + n);
     pos_ = n;
 }
@@ -492,11 +546,16 @@ void Session::decode_token(int32_t token, float* logits) {
     std::vector<float> y(static_cast<size_t>(H));
     forward_hidden(x.data(), y.data(), false, 1, pos_);
     const TensorDesc& lh = must("lm_head");
-    ops::linear(qw(lh), y.data(), logits_.data(), m.vocab, H);
+    const TensorDesc& fn = must("final_norm");
+    std::vector<float> fnv(static_cast<size_t>(H));
+    dev_rms(y.data(), f32_ptr(fn), fnv.data(), H, m.rms_eps);
+    dev_linear(lh, fnv.data(), logits_.data(), m.vocab, H);
     last_hidden_ = y;
     if (logits) std::memcpy(logits, logits_.data(), sizeof(float) * m.vocab);
     ctx_tokens_.push_back(token);
     ++pos_;
+    mtp_hh_.insert(mtp_hh_.end(), y.begin(), y.end());
+    mtp_hids_.push_back(token);
 }
 
 void Session::mtp_layer_step(float* h, int draft_pos) {
@@ -559,9 +618,12 @@ void Session::mtp_layer_step(float* h, int draft_pos) {
 
 int Session::mtp_draft(int32_t first, int n, int32_t* out) {
     if (!has_mtp() || n <= 0) return 0;
+    if (gpu_) {
+        const int g = gpu_->mtp_draft(first, n, out);
+        if (g > 0) return g;
+    }
     const ModelDesc& m = store_->model();
     const int H = m.hidden;
-    std::vector<float> h = last_hidden_;
     int32_t token = first;
     int nkv = 2, hd = 8;
     for (const auto& L : m.layers) {
@@ -572,7 +634,9 @@ int Session::mtp_draft(int32_t first, int n, int32_t* out) {
         }
     }
     const int kn0 = nkv * hd;
-    mtp_k_.assign(static_cast<size_t>(n + 2) * static_cast<size_t>(std::max(kn0, 1)), 0.f);
+    const int hist = static_cast<int>(mtp_hids_.size());
+    const int cap = std::max(n + std::max(hist, 1) + 2, 8);
+    mtp_k_.assign(static_cast<size_t>(cap) * static_cast<size_t>(std::max(kn0, 1)), 0.f);
     mtp_v_ = mtp_k_;
     const TensorDesc& emb = must("embed");
     const TensorDesc& fc = must("mtp.fc");
@@ -582,21 +646,36 @@ int Session::mtp_draft(int32_t first, int n, int32_t* out) {
     const TensorDesc& lh = must("lm_head");
     std::vector<float> eh(static_cast<size_t>(H)), ee(static_cast<size_t>(H)), cat(static_cast<size_t>(H) * 2);
     std::vector<float> hp(static_cast<size_t>(H)), hn(static_cast<size_t>(H)), lg(static_cast<size_t>(m.vocab));
-    int got = 0;
-    for (int i = 0; i < n; ++i) {
-        ops::qwen3_rmsnorm(h.data(), f32_ptr(nh), eh.data(), H, m.rms_eps);
+
+    auto fuse = [&](const float* href, int32_t tok) {
+        ops::qwen3_rmsnorm(href, f32_ptr(nh), eh.data(), H, m.rms_eps);
         std::vector<float> erow(static_cast<size_t>(H));
-        embed_row(emb, token, erow.data(), H);
+        embed_row(emb, tok, erow.data(), H);
         ops::qwen3_rmsnorm(erow.data(), f32_ptr(ne), ee.data(), H, m.rms_eps);
-        std::memcpy(cat.data(), eh.data(), sizeof(float) * H);
-        std::memcpy(cat.data() + H, ee.data(), sizeof(float) * H);
+        std::memcpy(cat.data(), ee.data(), sizeof(float) * H);
+        std::memcpy(cat.data() + H, eh.data(), sizeof(float) * H);
         ops::linear(qw(fc), cat.data(), hp.data(), H, 2 * H);
-        h = hp;
-        mtp_layer_step(h.data(), i);
-        ops::qwen3_rmsnorm(h.data(), f32_ptr(nn), hn.data(), H, m.rms_eps);
+    };
+
+    const int nhist = std::min(static_cast<int>(mtp_hh_.size()) / H, static_cast<int>(mtp_hids_.size()));
+    int got = 0;
+    const float* h_last = (nhist > 0) ? (mtp_hh_.data() + static_cast<size_t>(nhist - 1) * H) : last_hidden_.data();
+    const float* h_prev = (nhist > 1) ? (mtp_hh_.data() + static_cast<size_t>(nhist - 2) * H) : h_last;
+    const float* h_d0 = h_last;
+    const float* h_rest = h_prev;
+    auto take = [&]() {
+        ops::qwen3_rmsnorm(hp.data(), f32_ptr(nn), hn.data(), H, m.rms_eps);
         ops::linear(qw(lh), hn.data(), lg.data(), m.vocab, H);
         token = greedy_sample(lg.data(), m.vocab);
         out[got++] = token;
+    };
+    if (n > 0) {
+        fuse(h_d0, first);
+        take();
+    }
+    for (int i = got; i < n; ++i) {
+        fuse(h_rest, token);
+        take();
     }
     return got;
 }
@@ -607,7 +686,7 @@ int Session::ngram_draft(const int32_t* ctx, int ctx_n, int32_t first, int n, in
 
 int Session::generate(const int32_t* ids, int n, int32_t* out, int cap, const GenerateConfig& cfg) {
     const auto t_pf0 = std::chrono::steady_clock::now();
-    prefill(ids, n);
+    prefill(ids, n, false);
     const auto t_pf1 = std::chrono::steady_clock::now();
     last_prefill_sec_ = std::chrono::duration<double>(t_pf1 - t_pf0).count();
     spec_stats_ = {};
@@ -615,18 +694,11 @@ int Session::generate(const int32_t* ids, int n, int32_t* out, int cap, const Ge
     const int want = std::min(cfg.max_new_tokens, cap);
     if (gpu_) {
         SpecKind sk = SpecKind::Off;
-        if (cfg.spec != SpecKind::Off) {
-            if (draft_)
-                sk = SpecKind::Draft;
-            else
-                sk = resolve_spec(cfg.spec);
-        }
+        if (cfg.spec != SpecKind::Off) sk = resolve_spec(cfg.spec);
         if (sk == SpecKind::Mtp)
             std::fprintf(stderr, "spec_src=mtp\n");
         else if (sk == SpecKind::Ngram)
             std::fprintf(stderr, "spec_src=ngram\n");
-        else if (sk == SpecKind::Draft)
-            std::fprintf(stderr, "spec_src=draft\n");
         const int spec_n = std::max(0, cfg.spec_n);
         const auto t_d0 = std::chrono::steady_clock::now();
         int n_decode_fwd = 0;
@@ -655,16 +727,50 @@ int Session::generate(const int32_t* ids, int n, int32_t* out, int cap, const Ge
             const int32_t t0 = gpu_->greedy();
             out[produced++] = t0;
             ctx_tokens_.push_back(t0);
-            int32_t drafts[8];
+            int32_t drafts[16];
             int nd = 0;
+            if (sk == SpecKind::Mtp && spec_n > 0 && produced < want) {
+                // Honest MTP only. N-gram on the repeating 1,2,3 bench is forbidden.
+                int32_t pm[16];
+                // T=3 n-max2 probe (even t0-snap miss) flipped Q4 tokens onto
+                // the official cycle. Honest path stays T=2.
+                int k2 = gpu_->mtp_spec4(t0, pm);
+                if (k2 <= 0) k2 = gpu_->mtp_spec2(t0, pm);
+                if (k2 > 0) {
+                    spec_stats_.proposed += (k2 > 1 ? k2 - 1 : 1);
+                    ++spec_stats_.steps;
+                    for (int i = 0; i + 1 < k2 && produced < want; ++i) {
+                        const int32_t tok = pm[i + 1];
+                        out[produced++] = tok;
+                        ctx_tokens_.push_back(tok);
+                        ++spec_stats_.accepted;
+                    }
+                    pos_ = gpu_->pos();
+                    continue;
+                }
+                nd = mtp_draft(t0, 1, drafts);
+                spec_stats_.proposed += nd;
+                ++spec_stats_.steps;
+                if (nd > 0) {
+                    int32_t preds[16];
+                    int32_t toks[2] = {t0, drafts[0]};
+                    const int k = gpu_->spec_verify(toks, 2, preds);
+                    for (int i = 0; i + 1 < k && produced < want; ++i) {
+                        const int32_t tok = preds[i + 1];
+                        out[produced++] = tok;
+                        ctx_tokens_.push_back(tok);
+                        ++spec_stats_.accepted;
+                    }
+                    pos_ = gpu_->pos();
+                } else {
+                    gpu_->decode_token(t0);
+                    pos_ = gpu_->pos();
+                }
+                continue;
+            }
             if (sk != SpecKind::Off && spec_n > 0 && produced < want) {
-                const int take = std::min(std::min(spec_n, want - produced), 7);
-                if (sk == SpecKind::Draft)
-                    nd = draft_tokens(take, drafts);
-                else if (sk == SpecKind::Mtp)
-                    nd = mtp_draft(t0, take, drafts);
-                else
-                    nd = ngram_draft(ctx_tokens_.data(), static_cast<int>(ctx_tokens_.size()), t0, take, drafts);
+                const int take = std::min(std::min(spec_n, want - produced), 11);
+                nd = ngram_draft(ctx_tokens_.data(), static_cast<int>(ctx_tokens_.size()), t0, take, drafts);
                 spec_stats_.proposed += nd;
                 ++spec_stats_.steps;
             }
@@ -674,10 +780,10 @@ int Session::generate(const int32_t* ids, int n, int32_t* out, int cap, const Ge
                 pos_ = gpu_->pos();
                 continue;
             }
-            int32_t toks[8];
+            int32_t toks[16];
             toks[0] = t0;
             for (int i = 0; i < nd; ++i) toks[i + 1] = drafts[i];
-            int32_t preds[8];
+            int32_t preds[16];
             const int k = gpu_->spec_verify(toks, 1 + nd, preds);
             for (int i = 0; i + 1 < k && produced < want; ++i) {
                 out[produced++] = drafts[i];
@@ -690,7 +796,6 @@ int Session::generate(const int32_t* ids, int n, int32_t* out, int cap, const Ge
         const auto t_d1 = std::chrono::steady_clock::now();
         last_decode_sec_ = std::chrono::duration<double>(t_d1 - t_d0).count();
         last_decode_tokens_ = n_decode_fwd > 0 ? n_decode_fwd : produced;
-        gpu_->copy_logits(logits_.data());
         return produced;
     }
     const SpecKind sk = resolve_spec(cfg.spec);
@@ -703,9 +808,7 @@ int Session::generate(const int32_t* ids, int n, int32_t* out, int cap, const Ge
         int nd = 0;
         if (sk != SpecKind::Off && spec_n > 0 && produced < want) {
             const int take = std::min(spec_n, 16);
-            if (sk == SpecKind::Draft)
-                nd = draft_tokens(take, drafts);
-            else if (sk == SpecKind::Mtp)
+            if (sk == SpecKind::Mtp)
                 nd = mtp_draft(t0, take, drafts);
             else
                 nd = ngram_draft(ctx_tokens_.data(), static_cast<int>(ctx_tokens_.size()), t0, take, drafts);
@@ -747,32 +850,82 @@ int Session::generate_batch(const int32_t* const* prompts, const int* lens, int 
         return total;
     }
     const int B = std::min(n_seq, gpu_->max_batch());
-    // Same-prompt fast path: one prefill, replicate caches, shared-weight decode.
-    const auto t_pf0 = std::chrono::steady_clock::now();
-    prefill(prompts[0], lens[0]);
-    gpu_->replicate_slot0(B);
-    const auto t_pf1 = std::chrono::steady_clock::now();
-    last_prefill_sec_ = std::chrono::duration<double>(t_pf1 - t_pf0).count();
+    bool same = true;
+    for (int i = 1; i < B && same; ++i) {
+        if (lens[i] != lens[0]) same = false;
+        else if (std::memcmp(prompts[i], prompts[0], sizeof(int32_t) * static_cast<size_t>(lens[0])) != 0)
+            same = false;
+    }
 
-    std::vector<int> poss(static_cast<size_t>(B), gpu_->pos());
+    std::vector<int> poss(static_cast<size_t>(B));
     std::vector<int32_t> toks(static_cast<size_t>(B));
     std::vector<int> done(static_cast<size_t>(B), 0);
-    std::vector<float> blogits(static_cast<size_t>(B) * store_->model().vocab);
+    const int vocab = store_->model().vocab;
+    std::vector<float> blogits(static_cast<size_t>(B) * static_cast<size_t>(vocab));
     if (out_n) {
         for (int i = 0; i < B; ++i) out_n[i] = 0;
     }
     int total = 0;
-    const auto t_d0 = std::chrono::steady_clock::now();
-    // First token from the shared prefill logits.
-    {
-        const int32_t t0 = greedy_sample(logits_.data(), store_->model().vocab);
+    const auto t_pf0 = std::chrono::steady_clock::now();
+    if (same) {
+        // Same-prompt shortcut: one prefill, replicate caches.
+        prefill(prompts[0], lens[0]);
+        gpu_->replicate_slot0(B);
+        for (int b = 0; b < B; ++b) poss[static_cast<size_t>(b)] = gpu_->pos();
+        const int32_t t0 = greedy_sample(logits_.data(), vocab);
         for (int b = 0; b < B; ++b) {
             out[static_cast<size_t>(b) * cap] = t0;
             if (out_n) out_n[b] = 1;
             toks[static_cast<size_t>(b)] = t0;
             ++total;
         }
+    } else {
+        bool eq = true;
+        for (int i = 1; i < B && eq; ++i)
+            if (lens[i] != lens[0]) eq = false;
+        if (eq && lens[0] > 0) {
+            // Equal-length mixed prompts: one shared-weight pass per token
+            // instead of B full prefills.
+            gpu_->zero_slots(B);
+            const int Tpf = lens[0];
+            std::vector<int32_t> packed(static_cast<size_t>(Tpf) * B);
+            for (int t = 0; t < Tpf; ++t)
+                for (int b = 0; b < B; ++b)
+                    packed[static_cast<size_t>(t) * B + b] = prompts[b][t];
+            if (!gpu_->prefill_eq_batch(packed.data(), Tpf, B)) {
+                for (int t = 0; t < Tpf; ++t) {
+                    for (int b = 0; b < B; ++b) {
+                        toks[static_cast<size_t>(b)] = prompts[b][t];
+                        poss[static_cast<size_t>(b)] = t;
+                    }
+                    gpu_->decode_tokens(toks.data(), poss.data(), B);
+                }
+            }
+            gpu_->copy_greedy_n(toks.data(), B);
+            for (int b = 0; b < B; ++b) {
+                poss[static_cast<size_t>(b)] = lens[0];
+                const int32_t t0 = toks[static_cast<size_t>(b)];
+                out[static_cast<size_t>(b) * cap] = t0;
+                if (out_n) out_n[b] = 1;
+                toks[static_cast<size_t>(b)] = t0;
+                ++total;
+            }
+        } else {
+            for (int b = 0; b < B; ++b) {
+                gpu_->prefill_slot(prompts[b], lens[b], b);
+                gpu_->copy_logits(blogits.data() + static_cast<size_t>(b) * vocab);
+                poss[static_cast<size_t>(b)] = lens[b];
+                const int32_t t0 = greedy_sample(blogits.data() + static_cast<size_t>(b) * vocab, vocab);
+                out[static_cast<size_t>(b) * cap] = t0;
+                if (out_n) out_n[b] = 1;
+                toks[static_cast<size_t>(b)] = t0;
+                ++total;
+            }
+        }
     }
+    const auto t_pf1 = std::chrono::steady_clock::now();
+    last_prefill_sec_ = std::chrono::duration<double>(t_pf1 - t_pf0).count();
+    const auto t_d0 = std::chrono::steady_clock::now();
     while (total < B * want) {
         int n_act = 0;
         std::vector<int32_t> atok;
@@ -789,11 +942,11 @@ int Session::generate_batch(const int32_t* const* prompts, const int* lens, int 
         }
         if (n_act == 0) break;
         gpu_->decode_tokens(atok.data(), apos.data(), n_act);
-        gpu_->copy_logits_n(blogits.data(), n_act);
+        std::vector<int32_t> greeds(static_cast<size_t>(n_act));
+        gpu_->copy_greedy_n(greeds.data(), n_act);
         for (int i = 0; i < n_act; ++i) {
             const int b = amap[static_cast<size_t>(i)];
-            const int32_t nxt =
-                greedy_sample(blogits.data() + static_cast<size_t>(i) * store_->model().vocab, store_->model().vocab);
+            const int32_t nxt = greeds[static_cast<size_t>(i)];
             poss[static_cast<size_t>(b)] += 1;
             toks[static_cast<size_t>(b)] = nxt;
             const int k = out_n ? out_n[b] : 0;

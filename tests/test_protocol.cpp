@@ -31,6 +31,17 @@ int main() {
         expect(r.messages.size() == 2, "chat two turns");
         expect(r.messages[0].role == "system" && r.messages[1].content == "hello", "chat fields");
         expect(r.max_tokens == 16, "chat max_tokens");
+        expect(!r.stream, "chat stream default off");
+    }
+    {
+        GenRequest r;
+        expect(parse_openai_chat("{\"stream\":true,\"messages\":[{\"role\":\"user\",\"content\":\"x\"}]}", r, err),
+               "parse stream true");
+        expect(r.stream, "stream true");
+        GenRequest r1;
+        expect(parse_openai_chat("{\"stream\":1,\"messages\":[{\"role\":\"user\",\"content\":\"x\"}]}", r1, err),
+               "parse stream 1");
+        expect(r1.stream, "stream 1");
     }
     {
         GenRequest r;
@@ -112,6 +123,34 @@ int main() {
             expect(out.status == 200 && out.body.find("\"type\":\"message\"") != std::string::npos,
                    "anthropic generate");
 
+            rq.path = "/v1/chat/completions";
+            rq.body = "{\"model\":\"tiny\",\"max_tokens\":6,\"stream\":true,"
+                      "\"messages\":[{\"role\":\"user\",\"content\":\"1,2,3\"}]}";
+            out = handle_http(rq, eng, sess, "tiny");
+            expect(out.status == 200, "chat sse status");
+            expect(out.content_type == "text/event-stream", "chat sse content-type");
+            expect(out.body.find("data: ") != std::string::npos, "chat sse data");
+            expect(out.body.find("chat.completion.chunk") != std::string::npos, "chat sse chunk");
+            expect(out.body.find("data: [DONE]") != std::string::npos, "chat sse done");
+            expect(out.body.find("finish_reason") != std::string::npos, "chat sse finish");
+
+            rq.path = "/v1/responses";
+            rq.body = "{\"model\":\"tiny\",\"max_output_tokens\":6,\"stream\":true,\"input\":\"1,2,3\"}";
+            out = handle_http(rq, eng, sess, "tiny");
+            expect(out.status == 200 && out.content_type == "text/event-stream", "responses sse type");
+            expect(out.body.find("event: response.created") != std::string::npos, "responses sse created");
+            expect(out.body.find("event: response.output_text.delta") != std::string::npos, "responses sse delta");
+            expect(out.body.find("event: response.completed") != std::string::npos, "responses sse done");
+
+            rq.path = "/v1/messages";
+            rq.body = "{\"model\":\"tiny\",\"max_tokens\":6,\"stream\":true,"
+                      "\"messages\":[{\"role\":\"user\",\"content\":\"1,2,3\"}]}";
+            out = handle_http(rq, eng, sess, "tiny");
+            expect(out.status == 200 && out.content_type == "text/event-stream", "anthropic sse type");
+            expect(out.body.find("event: message_start") != std::string::npos, "anthropic sse start");
+            expect(out.body.find("event: content_block_delta") != std::string::npos, "anthropic sse delta");
+            expect(out.body.find("event: message_stop") != std::string::npos, "anthropic sse stop");
+
             rapidllm_session_free(sess);
         }
         rapidllm_free(eng);
@@ -121,6 +160,6 @@ int main() {
         std::fprintf(stderr, "test_protocol %d failure(s)\n", fails);
         return 1;
     }
-    std::printf("test_protocol ok openai_chat openai_responses anthropic messages\n");
+    std::printf("test_protocol ok openai_chat openai_responses anthropic messages sse\n");
     return 0;
 }

@@ -77,7 +77,8 @@ int main() {
                 sess.last_decode_tokens() / std::max(sess.last_decode_sec(), 1e-9));
 
     // CUDA generate with the loaded MTP head — must not fall back to n-gram.
-    Session sm(*dev, store, 64, false, true, true);
+    WeightStore store_m = WeightStore::open(root / "tiny_hybrid", *dev, LoadOptions{});
+    Session sm(*dev, store_m, 64, false, true, true);
     if (!sm.uses_cuda()) {
         std::fprintf(stderr, "MTP session lost CUDA engine\n");
         return 1;
@@ -107,7 +108,8 @@ int main() {
     }
 
     // Standalone draft after CUDA prefill must see last hidden (not zeros).
-    Session sd(*dev, store, 64, false, true, true);
+    WeightStore store_d = WeightStore::open(root / "tiny_hybrid", *dev, LoadOptions{});
+    Session sd(*dev, store_d, 64, false, true, true);
     sd.prefill(prompt.data(), static_cast<int>(prompt.size()));
     std::vector<int32_t> drafts(8);
     const int nd = sd.mtp_draft(want[0], 3, drafts.data());
@@ -120,6 +122,7 @@ int main() {
         return 1;
     }
 
+    // flash_gqa6_selftest runs in EngineImpl ctor (24Q/4KV hd=256 vs per-head flash).
     std::printf("test_cuda_decode ok GPU matches golden\n");
     return 0;
 }

@@ -43,8 +43,8 @@ typedef struct RapidSessionConfig {
     int enable_thinking;
     int preserve_thinking;
     int max_new_tokens;
-    int spec;    /* 0=off 1=ngram 2=mtp 3=auto 4=draft-model */
-    int spec_n;  /* draft tokens per step */
+    int spec;    /* 0=off 1=ngram 2=mtp 3=auto */
+    int spec_n;  /* speculative tokens per step */
 } RapidSessionConfig;
 
 typedef struct RapidSpecStats {
@@ -85,9 +85,12 @@ int           rapidllm_generate(RapidSession*, const int32_t* ids, int n,
 int           rapidllm_generate_batch(RapidSession*, const int32_t* ids, int n, int n_seq,
                                       const RapidSampleParams*, int32_t* out, int cap_each, int* out_n,
                                       RapidError*);
+/* Independent prompts: packed ids of length sum(lens). One shared-weight decode step. */
+int           rapidllm_generate_batch_var(RapidSession*, const int32_t* ids, const int* lens, int n_seq,
+                                          const RapidSampleParams*, int32_t* out, int cap_each, int* out_n,
+                                          RapidError*);
 RapidSession* rapidllm_session_new(RapidLLM*, const RapidSessionConfig*, RapidError*);
 void          rapidllm_session_set_max_new(RapidSession*, int max_new_tokens);
-int           rapidllm_session_set_draft(RapidSession* target, RapidSession* draft, RapidError*);
 int           rapidllm_prefill(RapidSession*, const int32_t*, int n, RapidError*);
 int           rapidllm_decode(RapidSession*, int32_t token, RapidLogitsView*, RapidError*);
 int           rapidllm_sample(RapidSession*, const RapidSampleParams*, int32_t* token, RapidError*);
@@ -95,6 +98,11 @@ void          rapidllm_session_free(RapidSession*);
 void          rapidllm_spec_stats(RapidSession*, RapidSpecStats*);
 void          rapidllm_bench_stats(RapidSession*, double* prefill_s, double* decode_s, int* n_decode);
 int           rapidllm_uses_cuda(const RapidSession*);
+int           rapidllm_uses_vulkan(const RapidSession*);
+const char*   rapidllm_device_name(const RapidSession*);
+int           rapidllm_has_mtp(const RapidSession*);
+/* Standalone MTP draft after prefill. Writes up to n ids. Returns count or -1. */
+int           rapidllm_mtp_draft(RapidSession*, int32_t first, int n, int32_t* out, RapidError*);
 int           rapidllm_api_version(void);
 const char*   rapidllm_version_string(void);
 

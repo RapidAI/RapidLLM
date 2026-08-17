@@ -19,7 +19,7 @@
 | | |
 | --- | --- |
 | 架构 | Qwen3.6-27B、Qwen3.8-27B（`qwen3_5` hybrid：48 层 Gated DeltaNet + 16 层 Gated Attention） |
-| 投机解码 | `--spec off\|ngram\|mtp\|auto\|draft` |
+| 投机解码 | `--spec off\|ngram\|mtp\|auto` |
 | MTP | 目标模型自带多 token 预测头（`mtp.fc` / `mtp.norm`）作草稿 |
 | 连续批 | `--batch N` / `rapidllm_generate_batch` — 每步共享一次权重扫描 |
 | 相对 vLLM（同机） | 短 decode **1.50–1.80×**；能跑 hybrid GGUF；163k–262k 能分配。见 [相对 vLLM 的结论](#相对-vllm-的结论) |
@@ -58,10 +58,9 @@ RapidLLM 把官方 HuggingFace **block-FP8** 目录和社区 **GGUF** 文件加�
 - 可选 TurboQuant 风格 KV（`--kv-type q8k_tq3v`）：K 用 q8、V 用 3-bit WHT，大约是 FP16 的 1/3
 - MemoryPlanner：超预算时缩短 ctx 或拒载，避免被操作系统杀掉
 - 融合 decode（`--fuse=on|off`），便于与未融合算子对拍
-- **投机解码**：`off` / `ngram` / `mtp` / `auto` / `draft`
-- **MTP**：27B 内嵌 1 层 MTP 头出草稿 token；`--spec mtp`，或未挂 `--draft` 时默认 `auto` 会用它
+- **投机解码**：`off` / `ngram` / `mtp` / `auto`
+- **MTP**：27B 内嵌 1 层 MTP 头出草稿 token；`--spec mtp` 或默认 `auto`
 - **连续批**：`--batch N`（同一 prompt 多副本，每步共享一次权重扫描；CUDA 用 `RAPIDLLM_MAX_BATCH`）
-- 外挂草稿模型：[`Qwen/Qwen3.5-0.8B`](https://huggingface.co/Qwen/Qwen3.5-0.8B)
 - HTTP 服务：OpenAI `/v1/chat/completions`、`/v1/responses`，以及 Anthropic `/v1/messages`
 - Qwen3.5 / 3.6 / 3.8 ViT + CLI 图文联合生成（`--image PATH`）
 - 默认开启 thinking；`bench` 与 `serve` 强制 `enable_thinking=false`
@@ -105,15 +104,15 @@ Windows 上若没有 Ninja，去掉 `-G Ninja`，使用 Visual Studio 生成器�
 ## 命令行
 
 ```text
-rapidllm -m <hf-dir|file.gguf> [--device cpu|cuda] [--ctx 32768] [--prompt TEXT]
+rapidllm -m <hf-dir|file.gguf> [--device cpu|cuda|vulkan] [--ctx 32768] [--prompt TEXT]
          [--max-new N] [--threads N] [--max-layers N] [--max-ram-mb N]
          [--thinking | --no-thinking] [--fuse=on|off]
-         [--spec off|ngram|mtp|auto|draft] [--spec-n N] [--draft <hf-dir|file.gguf>]
+         [--spec off|ngram|mtp|auto] [--spec-n N]
          [--image PATH] [--vision] [--batch N]
 
-rapidllm bench -m <path> [--device cpu|cuda] [--fuse=on|off] [--micro] [--batch N]
+rapidllm bench -m <path> [--device cpu|cuda|vulkan] [--fuse=on|off] [--micro] [--batch N]
 
-rapidllm serve -m <path> [--host 127.0.0.1] [--port 8080] [--device cpu|cuda]
+rapidllm serve -m <path> [--host 127.0.0.1] [--port 8080] [--device cpu|cuda|vulkan]
 ```
 
 示例：
@@ -121,7 +120,7 @@ rapidllm serve -m <path> [--host 127.0.0.1] [--port 8080] [--device cpu|cuda]
 ```bash
 rapidllm -m /path/to/Qwen3.6-27B-FP8 --device cpu --ctx 32768 --prompt "你好"
 rapidllm -m model.gguf --device cpu --prompt "你好"
-rapidllm -m /path/to/Qwen3.6-27B-FP8 --draft /path/to/Qwen3.5-0.8B --spec draft --spec-n 3 --prompt "你好"
+rapidllm -m /path/to/Qwen3.6-27B-FP8 --spec mtp --spec-n 3 --prompt "你好"
 rapidllm bench -m model.gguf
 rapidllm bench -m model.gguf --device cuda --batch 4
 rapidllm bench -m /path/to/Qwen3.6-27B-FP8 --device cuda --ctx 131072 --prompt-n 8192 --max-new 8 --spec off
@@ -136,10 +135,9 @@ rapidllm serve -m /path/to/Qwen3.6-27B-FP8 --host 127.0.0.1 --port 8080 --device
 | `--ctx` | `32768` | planner 可能缩短或拒载 |
 | `--max-new` | `8` | 生成 token 数 |
 | `--fuse` | `on` | 融合 DeltaNet / Attn / MLP decode |
-| `--spec` | `auto` | `draft` 需要 `--draft` |
+| `--spec` | `auto` | 有 MTP 头则用 `mtp`，否则 `ngram` |
 | `--kv-type` | `f16`；`--ctx>163840` 自动 `q8k_tq3v` | `q8k_tq3v` = K q8 + V TurboQuant-3。环境变量 `RAPIDLLM_KV_TQ=0\|1` |
-| `--draft` | — | 草稿权重；隐含 `--spec draft`。推荐 [`Qwen3.5-0.8B`](https://huggingface.co/Qwen/Qwen3.5-0.8B) |
-| `--batch` | `1` | 同一 prompt 的副本数；会设置 `RAPIDLLM_MAX_BATCH` |
+| `--batch` | `1` | 并发序列数（设置 `RAPIDLLM_MAX_BATCH`，上限 128）。独立 prompt 再加 `--mixed` |
 | `--prompt-n` | — | 直接合成 `N` 个不重复 token id（不走分词）。长上下文 bench 用 |
 | `--vision` / `--image` | 关 | 加载 `visual.*`。`--image PATH` 会跑 ViT 并把视觉 token 拼进 generate |
 | `--thinking` | 开 | `bench` 与 `serve` 始终关闭 |
@@ -149,7 +147,6 @@ rapidllm serve -m /path/to/Qwen3.6-27B-FP8 --host 127.0.0.1 --port 8080 --device
 - 最新目标：[`Qwen/Qwen3.8-27B-FP8`](https://huggingface.co/Qwen/Qwen3.8-27B-FP8) — 与 3.6-27B 同一套 `qwen3_5` hybrid IR
 - 上一版目标：[`Qwen/Qwen3.6-27B-FP8`](https://huggingface.co/Qwen/Qwen3.6-27B-FP8)
 - 社区 GGUF：[`unsloth/Qwen3.8-27B-GGUF`](https://huggingface.co/unsloth/Qwen3.8-27B-GGUF) Q4_K_M / Q5_K_M / Q6_K / Q8_0（亦可 [`unsloth/Qwen3.6-27B-GGUF`](https://huggingface.co/unsloth/Qwen3.6-27B-GGUF)）
-- 推荐草稿（3.5 / 3.6 / **3.8 通用**）：[`Qwen/Qwen3.5-0.8B`](https://huggingface.co/Qwen/Qwen3.5-0.8B) — 同族，词表 **248320**，24 层 hybrid（18 DeltaNet + 6 Gated Attn），hidden 1024
 
 ## Qwen3.8-27B 量化 bakeoff（RTX 6000 Ada 48 GB）
 
@@ -169,6 +166,73 @@ rapidllm bench -m /path/to/Qwen3.8-27B-Q4_K_M.gguf \
 ```
 
 社区 Q8_0 有时会量化 DeltaNet 的 `in_proj_a` / `in_proj_b`；loader 会把这些 leftover 反量化成 F32。`A_log` / conv / norm 若被量化仍会拒载。
+
+## Qwen3.8-27B 极限启动参数（RTX 6000 Ada 48 GB）
+
+**2026-08-16** 同机重测。墙钟 tok/s 是加载 + warmup generate 之后。thinking 关。prompt `1,2,3`，16 个新 token。未另说明时都是 `--fuse=on --device cuda --spec off`。
+
+### 单用户（单路 tok/s 最高）
+
+用 packed **Q8_0**。官方 FP8 次之；这份 checkpoint 请开 **MTP**（`--spec mtp --spec-n 3`）。同文件官方 pair：MTP 墙钟 **35.94**（accepted=7/8）对 `--spec off` **27.19**。Paris `--max-new 64`：MTP **41.68**（accepted=30/33）对 off **29.51**。重复的 `1,2,3` **不要开 n-gram**，那会把吞吐刷假。
+
+```bash
+# 单用户 tok/s 最高
+rapidllm bench -m /path/to/Qwen3.8-27B-Q8_0.gguf \
+  --device cuda --fuse=on --spec off --no-thinking --ctx 256 --max-new 16 --prompt 1,2,3
+
+# 必须留在官方 FP8 时
+rapidllm bench -m /path/to/Qwen3.8-27B-FP8 \
+  --device cuda --fuse=on --spec mtp --spec-n 3 --no-thinking --ctx 256 --max-new 16 --prompt 1,2,3
+```
+
+| 权重 | 墙钟 / decode tok/s | Prefill 秒 | 峰值 MiB | 备注 |
+| --- | ---: | ---: | ---: | --- |
+| Unsloth Q8_0 | **35.56** | 0.038 | 33557 | 原生 packed Q8 GEMV |
+| Jackrong MTP-GGUF Q8_0 | 35.33 | 0.037 | 33169 | 同一套官方 pair；快于 FP8 30.73 |
+| 官方 FP8 | 30.73 | 0.064 | 28007 | CUDA graph decode；跳过无用的 F16 权重工作区 |
+| Unsloth Q4_K_M | 26.51 | 0.085 | 24211 | 显存占用最小 |
+| Jackrong MTP-GGUF Q4_K_M | 26.23 | 0.080 | 22607 | 原生 packed Q4/Q6；MTP accepted=3 但墙钟 21.93 |
+| Jackrong MTP-GGUF Q6_K | 23.34 | 0.059 | 27615 | 快于已发布的 Unsloth Q6 22.98 |
+| 官方 FP8 `--spec mtp --spec-n 3` | **35.94** / 44.26 | 0.083 | 29341 | proposed=8 accepted=7；并行 GQA-6 flash + miss-fast；快于同文件 off 27.19 |
+
+官方 FP8 开 `--spec mtp` 时 `--max-new 64` 墙钟 **41.68**（Paris，accepted=30/33），同文件 off **29.51**。bench 请关 n-gram：重复的 `1,2,3` 会把吞吐刷假。
+
+### 多用户（合计 tok/s 最高）
+
+用**官方 FP8**、短 ctx、连续批、独立 prompt（`--mixed`）。packed Q8 是单用户冠军，但多用户不行：残差 `wo`/`wd` 仍走串行 packed GEMV（cublas add=1 会把 27B mixed 写成全 0），所以 Q8 mixed 顶到 **`--batch 64` 的 176 tok/s**（80 OOM）。FP8 cublasLt 仍然大幅领先。官方 FP8 不再常驻 1.2 GiB 的 F16 反量化工作区，**`--batch 100 --mixed` 能分配**。等长 mixed prefill 现在按 time-major 打包 `T×B` 行（一次权重扫描，`prefill_eq_batch=1`），再叠加 batched attn decode。
+
+greedy argmax 以前 `<<<1,32>>>`，`--batch >32` 时第 32 路及之后全是 token 0。2026-08-16 改成 grid-stride 后重测：96 和 100 均为 `batch_zero_seqs=0`。
+
+```bash
+rapidllm bench -m /path/to/Qwen3.8-27B-FP8 \
+  --device cuda --fuse=on --spec off --no-thinking --ctx 256 --max-new 16 \
+  --batch 100 --mixed --prompt 1,2,3
+```
+
+| `--batch` | 模式 | 墙钟 tok/s（全部序列） | 每路 | 峰值 MiB |
+| ---: | --- | ---: | ---: | ---: |
+| 1 | — | 30.73 | 30.73 | 29159 |
+| 8 | mixed | 193.6 | 24.2 | 30495 |
+| 16 | mixed | 395.0 | 24.7 | 32031 |
+| 32 | 同一 prompt | 679.4 | 21.2 | 35103 |
+| 32 | mixed | 683.7 | 21.4 | 35103 |
+| 96 | mixed | 986.0 | 10.3 | 46279 | 上次重测；`batch_zero_seqs=0/96` |
+| **100** | **mixed** | **1224.3** | 12.2 | 47233 | packed T×B prefill；`batch_zero_seqs=0/100` |
+
+`--mixed` = 不同 prompt，每步 decode 共享一次权重（更接近真实多用户）。去掉则是同一 prompt 的 N 份副本。`serve` 仍是单连接；并发走这条 `--batch` / `generate_batch`。
+
+`--batch` 上限 128；这张 48 GB 卡上 FP8 `@ctx 256` 能到 **100**。argmax 修复前的 48/64/80 行已去掉（当时 32 路之后是 0）。
+
+Q8 mixed，同样开关，`--batch N --mixed`（2026-08-16，T≥16 add=0 走 Q8→F16 cublas；残差仍是 packed GEMV）：
+
+| `--batch` | 墙钟 tok/s | decode tok/s | 每路 | 峰值 MiB |
+| ---: | ---: | ---: | ---: | ---: |
+| 1 | 34.84 | 35.59 | 34.84 | 33561 |
+| 8 | 77.55 | 92.83 | 9.69 | 34905 |
+| 16 | 88.12 | 105.8 | 5.51 | 36457 |
+| 32 | 131.9 | 158.3 | 4.12 | 39561 | `batch_zero_seqs=0/32` |
+| **64** | **176.3** | **212.7** | 2.76 | 45793 | `batch_zero_seqs=0/64` |
+| 80 | OOM | — | — | ~47700 |
 
 ## Qwen3.6 / 3.8-27B 对比 vLLM（RTX 6000 Ada 48 GB）
 
@@ -196,6 +260,17 @@ rapidllm bench -m /path/to/Qwen3.8-27B-FP8 \
 
 未跑：Qwen3.6 Q4_K / Q5_K（本机没有权重）。vLLM 加载 Qwen3.8-27B-Q4_K_M 失败：`GGUF model with architecture qwen35 is not supported yet.`
 
+## Qwen3.8-27B 对比最新 SGLang（同机）
+
+与上面同一套官方 pair，packed mixed-prefill 改动后于 2026-08-16 重测。SGLang 为 **0.5.17**（`/home/znsoft/sglang-env`，`Engine`，flashinfer，CUDA graph 开，`language_only`，投机解码关）。墙钟 tok/s 是加载 + warmup generate 之后。
+
+| 引擎 | 墙钟 tok/s | n_new | 备注 |
+| --- | ---: | ---: | --- |
+| RapidLLM `--spec off --fuse=on` | **29.04** | 16 | tokens `170164 158534 …`（非全 0） |
+| SGLang 0.5.17 | 21.71 | 16 | `output_ids` `[4, 5, 0, 31, 46474, …]` 循环 |
+
+RapidLLM 墙钟 / SGLang 墙钟 = **1.34×**。不要拿 RapidLLM 的 `decode_tok/s` 来比。SGLang 确实加载了 hybrid 权重（mamba cache 有占用）并吐出 16 个 token；循环的小 id 更像 hybrid / tokenizer 对不齐，不是 RapidLLM 的数。官方 pair 上 `--spec mtp` 已有墙钟收益： **35.94** tok/s（accepted=7/8）对同文件 `--spec off` **27.19**。
+
 ## 相对 vLLM 的结论
 
 同机（RTX 6000 Ada 48 GB），同一套官方 pair（短 prompt、16 个新 token、graphs on）。数字见上表。
@@ -212,7 +287,7 @@ rapidllm bench -m /path/to/Qwen3.8-27B-FP8 \
 **vLLM 仍然更强的地方（不要夸大）**
 
 - **长 prefill。** 128k 窗口填 2048–8192 时，vLLM 墙钟更高（7.90 vs 7.17；2.44 vs 1.93）。RapidLLM 16 层 gated attn 的 prefill 仍是 O(N²)。
-- **多用户 serving。** vLLM 分页、把不同 prompt 连续批在一起，并且是完整的 OpenAI HTTP 栈。RapidLLM 的 `--batch N` 是**同一 prompt** 共享权重；`serve` 是单连接，没有 SSE。
+- **多用户 serving。** vLLM 分页、把不同 prompt 连续批在一起，并且是完整的 OpenAI HTTP 栈。RapidLLM 的 `--batch N` 是**同一 prompt** 共享权重；`serve` 是单连接（支持 SSE 流式）。
 - **生态。** 采样、工具、LoRA、多卡 TP/PP 是 vLLM 的地盘。RapidLLM 是面向这一族架构的单卡 / CPU 引擎。
 
 **选 RapidLLM**：本地跑 Qwen3.6 / 3.8-27B 的 decode（尤其是 GGUF、128k–262k 分配、或不想上 Python）。**选 vLLM**：共享端点、混合请求、长 prefill。
@@ -238,23 +313,11 @@ rapidllm bench -m /path/to/Qwen3.8-27B-FP8 \
 
 `--ctx 256` 约 27.8 GiB；每多 16384 token 的 KV 约 2.00 GiB。167936 比 163840 再多约 0.5 GiB，装不下。
 
-`serve` 是单连接；并发路径是 `--batch N`（同一 prompt，每步共享一次权重扫描）。`ctx<=4096` 时 `RAPIDLLM_MAX_BATCH` 上限 32（`pf_cap`）。
+`serve` 是单连接；并发路径是 `--batch N`（可加 `--mixed` 跑独立 prompt，每步共享一次权重）。`--batch` 可到 128；48 GB 上短 ctx FP8 的上限是 **100**（见 [极限启动参数](#qwen38-27b-极限启动参数rtx-6000-ada-48-gb)）。
 
 ### 并发 batch TPS
 
-官方 pair：`--ctx 256 --max-new 16 --prompt 1,2,3`。`tok/s` 是**合计**（所有序列）。每条序列的 decode = decode tok/s / batch。
-
-| `--batch` | 墙钟 tok/s | Decode tok/s | 每条 decode | 峰值 MiB |
-| ---: | ---: | ---: | ---: | ---: |
-| 1 | 31.63 | 32.01 | 32.01 | 27832 |
-| 2 | 50.00 | 53.12 | 26.56 | 28024 |
-| 4 | 87.90 | 92.77 | 23.19 | 28404 |
-| 8 | 92.11 | 94.77 | 11.85 | 29168 |
-| 16 | 94.13 | 95.57 | 5.97 | 30704 |
-| **24** | **94.49** | 95.48 | 3.98 | 32240 |
-| 32 | 94.42 | 95.38 | 2.98 | 33776 |
-
-合计峰值约 **94.5 tok/s**（batch 24–32）。batch 8 之后权重扫描已经饱和，再加序列几乎不再涨。
+见 [极限启动参数](#qwen38-27b-极限启动参数rtx-6000-ada-48-gb)（2026-08-16）。短 ctx 官方 FP8 重测墙钟为 **1224.3 tok/s**（`--batch 100 --mixed`），每路 greedy 均非全 0（`prefill_eq_batch=1 T=3 B=100`）。以前的 ~94 tok/s 平台是 batched GDN / cublasLt T=8 / GPU argmax 之前的数。
 
 ### 262k TurboQuant + 连续批
 
@@ -299,6 +362,18 @@ fill-256（仍在 8k F16 窗口内）`--ctx 262144`，同机同开关的更早�
 
 这张 48 GB 卡在 262k 下，FP8 / Q4 / Q6 / Q8 的并发上限都是 **`--batch 2`**。合计 TPS 峰值是 **55.50 tok/s**（Q8_0，batch 2，3-token prompt）。官方 FP8 峰值是 **40.76 tok/s**（batch 2）。batch 3+ 会 OOM：持久化 KV 按路线性涨（约 5.7–6.1 GiB/路）。
 
+### 240k TurboQuant + 连续批
+
+`--ctx 245760`（240×1024）官方 FP8，2026-08-17 同机重测，开关与 262k 扫描相同（`--kv-type q8k_tq3v`，`--spec off`，prompt `1,2,3`，16 个新 token）。F16 KV 在建 session 时 OOM。TQ 持久化 5370 MiB/路。`seq_cap=245760`。
+
+| `--batch` | 墙钟 tok/s（总） | Decode tok/s | 每请求墙钟 | 每路 decode | 峰值 MiB | 结果 |
+| ---: | ---: | ---: | ---: | ---: | ---: | --- |
+| 1 | **27.20** | 29.72 | 27.20 | 29.72 | 36131 | ok |
+| **2** | **47.90** | **54.84** | 23.95 | 27.42 | 42685 | **能跑的最大并发**；`zero_seqs=0` |
+| 3 | — | — | — | — | — | session 时 CUDA OOM |
+
+并发上限是 **`--batch 2`**。合计 TPS 在 B=2 最高（墙钟是 B=1 的 1.76×）。每请求 TPS 从 27.20 降到 23.95：两路共享一次权重扫描，但仍要两份 persist KV。
+
 ```bash
 # 不开 TurboQuant 时 48 GB 能分配的最大窗口
 rapidllm bench -m /path/to/Qwen3.8-27B-FP8 \
@@ -312,14 +387,14 @@ RAPIDLLM_KV_TQ=1 rapidllm bench -m /path/to/Qwen3.8-27B-FP8 \
 RAPIDLLM_KV_TQ=1 rapidllm bench -m /path/to/Qwen3.8-27B-Q8_0.gguf \
   --device cuda --ctx 262144 --batch 2 --max-new 16 --spec off --fuse=on --no-thinking --prompt 1,2,3
 
-# 短 ctx 并发合计 TPS
+# 短 ctx 并发合计 TPS（这张 48 GB 卡上的峰值）
 rapidllm bench -m /path/to/Qwen3.8-27B-FP8 \
-  --device cuda --ctx 256 --batch 24 --max-new 16 --spec off --fuse=on --no-thinking --prompt 1,2,3
+  --device cuda --ctx 256 --batch 100 --mixed --max-new 16 --spec off --fuse=on --no-thinking --prompt 1,2,3
 ```
 
 ## 图文联合生成
 
-`--image PATH` 读 PNG / JPEG / PPM / BMP，跑自研 ViT（CPU），并在 prompt 前插入 `vision_start + image_pad × N + vision_end`。generate 会把这些 `image_pad` 的 embedding 换成编码器输出（CPU 与 CUDA）。需要 HF 权重里仍有 `visual.*`（加 `--image` 才不会跳过）。草稿投机会关掉：草稿模型看不到图。
+`--image PATH` 读 PNG / JPEG / PPM / BMP，跑自研 ViT（CPU），并在 prompt 前插入 `vision_start + image_pad × N + vision_end`。generate 会把这些 `image_pad` 的 embedding 换成编码器输出（CPU 与 CUDA）。需要 HF 权重里仍有 `visual.*`（加 `--image` 才不会跳过）。
 
 ```bash
 rapidllm -m /path/to/Qwen3.8-27B-FP8 --image photo.png \
@@ -332,7 +407,7 @@ rapidllm -m /path/to/Qwen3.8-27B-FP8 --image photo.png \
 
 机器与短 prompt bakeoff 相同：**NVIDIA RTX 6000 Ada Generation，49140 MiB**。官方 FP8 文本权重约 28 GiB。RapidLLM CUDA 的 KV 是 FP32（16 层 gated attn 合计约 **128 KiB / token**）。vLLM 是分页 FP16 KV（约 **64 KiB / token**）。
 
-下面 RapidLLM 行都是 `--device cuda --fuse=on --spec off --no-thinking`（decode CUDA graph + 融合 GDN/RMS/MLP）。这里不用 `--spec auto` / draft：重复 prompt 会让 n-gram 把吞吐刷假。
+下面 RapidLLM 行都是 `--device cuda --fuse=on --spec off --no-thinking`（decode CUDA graph + 融合 GDN/RMS/MLP）。这里不用 `--spec auto`：重复 prompt 会让 n-gram 把吞吐刷假。
 
 `--prompt-n N` 填 `N` 个不重复 id。`tok/s` 是墙钟（prefill + 8–16 个新 token）。`decode_tok/s` 是填满之后的逐步 decode。Prefill tok/s = `N / prefill_s`。
 
@@ -383,37 +458,18 @@ rapidllm bench -m /path/to/Qwen3.6-27B-FP8 \
 
 ## 投机解码与 MTP
 
-Qwen3.6 / 3.8-27B 自带 **MTP** 头（`mtp.fc`、`mtp.norm`，`mtp_num_hidden_layers=1`）。RapidLLM 会解析并当作草稿跑：`--spec mtp` 固定用这颗头；未挂 `--draft` 时 `--spec auto` 也会用它。
+Qwen3.6 / 3.8-27B 自带 **MTP** 头（`mtp.fc`、`mtp.norm`，`mtp_num_hidden_layers=1`）。RapidLLM 会解析并当作投机草稿跑。不再支持外挂草稿模型：MTP 替代那条路径。
 
 `--spec auto`（默认）按此顺序选草稿：
 
-1. 已挂上的 `--draft` session（推荐 Qwen3.5-0.8B）
-2. 目标模型自带 **MTP** 头
-3. 从已生成上下文做 n-gram 续写
+1. 目标模型自带 **MTP** 头（若有）
+2. 从已生成上下文做 n-gram 续写
 
 ```bash
 rapidllm -m /path/to/Qwen3.8-27B-FP8 --spec mtp --spec-n 3 --prompt "你好"
 ```
 
-CUDA 且未传 `--draft` 时只走 n-gram（MTP 草稿在 CPU session）。`set_draft` 要求词表一致，架构可以不同。
-
-Qwen3.6-27B **和 Qwen3.8-27B** 的推荐草稿都是 [`Qwen/Qwen3.5-0.8B`](https://huggingface.co/Qwen/Qwen3.5-0.8B)。`set_draft` 只要求词表一致，架构可以不同。3.8 仍是 `qwen3_5`、词表 **248320**，所以 0.8B 草稿继续可用。
-
-| | Qwen3.8 / 3.6-27B（目标） | Qwen3.5-0.8B（草稿） |
-| --- | --- | --- |
-| 架构族 | `qwen3_5` hybrid | 同族 |
-| 词表 | 248320 | **248320** |
-| 层数 | 64（48 DeltaNet + 16 Attn） | 24（18 DeltaNet + 6 Attn） |
-| hidden | 5120 | 1024 |
-| DeltaNet V 头 | 48 | 16 |
-| Attn | 24 Q / 4 KV，hd 256 | 8 Q / 2 KV，hd 256 |
-
-```bash
-rapidllm -m /path/to/Qwen3.8-27B-FP8 \
-  --draft /path/to/Qwen3.5-0.8B \
-  --spec draft --spec-n 3 \
-  --prompt "你好"
-```
+T=2 verify 每个权重只读一次（自定义 GEMV，不用 cublasLt n=2）。fused miss 保留 token-0 的 hidden/KV，只回滚 GDN 的 S/conv，不再整网重跑。官方 Qwen3.8-27B-FP8 快于 `--spec off`：prompt `1,2,3` 上 **35.94** 对 **27.19** tok/s（accepted=7/8）。Decode 对 GQA 24/4（group=6）走内核 Flash Attention；`RAPIDLLM_NO_FLASH=1` 可关闭。
 
 ## 连续批
 
@@ -427,7 +483,7 @@ C API：`rapidllm_generate_batch`。Session API：`Session::generate_batch`。
 
 ## HTTP 服务
 
-`rapidllm serve` 是单连接 JSON 服务（尚无 SSE）。thinking 关闭。
+`rapidllm serve` 是单连接 HTTP 服务。请求里设 `"stream": true` 即 SSE token 流。thinking 关闭。
 
 | 方法 | 路径 | 协议 |
 | --- | --- | --- |
@@ -441,9 +497,13 @@ C API：`rapidllm_generate_batch`。Session API：`Session::generate_batch`。
 curl http://127.0.0.1:8080/v1/chat/completions \
   -H "Content-Type: application/json" \
   -d '{"model":"qwen","messages":[{"role":"user","content":"你好"}],"max_tokens":64}'
+
+curl -N http://127.0.0.1:8080/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{"model":"qwen","messages":[{"role":"user","content":"你好"}],"max_tokens":64,"stream":true}'
 ```
 
-`max_tokens` 上限 4096。`temperature <= 0` 走 greedy。
+`max_tokens` 上限 4096。`temperature <= 0` 走 greedy。`"stream": true` 返回 `text/event-stream`（OpenAI chat chunk + `[DONE]`、Responses `response.output_text.delta`、Anthropic `content_block_delta`）。
 
 ## C API
 
@@ -462,7 +522,7 @@ RapidLLM* eng = rapidllm_load(&cfg, &err);
 RapidSessionConfig sc = {0};
 sc.enable_thinking = 1;
 sc.max_new_tokens = 64;
-sc.spec = 3; /* auto；4 = draft-model */
+sc.spec = 3; /* auto：有 MTP 就用 MTP */
 RapidSession* sess = rapidllm_session_new(eng, &sc, &err);
 
 int32_t ids[256], out[64];
@@ -480,7 +540,7 @@ rapidllm_session_free(sess);
 rapidllm_free(eng);
 ```
 
-用 `rapidllm_session_set_draft` 挂接草稿模型。`RAPIDLLM_API_VERSION` 为 `1`。完整接口见 `include/rapidllm/api.h`。
+`RAPIDLLM_API_VERSION` 为 `1`。完整接口见 `include/rapidllm/api.h`。
 
 ## 测试
 
@@ -497,7 +557,7 @@ ctest --test-dir build --output-on-failure
 | `test_hybrid` | greedy token 对拍 golden；fuse 开关；两种格式 |
 | `test_simd_bench` | AVX2 / AVX-512 相对标量 |
 | `test_nv` | DP4A GEMV 参考实现 |
-| `test_spec` | n-gram / MTP / draft-model 投机解码 |
+| `test_spec` | n-gram / MTP 投机解码 |
 | `test_batch` | 连续 batch 生成 |
 | `test_protocol` | OpenAI / Anthropic 解析与渲染，以及 `/health` |
 | `test_cuda_decode` | CUDA 路径或 host-ref 回退 |
@@ -522,7 +582,7 @@ docs/               架构设计（中英）
 
 ## v1 明确不做
 
-- `serve` 不做 SSE / token 流式（一次 JSON 请求对应一次 JSON 响应）
+- `serve` 是单连接（不并发）。支持 SSE（`stream: true`）。
 - 不做视频编码器
 - 不做 MoE 专家路径
 - 不做 ARM / Apple Silicon

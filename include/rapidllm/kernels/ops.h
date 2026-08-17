@@ -60,6 +60,7 @@ struct FusedDeltaArgs {
     int gnorm_n = 0;
     float eps;
     bool use_simd;
+    bool v_tiled = false;
 };
 void fused_delta_decode(const FusedDeltaArgs& a);
 

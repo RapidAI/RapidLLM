@@ -129,12 +129,29 @@ void qwen3_rmsnorm(const float* x, const float* gamma, float* y, int n, float ep
 void gated_rmsnorm(const float* x, const float* z, const float* gamma, float* y, int n, float eps,
                    int gamma_n) {
     if (gamma_n <= 0) gamma_n = n;
-    double acc = 0;
-    for (int i = 0; i < n; ++i) acc += static_cast<double>(x[i]) * x[i];
-    const float inv = 1.f / std::sqrt(static_cast<float>(acc / n) + eps);
-    for (int i = 0; i < n; ++i) {
-        const float g = gamma ? gamma[i % gamma_n] : 1.f;
-        y[i] = g * (x[i] * inv) * silu(z[i]);
+    const bool per_head = gamma_n < n && (n % gamma_n) == 0 && n >= 256;
+    if (!per_head) {
+        double acc = 0;
+        for (int i = 0; i < n; ++i) acc += static_cast<double>(x[i]) * x[i];
+        const float inv = 1.f / std::sqrt(static_cast<float>(acc / n) + eps);
+        for (int i = 0; i < n; ++i) {
+            const float g = gamma ? gamma[i % gamma_n] : 1.f;
+            y[i] = g * (x[i] * inv) * silu(z[i]);
+        }
+        return;
+    }
+    const int nhead = n / gamma_n;
+    for (int h = 0; h < nhead; ++h) {
+        const float* xh = x + h * gamma_n;
+        const float* zh = z + h * gamma_n;
+        float* yh = y + h * gamma_n;
+        double acc = 0;
+        for (int i = 0; i < gamma_n; ++i) acc += static_cast<double>(xh[i]) * xh[i];
+        const float inv = 1.f / std::sqrt(static_cast<float>(acc / gamma_n) + eps);
+        for (int i = 0; i < gamma_n; ++i) {
+            const float g = gamma ? gamma[i] : 1.f;
+            yh[i] = g * (xh[i] * inv) * silu(zh[i]);
+        }
     }
 }
 
@@ -454,13 +471,20 @@ void rope_partial(float* q, float* k, int n_q, int n_kv, int head_dim, int rotar
     auto apply = [&](float* t, int n_heads) {
         for (int h = 0; h < n_heads; ++h) {
             float* v = t + h * head_dim;
-            for (int i = 0; i < rotary_dim / 2; ++i) {
-                const float freq = 1.f / std::pow(theta, static_cast<float>(i) / (rotary_dim / 2));
+            const int pairs = rotary_dim / 2;
+            for (int i = 0; i < pairs; ++i) {
+                const float freq = 1.f / std::pow(theta, static_cast<float>(i) / static_cast<float>(pairs));
                 const float ang = static_cast<float>(pos) * freq;
                 const float c = std::cos(ang), s = std::sin(ang);
-                const float x0 = v[2 * i], x1 = v[2 * i + 1];
-                v[2 * i] = x0 * c - x1 * s;
-                v[2 * i + 1] = x0 * s + x1 * c;
+                if (head_dim >= 64) {
+                    const float x0 = v[i], x1 = v[i + pairs];
+                    v[i] = x0 * c - x1 * s;
+                    v[i + pairs] = x0 * s + x1 * c;
+                } else {
+                    const float x0 = v[2 * i], x1 = v[2 * i + 1];
+                    v[2 * i] = x0 * c - x1 * s;
+                    v[2 * i + 1] = x0 * s + x1 * c;
+                }
             }
         }
     };

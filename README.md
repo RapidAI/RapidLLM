@@ -19,7 +19,7 @@ This is not a wrapper around llama.cpp, ggml, vLLM, or MLC.
 | | |
 | --- | --- |
 | Architecture | Qwen3.6-27B and Qwen3.8-27B (`qwen3_5` hybrid: 48 Gated DeltaNet + 16 Gated Attention) |
-| Speculative decode | `--spec off\|ngram\|mtp\|auto\|draft` |
+| Speculative decode | `--spec off\|ngram\|mtp\|auto` |
 | MTP | Target model's own multi-token prediction head (`mtp.fc` / `mtp.norm`) as draft |
 | Continuous batch | `--batch N` / `rapidllm_generate_batch` — one shared weight pass per step |
 | vs vLLM (same box) | Short-decode **1.50–1.80×**; hybrid GGUF; 163k–262k alloc. See [Conclusion vs vLLM](#conclusion-vs-vllm) |
@@ -58,10 +58,9 @@ At 32K context, KV is about 2 GiB FP16. `--ctx>163840` (or `--kv-type q8k_tq3v` 
 - Optional TurboQuant-style KV (`--kv-type q8k_tq3v`): q8 keys + 3-bit WHT values, ~3× smaller than FP16
 - Memory planner: refuse or shrink context instead of letting the OS OOM-kill the process
 - Fused decode path (`--fuse=on|off`) for A/B against unfused ops
-- **Speculative decode**: `off` / `ngram` / `mtp` / `auto` / `draft`
-- **MTP**: 27B's embedded 1-layer MTP head drafts tokens; `--spec mtp` or default `auto` when no `--draft` is attached
+- **Speculative decode**: `off` / `ngram` / `mtp` / `auto`
+- **MTP**: 27B's embedded 1-layer MTP head drafts tokens; `--spec mtp` or default `auto`
 - **Continuous batch**: `--batch N` (same prompt, one shared weight pass per step; CUDA via `RAPIDLLM_MAX_BATCH`)
-- External draft model: [`Qwen/Qwen3.5-0.8B`](https://huggingface.co/Qwen/Qwen3.5-0.8B)
 - HTTP serve: OpenAI `/v1/chat/completions` + `/v1/responses`, Anthropic `/v1/messages`
 - Qwen3.5 / 3.6 / 3.8 ViT + CLI image+text generate (`--image PATH`)
 - Thinking on by default; `bench` and `serve` force `enable_thinking=false`
@@ -105,15 +104,15 @@ On Windows without Ninja, omit `-G Ninja` and use the Visual Studio generator. `
 ## CLI
 
 ```text
-rapidllm -m <hf-dir|file.gguf> [--device cpu|cuda] [--ctx 32768] [--prompt TEXT]
+rapidllm -m <hf-dir|file.gguf> [--device cpu|cuda|vulkan] [--ctx 32768] [--prompt TEXT]
          [--max-new N] [--threads N] [--max-layers N] [--max-ram-mb N]
          [--thinking | --no-thinking] [--fuse=on|off]
-         [--spec off|ngram|mtp|auto|draft] [--spec-n N] [--draft <hf-dir|file.gguf>]
+         [--spec off|ngram|mtp|auto] [--spec-n N]
          [--image PATH] [--vision] [--batch N]
 
-rapidllm bench -m <path> [--device cpu|cuda] [--fuse=on|off] [--micro] [--batch N]
+rapidllm bench -m <path> [--device cpu|cuda|vulkan] [--fuse=on|off] [--micro] [--batch N]
 
-rapidllm serve -m <path> [--host 127.0.0.1] [--port 8080] [--device cpu|cuda]
+rapidllm serve -m <path> [--host 127.0.0.1] [--port 8080] [--device cpu|cuda|vulkan]
 ```
 
 Examples:
@@ -121,7 +120,7 @@ Examples:
 ```bash
 rapidllm -m /path/to/Qwen3.6-27B-FP8 --device cpu --ctx 32768 --prompt "Hello"
 rapidllm -m model.gguf --device cpu --prompt "Hello"
-rapidllm -m /path/to/Qwen3.6-27B-FP8 --draft /path/to/Qwen3.5-0.8B --spec draft --spec-n 3 --prompt "Hello"
+rapidllm -m /path/to/Qwen3.6-27B-FP8 --spec mtp --spec-n 3 --prompt "Hello"
 rapidllm bench -m model.gguf
 rapidllm bench -m model.gguf --device cuda --batch 4
 rapidllm bench -m /path/to/Qwen3.6-27B-FP8 --device cuda --ctx 131072 --prompt-n 8192 --max-new 8 --spec off
@@ -136,10 +135,9 @@ rapidllm -m /path/to/Qwen3.8-27B-FP8 --image photo.png --prompt "What is in this
 | `--ctx` | `32768` | planner may shrink or refuse |
 | `--max-new` | `8` | generated tokens |
 | `--fuse` | `on` | fused DeltaNet / Attn / MLP decode |
-| `--spec` | `auto` | `draft` needs `--draft` |
+| `--spec` | `auto` | `mtp` if the checkpoint has an MTP head, else `ngram` |
 | `--kv-type` | `f16`; auto `q8k_tq3v` if `--ctx>163840` | `q8k_tq3v` = K q8 + V TurboQuant-3. Env `RAPIDLLM_KV_TQ=0\|1` |
-| `--draft` | — | draft weights; implies `--spec draft`. Use [`Qwen3.5-0.8B`](https://huggingface.co/Qwen/Qwen3.5-0.8B) |
-| `--batch` | `1` | copies of the same prompt; sets `RAPIDLLM_MAX_BATCH` |
+| `--batch` | `1` | concurrent sequences (sets `RAPIDLLM_MAX_BATCH`, cap 128). Add `--mixed` for independent prompts |
 | `--prompt-n` | — | synthesize `N` non-repeating token ids (skips the tokenizer). For long-ctx benches. |
 | `--vision` / `--image` | off | load `visual.*`. `--image PATH` runs the ViT and splices visual tokens into generate |
 | `--thinking` | on | `bench` and `serve` always turn it off |
@@ -149,7 +147,6 @@ Weight sources:
 - Target (latest): [`Qwen/Qwen3.8-27B-FP8`](https://huggingface.co/Qwen/Qwen3.8-27B-FP8) — same `qwen3_5` hybrid IR as 3.6-27B
 - Target (previous): [`Qwen/Qwen3.6-27B-FP8`](https://huggingface.co/Qwen/Qwen3.6-27B-FP8)
 - Community GGUF: [`unsloth/Qwen3.8-27B-GGUF`](https://huggingface.co/unsloth/Qwen3.8-27B-GGUF) Q4_K_M / Q5_K_M / Q6_K / Q8_0 (also [`unsloth/Qwen3.6-27B-GGUF`](https://huggingface.co/unsloth/Qwen3.6-27B-GGUF))
-- Draft (recommended for 3.5 / 3.6 / **3.8**): [`Qwen/Qwen3.5-0.8B`](https://huggingface.co/Qwen/Qwen3.5-0.8B) — same family and vocab **248320**, 24-layer hybrid (18 DeltaNet + 6 Gated Attn), hidden 1024
 
 ## Qwen3.8-27B quant bakeoff (RTX 6000 Ada 48 GB)
 
@@ -169,6 +166,73 @@ rapidllm bench -m /path/to/Qwen3.8-27B-Q4_K_M.gguf \
 ```
 
 Q8_0 community files may quantize DeltaNet `in_proj_a` / `in_proj_b`; the loader dequants those leftovers to F32. `A_log` / conv / norms still reject if quantized.
+
+## Qwen3.8-27B peak launch recipes (RTX 6000 Ada 48 GB)
+
+Re-measured **2026-08-16** on this box. Wall tok/s is after load + warmup generate. Thinking off. Prompt `1,2,3`, 16 new tokens. `--fuse=on --device cuda --spec off` unless noted.
+
+### Single-user (max per-request tok/s)
+
+Use packed **Q8_0**. Official FP8 is next; on that checkpoint turn **MTP** on (`--spec mtp --spec-n 3`). Same-file official pair: MTP wall **35.94** (accepted=7/8) vs `--spec off` **27.19**. Paris `--max-new 64`: MTP **41.68** (accepted=30/33) vs off **29.51**. Do **not** use n-gram on the repeating `1,2,3` prompt — that inflates throughput.
+
+```bash
+# highest single-user tok/s
+rapidllm bench -m /path/to/Qwen3.8-27B-Q8_0.gguf \
+  --device cuda --fuse=on --spec off --no-thinking --ctx 256 --max-new 16 --prompt 1,2,3
+
+# official FP8 (if you must stay on the HF checkpoint)
+rapidllm bench -m /path/to/Qwen3.8-27B-FP8 \
+  --device cuda --fuse=on --spec mtp --spec-n 3 --no-thinking --ctx 256 --max-new 16 --prompt 1,2,3
+```
+
+| Weights | Wall / decode tok/s | Prefill s | Peak MiB | Notes |
+| --- | ---: | ---: | ---: | --- |
+| Unsloth Q8_0 | **35.56** | 0.038 | 33557 | packed native Q8 GEMV |
+| Jackrong MTP-GGUF Q8_0 | 35.33 | 0.037 | 33169 | same official pair; beats FP8 30.73 |
+| Official FP8 | 30.73 | 0.064 | 28007 | CUDA graph decode; skip unused F16 W workspace |
+| Unsloth Q4_K_M | 26.51 | 0.085 | 24211 | smallest working set |
+| Jackrong MTP-GGUF Q4_K_M | 26.23 | 0.080 | 22607 | native packed Q4/Q6; MTP accepted=3 but wall 21.93 |
+| Jackrong MTP-GGUF Q6_K | 23.34 | 0.059 | 27615 | beats published Unsloth Q6 22.98 |
+| Official FP8 `--spec mtp --spec-n 3` | **35.94** / 44.26 | 0.083 | 29341 | proposed=8 accepted=7; parallel GQA-6 flash + miss-fast; beats same-file off 27.19 |
+
+`--max-new 64` on official FP8 with `--spec mtp` is **41.68** wall (Paris prompt, accepted=30/33) vs same-file off **29.51**. Leave n-gram off on benches: a repeating `1,2,3` prompt would let n-gram fake throughput.
+
+### Multi-user (max aggregate tok/s)
+
+Use **official FP8**, short ctx, continuous batch, independent prompts (`--mixed`). Packed Q8 is the single-user winner but not the multi-user one: residuals (`wo` / `wd`) stay serial packed GEMV (cublas add=1 zeros 27B tokens), so mixed Q8 tops out at **176 tok/s at `--batch 64`** (80 OOMs). FP8 cublasLt still wins by a wide margin. Official FP8 no longer keeps a 1.2 GiB F16 unpack workspace, so **`--batch 100 --mixed` allocates**. Equal-length mixed prefill now packs time-major `T×B` rows (one weight pass, `prefill_eq_batch=1`) on top of batched attn decode.
+
+Greedy argmax used to launch `<<<1,32>>>`, so `--batch >32` wrote token 0 for every slot ≥32. Remesured 2026-08-16 after a grid-stride fix: `batch_zero_seqs=0` on 96 and 100.
+
+```bash
+rapidllm bench -m /path/to/Qwen3.8-27B-FP8 \
+  --device cuda --fuse=on --spec off --no-thinking --ctx 256 --max-new 16 \
+  --batch 100 --mixed --prompt 1,2,3
+```
+
+| `--batch` | Mode | Wall tok/s (all seqs) | Per-seq | Peak MiB |
+| ---: | --- | ---: | ---: | ---: |
+| 1 | — | 30.73 | 30.73 | 29159 |
+| 8 | mixed | 193.6 | 24.2 | 30495 |
+| 16 | mixed | 395.0 | 24.7 | 32031 |
+| 32 | same prompt | 679.4 | 21.2 | 35103 |
+| 32 | mixed | 683.7 | 21.4 | 35103 |
+| 96 | mixed | 986.0 | 10.3 | 46279 | prior remesure; `batch_zero_seqs=0/96` |
+| **100** | **mixed** | **1224.3** | 12.2 | 47233 | packed T×B prefill; `batch_zero_seqs=0/100` |
+
+`--mixed` = different prompts, one shared-weight decode step (the realistic multi-user path). Omit it for N copies of the same prompt. `serve` is still single-connection; this `--batch` / `generate_batch` path is the concurrent engine.
+
+`--batch` may go up to 128; on this 48 GB card FP8 `@ctx 256` fits **100**. Rows 48/64/80 from before the argmax fix are omitted (slots 32+ were zero).
+
+Q8 mixed, same flags, `--batch N --mixed` (2026-08-16, T≥16 Q8→F16 cublas on add=0; residuals packed GEMV):
+
+| `--batch` | Wall tok/s | Decode tok/s | Per-seq | Peak MiB |
+| ---: | ---: | ---: | ---: | ---: |
+| 1 | 34.84 | 35.59 | 34.84 | 33561 |
+| 8 | 77.55 | 92.83 | 9.69 | 34905 |
+| 16 | 88.12 | 105.8 | 5.51 | 36457 |
+| 32 | 131.9 | 158.3 | 4.12 | 39561 | `batch_zero_seqs=0/32` |
+| **64** | **176.3** | **212.7** | 2.76 | 45793 | `batch_zero_seqs=0/64` |
+| 80 | OOM | — | — | ~47700 |
 
 ## Qwen3.6 / 3.8-27B vs vLLM (RTX 6000 Ada 48 GB)
 
@@ -196,6 +260,17 @@ rapidllm bench -m /path/to/Qwen3.8-27B-FP8 \
 
 Did not run: Qwen3.6 Q4_K / Q5_K (weights not present). vLLM GGUF load of Qwen3.8-27B-Q4_K_M failed with `GGUF model with architecture qwen35 is not supported yet.`
 
+## Qwen3.8-27B vs latest SGLang (same box)
+
+Same official pair as above, remesured 2026-08-16 after the packed mixed-prefill change. SGLang is **0.5.17** in `/home/znsoft/sglang-env` (`Engine`, flashinfer, CUDA graphs on, `language_only`, speculative decode off). Wall tok/s is after load + warmup generate.
+
+| Engine | Wall tok/s | n_new | Notes |
+| --- | ---: | ---: | --- |
+| RapidLLM `--spec off --fuse=on` | **29.04** | 16 | tokens `170164 158534 …` (non-zero) |
+| SGLang 0.5.17 | 21.71 | 16 | `output_ids` `[4, 5, 0, 31, 46474, …]` repeating |
+
+RapidLLM wall / SGLang wall = **1.34×**. Do not treat RapidLLM `decode_tok/s` as this figure. SGLang did load the hybrid checkpoint (mamba cache active) and emit 16 tokens; the repeating low ids look like a hybrid / tokenizer mismatch, not a RapidLLM number. `--spec mtp` on the official pair is a wall win: **35.94** tok/s (accepted=7/8) vs same-file `--spec off` **27.19**.
+
 ## Conclusion vs vLLM
 
 Same box (RTX 6000 Ada 48 GB), same official pair (short prompt, 16 new, graphs on). Numbers above.
@@ -212,7 +287,7 @@ Same box (RTX 6000 Ada 48 GB), same official pair (short prompt, 16 new, graphs 
 **Where vLLM is ahead (do not oversell)**
 
 - **Long prefill.** At 128k / 2048–8192 fill, vLLM wall tok/s is higher (7.90 vs 7.17; 2.44 vs 1.93). RapidLLM prefill attention on the 16 gated layers is still O(N²).
-- **Multi-user serving.** vLLM pages independent sequences, continuous-batches different prompts, and speaks a production OpenAI HTTP stack. RapidLLM `--batch N` is **same-prompt** weight sharing; `serve` is single-connection and not SSE.
+- **Multi-user serving.** vLLM pages independent sequences, continuous-batches different prompts, and speaks a production OpenAI HTTP stack. RapidLLM `--batch N` is **same-prompt** weight sharing; `serve` is single-connection (SSE streaming is supported).
 - **Ecosystem.** Sampling, tools, LoRA, and multi-GPU TP/PP are vLLM's job. RapidLLM is a single-GPU / CPU engine for this one architecture family.
 
 **Pick RapidLLM** for local Qwen3.6 / 3.8-27B decode (especially GGUF, 128k–262k allocation, or no Python). **Pick vLLM** for a shared endpoint with mixed prompts and long prefills.
@@ -238,23 +313,11 @@ Allocate `--ctx`, then generate 8 new tokens from prompt `1,2,3` (3-token fill).
 
 `--ctx 256` is ~27.8 GiB; each extra 16384 tokens of KV is ~2.00 GiB. 167936 needs ~0.5 GiB more than 163840 and does not fit.
 
-`serve` is single-connection; this engine's concurrent path is `--batch N` (same prompt, one shared weight pass). `ctx<=4096` caps `RAPIDLLM_MAX_BATCH` at 32 (`pf_cap`).
+`serve` is single-connection; this engine's concurrent path is `--batch N` (optional `--mixed` for independent prompts, one shared weight pass). `--batch` may go to 128; on 48 GB the short-ctx FP8 cap is **100** (see [peak launch recipes](#qwen38-27b-peak-launch-recipes-rtx-6000-ada-48-gb)).
 
 ### Concurrent batch TPS
 
-Official pair: `--ctx 256 --max-new 16 --prompt 1,2,3`. `tok/s` is **aggregate** (all sequences). Per-seq decode = decode tok/s / batch.
-
-| `--batch` | Wall tok/s | Decode tok/s | Per-seq decode | Peak MiB |
-| ---: | ---: | ---: | ---: | ---: |
-| 1 | 31.63 | 32.01 | 32.01 | 27832 |
-| 2 | 50.00 | 53.12 | 26.56 | 28024 |
-| 4 | 87.90 | 92.77 | 23.19 | 28404 |
-| 8 | 92.11 | 94.77 | 11.85 | 29168 |
-| 16 | 94.13 | 95.57 | 5.97 | 30704 |
-| **24** | **94.49** | 95.48 | 3.98 | 32240 |
-| 32 | 94.42 | 95.38 | 2.98 | 33776 |
-
-Peak aggregate is **~94.5 tok/s** at batch 24–32. After batch 8 the weight scan is already saturated; more sequences only add a little.
+See the [peak launch recipes](#qwen38-27b-peak-launch-recipes-rtx-6000-ada-48-gb) table (2026-08-16). Short-ctx official FP8 remesures at **1224.3 wall tok/s** at `--batch 100 --mixed` with every sequence non-zero (`prefill_eq_batch=1 T=3 B=100`). The older ~94 tok/s plateau was before batched GDN / cublasLt T=8 / GPU argmax.
 
 ### 262k TurboQuant + continuous batch
 
@@ -299,6 +362,18 @@ Fill-256 (still inside the 8k F16 window) at `--ctx 262144`, same box and flags,
 
 On this 48 GB card the 262k concurrency cap is **`--batch 2`** for FP8 / Q4 / Q6 / Q8. Peak total TPS is **55.50 tok/s** (Q8_0, batch 2, 3-token prompt). Official FP8 peaks at **40.76 tok/s** (batch 2). Batch 3+ OOMs because persist KV scales linearly (~5.7–6.1 GiB/seq).
 
+### 240k TurboQuant + continuous batch
+
+`--ctx 245760` (240×1024) on official FP8, remesured 2026-08-17, same box and flags as the 262k sweep (`--kv-type q8k_tq3v`, `--spec off`, prompt `1,2,3`, 16 new). F16 KV OOMs at session. TQ persist is 5370 MiB/seq. `seq_cap=245760`.
+
+| `--batch` | Wall tok/s (总) | Decode tok/s | Per-req wall | Per-seq decode | Peak MiB | Result |
+| ---: | ---: | ---: | ---: | ---: | ---: | --- |
+| 1 | **27.20** | 29.72 | 27.20 | 29.72 | 36131 | ok |
+| **2** | **47.90** | **54.84** | 23.95 | 27.42 | 42685 | **max that fits**; `zero_seqs=0` |
+| 3 | — | — | — | — | — | CUDA OOM at session |
+
+Concurrency cap is **`--batch 2`**. Aggregate TPS is highest at B=2 (1.76× B=1 wall). Per-request TPS drops 27.20 → 23.95 because two sequences share one weight pass but still pay two persist KV streams.
+
 ```bash
 # max window that allocates on 48 GB without TurboQuant
 rapidllm bench -m /path/to/Qwen3.8-27B-FP8 \
@@ -312,14 +387,14 @@ RAPIDLLM_KV_TQ=1 rapidllm bench -m /path/to/Qwen3.8-27B-FP8 \
 RAPIDLLM_KV_TQ=1 rapidllm bench -m /path/to/Qwen3.8-27B-Q8_0.gguf \
   --device cuda --ctx 262144 --batch 2 --max-new 16 --spec off --fuse=on --no-thinking --prompt 1,2,3
 
-# short-ctx concurrent aggregate TPS
+# short-ctx concurrent aggregate TPS (peak on this 48 GB box)
 rapidllm bench -m /path/to/Qwen3.8-27B-FP8 \
-  --device cuda --ctx 256 --batch 24 --max-new 16 --spec off --fuse=on --no-thinking --prompt 1,2,3
+  --device cuda --ctx 256 --batch 100 --mixed --max-new 16 --spec off --fuse=on --no-thinking --prompt 1,2,3
 ```
 
 ## Image + text
 
-`--image PATH` loads PNG / JPEG / PPM / BMP, runs the in-tree ViT (CPU), and splices `vision_start + image_pad × N + vision_end` in front of the prompt. Generate replaces those `image_pad` embeddings with the encoder output (CPU and CUDA). Needs an HF checkpoint that still has `visual.*` (pass `--image` so they are not skipped). Draft spec is turned off because the draft model does not see the picture.
+`--image PATH` loads PNG / JPEG / PPM / BMP, runs the in-tree ViT (CPU), and splices `vision_start + image_pad × N + vision_end` in front of the prompt. Generate replaces those `image_pad` embeddings with the encoder output (CPU and CUDA). Needs an HF checkpoint that still has `visual.*` (pass `--image` so they are not skipped).
 
 ```bash
 rapidllm -m /path/to/Qwen3.8-27B-FP8 --image photo.png \
@@ -332,7 +407,7 @@ Video is not supported.
 
 Same box as the short-prompt bakeoff: **NVIDIA RTX 6000 Ada Generation, 49140 MiB**. Official FP8 text weights ~28 GiB. RapidLLM CUDA KV is FP32 (about **128 KiB / token** across the 16 gated-attention layers). vLLM uses paged FP16 KV (about **64 KiB / token**).
 
-All RapidLLM rows below are `--device cuda --fuse=on --spec off --no-thinking` (decode CUDA graph + fused GDN/RMS/MLP). `--spec auto` / draft is not used here: a repeating prompt would let n-gram fake throughput.
+All RapidLLM rows below are `--device cuda --fuse=on --spec off --no-thinking` (decode CUDA graph + fused GDN/RMS/MLP). `--spec auto` is not used here: a repeating prompt would let n-gram fake throughput.
 
 `--prompt-n N` fills `N` non-repeating ids. `tok/s` is wall (prefill + 8–16 new tokens). `decode_tok/s` is the decode-only rate after that fill. Prefill tok/s = `N / prefill_s`.
 
@@ -388,37 +463,18 @@ Full 128k/200k **fills** are not a useful default: RapidLLM prefill attn is stil
 
 ## Speculative decode and MTP
 
-Qwen3.6 / 3.8-27B ship an embedded **MTP** head (`mtp.fc`, `mtp.norm`, `mtp_num_hidden_layers=1`). RapidLLM parses it and runs it as a draft: `--spec mtp` always uses that head; `--spec auto` uses it when no `--draft` session is attached.
+Qwen3.6 / 3.8-27B ship an embedded **MTP** head (`mtp.fc`, `mtp.norm`, `mtp_num_hidden_layers=1`). RapidLLM parses it and runs it as the speculative draft. There is no external draft-model path: MTP replaces that.
 
 `--spec auto` (the default) picks a draft source in this order:
 
-1. Attached `--draft` session (recommended: Qwen3.5-0.8B)
-2. The target's own **MTP** head
-3. N-gram continuation from already generated tokens
+1. The target's own **MTP** head, if present
+2. N-gram continuation from already generated tokens
 
 ```bash
 rapidllm -m /path/to/Qwen3.8-27B-FP8 --spec mtp --spec-n 3 --prompt "Hello"
 ```
 
-CUDA without `--draft` uses n-gram only (MTP draft on CUDA is CPU-session). `set_draft` requires matching vocab; architecture may differ.
-
-Recommended draft for Qwen3.6-27B **and Qwen3.8-27B**: [`Qwen/Qwen3.5-0.8B`](https://huggingface.co/Qwen/Qwen3.5-0.8B). `set_draft` only requires matching vocab; architecture may differ. 3.8 is still `qwen3_5` with vocab **248320**, so the 0.8B draft stays valid.
-
-| | Qwen3.8 / 3.6-27B (target) | Qwen3.5-0.8B (draft) |
-| --- | --- | --- |
-| Family | `qwen3_5` hybrid | same |
-| Vocab | 248320 | **248320** |
-| Layers | 64 (48 DeltaNet + 16 Attn) | 24 (18 DeltaNet + 6 Attn) |
-| Hidden | 5120 | 1024 |
-| DeltaNet V heads | 48 | 16 |
-| Attn | 24 Q / 4 KV, hd 256 | 8 Q / 2 KV, hd 256 |
-
-```bash
-rapidllm -m /path/to/Qwen3.8-27B-FP8 \
-  --draft /path/to/Qwen3.5-0.8B \
-  --spec draft --spec-n 3 \
-  --prompt "Hello"
-```
+T=2 verify reads each weight once (custom GEMV, not cublasLt n=2). A fused miss keeps token-0 hidden/KV and restores snapped GDN S/conv instead of re-decoding. On official Qwen3.8-27B-FP8 this beats `--spec off`: **35.94** vs **27.19** tok/s on prompt `1,2,3` (accepted=7/8). Decode uses in-kernel Flash Attention for GQA 24/4 (group=6); `RAPIDLLM_NO_FLASH=1` is the kill switch.
 
 ## Continuous batch
 
@@ -432,7 +488,7 @@ C API: `rapidllm_generate_batch`. Session API: `Session::generate_batch`.
 
 ## HTTP serve
 
-`rapidllm serve` is a single-connection JSON server (no SSE yet). Thinking is off.
+`rapidllm serve` is a single-connection HTTP server. Set `"stream": true` for SSE token streaming. Thinking is off.
 
 | Method | Path | Protocol |
 | --- | --- | --- |
@@ -446,9 +502,13 @@ C API: `rapidllm_generate_batch`. Session API: `Session::generate_batch`.
 curl http://127.0.0.1:8080/v1/chat/completions \
   -H "Content-Type: application/json" \
   -d '{"model":"qwen","messages":[{"role":"user","content":"Hello"}],"max_tokens":64}'
+
+curl -N http://127.0.0.1:8080/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{"model":"qwen","messages":[{"role":"user","content":"Hello"}],"max_tokens":64,"stream":true}'
 ```
 
-`max_tokens` is clamped to 4096. `temperature <= 0` is greedy.
+`max_tokens` is clamped to 4096. `temperature <= 0` is greedy. `"stream": true` emits `text/event-stream` (OpenAI chat chunks + `[DONE]`, Responses `response.output_text.delta`, Anthropic `content_block_delta`).
 
 ## C API
 
@@ -467,7 +527,7 @@ RapidLLM* eng = rapidllm_load(&cfg, &err);
 RapidSessionConfig sc = {0};
 sc.enable_thinking = 1;
 sc.max_new_tokens = 64;
-sc.spec = 3; /* auto; 4 = draft-model */
+sc.spec = 3; /* auto → MTP if the model has it */
 RapidSession* sess = rapidllm_session_new(eng, &sc, &err);
 
 int32_t ids[256], out[64];
@@ -485,7 +545,7 @@ rapidllm_session_free(sess);
 rapidllm_free(eng);
 ```
 
-Attach a draft model with `rapidllm_session_set_draft`. `RAPIDLLM_API_VERSION` is `1`. See `include/rapidllm/api.h`.
+`RAPIDLLM_API_VERSION` is `1`. See `include/rapidllm/api.h`.
 
 ## Tests
 
@@ -502,7 +562,7 @@ ctest --test-dir build --output-on-failure
 | `test_hybrid` | greedy tokens vs golden, fuse on/off, both formats |
 | `test_simd_bench` | AVX2 / AVX-512 vs scalar |
 | `test_nv` | DP4A GEMV reference |
-| `test_spec` | n-gram / MTP / draft-model speculative decode |
+| `test_spec` | n-gram / MTP speculative decode |
 | `test_batch` | continuous batch generate |
 | `test_protocol` | OpenAI / Anthropic parse + render + `/health` |
 | `test_cuda_decode` | CUDA path or host-ref fallback |
@@ -527,7 +587,7 @@ docs/               architecture (EN/ZH)
 
 ## Non-goals (v1)
 
-- No SSE / token streaming on `serve` (JSON request → JSON response)
+- `serve` is single-connection (no concurrent requests). SSE (`stream: true`) is supported.
 - No video encoder
 - No MoE expert path
 - No ARM / Apple Silicon

@@ -23,6 +23,7 @@ using socklen_t = int;
 #else
 #include <arpa/inet.h>
 #include <netinet/in.h>
+#include <netinet/tcp.h>
 #include <sys/socket.h>
 #include <unistd.h>
 #define closesocket close
@@ -117,6 +118,56 @@ HttpResponse json_err(int status, std::string_view type, std::string_view msg) {
     return r;
 }
 
+void read_stream_flag(const Json& j, GenRequest& out) {
+    const Json* s = j.get("stream");
+    if (!s) return;
+    if (s->is_bool()) out.stream = s->as_bool();
+    else if (s->is_num()) out.stream = s->as_int() != 0;
+}
+
+int classify_path(std::string_view path) {
+    if (path == "/v1/chat/completions" || path == "/chat/completions") return 1;
+    if (path == "/v1/responses" || path == "/responses") return 2;
+    if (path == "/v1/messages" || path == "/messages") return 3;
+    return 0;
+}
+
+std::string decode_ids(RapidLLM* eng, const int32_t* ids, int n) {
+    if (!eng || !ids || n <= 0) return {};
+    RapidError e{};
+    std::string t(static_cast<size_t>(n) * 16 + 32, '\0');
+    int dn = rapidllm_decode_ids(eng, ids, n, t.data(), static_cast<int>(t.size()), &e);
+    if (dn < 0) {
+        t.assign(static_cast<size_t>(n) * 64 + 64, '\0');
+        dn = rapidllm_decode_ids(eng, ids, n, t.data(), static_cast<int>(t.size()), &e);
+    }
+    if (dn < 0) return {};
+    t.resize(static_cast<size_t>(dn));
+    return t;
+}
+
+bool push_sse(std::string& body, SseEmit emit, void* ctx, std::string_view frame) {
+    body.append(frame);
+    if (emit) return emit(ctx, frame.data(), frame.size());
+    return true;
+}
+
+bool send_all(int fd, const char* p, size_t n) {
+    while (n > 0) {
+        const int chunk = n > 1u << 20 ? (1 << 20) : static_cast<int>(n);
+        const int w = send(fd, p, chunk, 0);
+        if (w <= 0) return false;
+        p += w;
+        n -= static_cast<size_t>(w);
+    }
+    return true;
+}
+
+bool sock_emit(void* ctx, const char* data, size_t n) {
+    if (!ctx || !data) return false;
+    return send_all(*static_cast<int*>(ctx), data, n);
+}
+
 } // namespace
 
 std::string json_escape(std::string_view s) {
@@ -162,7 +213,7 @@ bool parse_openai_chat(std::string_view body, GenRequest& out, std::string& err)
         if (const Json* t = j.get("max_tokens"); t && t->is_num()) out.max_tokens = t->as_int();
         if (const Json* t = j.get("max_completion_tokens"); t && t->is_num()) out.max_tokens = t->as_int();
         if (const Json* t = j.get("temperature"); t && t->is_num()) out.temperature = static_cast<float>(t->as_num());
-        if (const Json* s = j.get("stream"); s && s->is_bool()) out.stream = s->as_bool();
+        read_stream_flag(j, out);
         const Json* msgs = j.get("messages");
         if (!msgs) {
             err = "missing messages";
@@ -186,7 +237,7 @@ bool parse_openai_responses(std::string_view body, GenRequest& out, std::string&
         if (const Json* t = j.get("max_output_tokens"); t && t->is_num()) out.max_tokens = t->as_int();
         if (const Json* t = j.get("max_tokens"); t && t->is_num()) out.max_tokens = t->as_int();
         if (const Json* t = j.get("temperature"); t && t->is_num()) out.temperature = static_cast<float>(t->as_num());
-        if (const Json* s = j.get("stream"); s && s->is_bool()) out.stream = s->as_bool();
+        read_stream_flag(j, out);
         if (const Json* inp = j.get("input")) {
             if (inp->is_str()) {
                 out.messages.push_back({"user", inp->as_str()});
@@ -213,7 +264,7 @@ bool parse_anthropic_messages(std::string_view body, GenRequest& out, std::strin
         if (const Json* m = j.get("model"); m && m->is_str()) out.model = m->as_str();
         if (const Json* t = j.get("max_tokens"); t && t->is_num()) out.max_tokens = t->as_int();
         if (const Json* t = j.get("temperature"); t && t->is_num()) out.temperature = static_cast<float>(t->as_num());
-        if (const Json* s = j.get("stream"); s && s->is_bool()) out.stream = s->as_bool();
+        read_stream_flag(j, out);
         if (const Json* sys = j.get("system")) {
             std::string sys_t;
             append_text_pieces(*sys, sys_t);
@@ -275,7 +326,25 @@ std::string render_error(int status, std::string_view type, std::string_view mes
     return o.str();
 }
 
+std::string sse_data(std::string_view payload, std::string_view event) {
+    std::string o;
+    if (!event.empty()) {
+        o += "event: ";
+        o += event;
+        o += "\n";
+    }
+    o += "data: ";
+    o += payload;
+    o += "\n\n";
+    return o;
+}
+
 HttpResponse handle_http(const HttpRequest& req, RapidLLM* eng, RapidSession* sess, const std::string& model_id) {
+    return handle_http(req, eng, sess, model_id, nullptr, nullptr);
+}
+
+HttpResponse handle_http(const HttpRequest& req, RapidLLM* eng, RapidSession* sess, const std::string& model_id,
+                         SseEmit emit, void* emit_ctx) {
     if (req.method == "GET" && (req.path == "/health" || req.path == "/v1/health")) {
         return json_ok("{\"status\":\"ok\"}");
     }
@@ -316,19 +385,122 @@ HttpResponse handle_http(const HttpRequest& req, RapidLLM* eng, RapidSession* se
     RapidSampleParams sp{};
     sp.greedy = gr.temperature <= 0.f ? 1 : 0;
     sp.temperature = gr.temperature;
-    std::vector<int32_t> out(static_cast<size_t>(gr.max_tokens));
-    const int got = rapidllm_generate(sess, ids.data(), n, &sp, out.data(), gr.max_tokens, &e);
-    if (got < 0) return json_err(500, "server_error", e.message);
 
-    std::string text(static_cast<size_t>(got) * 8 + 8, '\0');
-    const int dn = rapidllm_decode_ids(eng, out.data(), got, text.data(), static_cast<int>(text.size()), &e);
-    if (dn < 0) text.clear();
-    else text.resize(static_cast<size_t>(dn));
+    if (!gr.stream) {
+        std::vector<int32_t> out(static_cast<size_t>(gr.max_tokens));
+        const int got = rapidllm_generate(sess, ids.data(), n, &sp, out.data(), gr.max_tokens, &e);
+        if (got < 0) return json_err(500, "server_error", e.message);
+        const std::string text = decode_ids(eng, out.data(), got);
+        if (is_chat)
+            return json_ok(render_openai_chat(make_id("chatcmpl-"), model, text, n, got, now_unix()));
+        if (is_resp) return json_ok(render_openai_responses(make_id("resp_"), model, text, n, got));
+        return json_ok(render_anthropic(make_id("msg_"), model, text, n, got));
+    }
 
-    if (is_chat)
-        return json_ok(render_openai_chat(make_id("chatcmpl-"), model, text, n, got, now_unix()));
-    if (is_resp) return json_ok(render_openai_responses(make_id("resp_"), model, text, n, got));
-    return json_ok(render_anthropic(make_id("msg_"), model, text, n, got));
+    if (rapidllm_prefill(sess, ids.data(), n, &e) != RAPID_OK)
+        return json_err(500, "server_error", e.message[0] ? e.message : "prefill failed");
+
+    const long long created = now_unix();
+    const std::string id = is_chat ? make_id("chatcmpl-") : (is_resp ? make_id("resp_") : make_id("msg_"));
+    HttpResponse r;
+    r.status = 200;
+    r.content_type = "text/event-stream";
+    auto fail = [&](std::string_view msg) {
+        const std::string ev = sse_data(render_error(500, "server_error", msg));
+        push_sse(r.body, emit, emit_ctx, ev);
+        return r;
+    };
+
+    if (is_chat) {
+        std::ostringstream o;
+        o << "{\"id\":\"" << json_escape(id) << "\",\"object\":\"chat.completion.chunk\",\"created\":" << created
+          << ",\"model\":\"" << json_escape(model) << "\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\"},"
+          << "\"finish_reason\":null}]}";
+        if (!push_sse(r.body, emit, emit_ctx, sse_data(o.str()))) return r;
+    } else if (is_resp) {
+        std::ostringstream o;
+        o << "{\"type\":\"response.created\",\"response\":{\"id\":\"" << json_escape(id)
+          << "\",\"object\":\"response\",\"status\":\"in_progress\",\"model\":\"" << json_escape(model) << "\"}}";
+        if (!push_sse(r.body, emit, emit_ctx, sse_data(o.str(), "response.created"))) return r;
+    } else {
+        std::ostringstream o;
+        o << "{\"type\":\"message_start\",\"message\":{\"id\":\"" << json_escape(id)
+          << "\",\"type\":\"message\",\"role\":\"assistant\",\"model\":\"" << json_escape(model)
+          << "\",\"content\":[],\"stop_reason\":null}}";
+        if (!push_sse(r.body, emit, emit_ctx, sse_data(o.str(), "message_start"))) return r;
+        if (!push_sse(r.body, emit, emit_ctx,
+                      sse_data("{\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\","
+                               "\"text\":\"\"}}",
+                               "content_block_start")))
+            return r;
+    }
+
+    std::vector<int32_t> toks;
+    toks.reserve(static_cast<size_t>(gr.max_tokens));
+    std::string prev;
+    for (int i = 0; i < gr.max_tokens; ++i) {
+        int32_t tok = 0;
+        if (rapidllm_sample(sess, &sp, &tok, &e) != RAPID_OK) return fail(e.message);
+        toks.push_back(tok);
+        const std::string cur = decode_ids(eng, toks.data(), static_cast<int>(toks.size()));
+        std::string delta;
+        if (cur.size() >= prev.size() && cur.compare(0, prev.size(), prev) == 0)
+            delta = cur.substr(prev.size());
+        else
+            delta = cur;
+        prev = cur;
+        if (!delta.empty()) {
+            if (is_chat) {
+                std::ostringstream o;
+                o << "{\"id\":\"" << json_escape(id) << "\",\"object\":\"chat.completion.chunk\",\"created\":"
+                  << created << ",\"model\":\"" << json_escape(model)
+                  << "\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"" << json_escape(delta)
+                  << "\"},\"finish_reason\":null}]}";
+                if (!push_sse(r.body, emit, emit_ctx, sse_data(o.str()))) return r;
+            } else if (is_resp) {
+                std::ostringstream o;
+                o << "{\"type\":\"response.output_text.delta\",\"delta\":\"" << json_escape(delta) << "\"}";
+                if (!push_sse(r.body, emit, emit_ctx, sse_data(o.str(), "response.output_text.delta"))) return r;
+            } else {
+                std::ostringstream o;
+                o << "{\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\""
+                  << json_escape(delta) << "\"}}";
+                if (!push_sse(r.body, emit, emit_ctx, sse_data(o.str(), "content_block_delta"))) return r;
+            }
+        }
+        if (i + 1 < gr.max_tokens) {
+            if (rapidllm_decode(sess, tok, nullptr, &e) != RAPID_OK) return fail(e.message);
+        }
+    }
+    const int got = static_cast<int>(toks.size());
+
+    if (is_chat) {
+        std::ostringstream o;
+        o << "{\"id\":\"" << json_escape(id) << "\",\"object\":\"chat.completion.chunk\",\"created\":" << created
+          << ",\"model\":\"" << json_escape(model)
+          << "\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":"
+          << n << ",\"completion_tokens\":" << got << ",\"total_tokens\":" << (n + got) << "}}";
+        if (!push_sse(r.body, emit, emit_ctx, sse_data(o.str()))) return r;
+        push_sse(r.body, emit, emit_ctx, sse_data("[DONE]"));
+    } else if (is_resp) {
+        std::ostringstream o;
+        o << "{\"type\":\"response.completed\",\"response\":{\"id\":\"" << json_escape(id)
+          << "\",\"object\":\"response\",\"status\":\"completed\",\"model\":\"" << json_escape(model)
+          << "\",\"output\":[{\"type\":\"message\",\"role\":\"assistant\",\"content\":[{\"type\":\"output_text\","
+          << "\"text\":\"" << json_escape(prev) << "\"}]}],\"usage\":{\"input_tokens\":" << n
+          << ",\"output_tokens\":" << got << ",\"total_tokens\":" << (n + got) << "}}}";
+        push_sse(r.body, emit, emit_ctx, sse_data(o.str(), "response.completed"));
+    } else {
+        if (!push_sse(r.body, emit, emit_ctx, sse_data("{\"type\":\"content_block_stop\",\"index\":0}",
+                                                      "content_block_stop")))
+            return r;
+        std::ostringstream d;
+        d << "{\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":"
+          << got << "}}";
+        if (!push_sse(r.body, emit, emit_ctx, sse_data(d.str(), "message_delta"))) return r;
+        push_sse(r.body, emit, emit_ctx, sse_data("{\"type\":\"message_stop\"}", "message_stop"));
+    }
+    return r;
 }
 
 #if defined(_WIN32)
@@ -369,8 +541,9 @@ int serve_listen(const char* host, int port, RapidLLM* eng, RapidSession* sess, 
         closesocket(fd);
         return 1;
     }
-    std::fprintf(stderr, "rapidllm serve %s:%d  /v1/chat/completions  /v1/responses  /v1/messages\n", bind_host,
-                 port);
+    std::fprintf(stderr,
+                 "rapidllm serve %s:%d  /v1/chat/completions  /v1/responses  /v1/messages  (SSE stream=true)\n",
+                 bind_host, port);
     std::fflush(stderr);
     for (;;) {
         sockaddr_in cli{};
@@ -415,6 +588,39 @@ int serve_listen(const char* host, int port, RapidLLM* eng, RapidSession* sess, 
             }
             hr.body = std::move(body);
         }
+        int one = 1;
+        setsockopt(cfd, IPPROTO_TCP, TCP_NODELAY, reinterpret_cast<const char*>(&one), sizeof(one));
+
+        bool live_sse = false;
+        if (hr.method == "POST") {
+            const int kind = classify_path(hr.path);
+            if (kind) {
+                GenRequest peek;
+                std::string perr;
+                bool pok = false;
+                if (kind == 1) pok = parse_openai_chat(hr.body, peek, perr);
+                else if (kind == 2) pok = parse_openai_responses(hr.body, peek, perr);
+                else pok = parse_anthropic_messages(hr.body, peek, perr);
+                live_sse = pok && peek.stream;
+            }
+        }
+
+        if (live_sse) {
+            const char* hdr = "HTTP/1.1 200 OK\r\n"
+                              "Content-Type: text/event-stream\r\n"
+                              "Cache-Control: no-cache\r\n"
+                              "Connection: close\r\n"
+                              "X-Accel-Buffering: no\r\n\r\n";
+            send_all(cfd, hdr, std::strlen(hdr));
+            const HttpResponse resp = handle_http(hr, eng, sess, model_id, sock_emit, &cfd);
+            if (resp.status != 200 && !resp.body.empty()) {
+                const std::string ev = sse_data(resp.body);
+                send_all(cfd, ev.data(), ev.size());
+            }
+            closesocket(cfd);
+            continue;
+        }
+
         const HttpResponse resp = handle_http(hr, eng, sess, model_id);
         std::ostringstream out;
         out << "HTTP/1.1 " << resp.status << (resp.status == 200 ? " OK" : " ERR") << "\r\n"
@@ -423,7 +629,7 @@ int serve_listen(const char* host, int port, RapidLLM* eng, RapidSession* sess, 
             << "Connection: close\r\n\r\n"
             << resp.body;
         const std::string wire = out.str();
-        send(cfd, wire.data(), static_cast<int>(wire.size()), 0);
+        send_all(cfd, wire.data(), wire.size());
         closesocket(cfd);
     }
 }

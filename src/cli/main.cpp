@@ -19,14 +19,14 @@
 static void usage() {
     std::fprintf(stderr,
                  "rapidllm %s\n"
-                 "  rapidllm -m <hf-dir|file.gguf> [--device cpu|cuda] [--ctx 32768] [--prompt TEXT]\n"
-                 "           [--max-new N] [--fuse=on|off] [--spec off|ngram|mtp|auto|draft] [--spec-n N]\n"
-                 "           [--draft <hf-dir|file.gguf>]\n"
+                 "  rapidllm -m <hf-dir|file.gguf> [--device cpu|cuda|vulkan] [--ctx 32768] [--prompt TEXT]\n"
+                 "           [--max-new N] [--fuse=on|off] [--spec off|ngram|mtp|auto] [--spec-n N]\n"
+                 "           [--dump-mtp-draft [N]]\n"
                  "           [--image PATH] [--vision] [--batch N] [--prompt-n N]\n"
                  "           [--kv-type f16|q8k_tq3v]\n"
                  "           --image runs the ViT and splices visual tokens into generate\n"
-                 "  rapidllm bench -m <path> [--device cpu|cuda] [--fuse=on|off] [--micro]\n"
-                 "  rapidllm serve -m <path> [--host 127.0.0.1] [--port 8080] [--device cpu|cuda]\n"
+                 "  rapidllm bench -m <path> [--device cpu|cuda|vulkan] [--fuse=on|off] [--micro]\n"
+                 "  rapidllm serve -m <path> [--host 127.0.0.1] [--port 8080] [--device cpu|cuda|vulkan]\n"
                  "           OpenAI: POST /v1/chat/completions  POST /v1/responses\n"
                  "           Anthropic: POST /v1/messages\n",
                  rapidllm_version_string());
@@ -47,9 +47,10 @@ int main(int argc, char** argv) {
     int max_layers = -1;
     int language_only = 1;
     std::string image_path;
-    std::string draft_path;
     int batch_n = 1;
     int prompt_n = 0;
+    bool mixed = false;
+    int dump_mtp = 0;
     bool serve = false;
     std::string host = "127.0.0.1";
     int port = 8080;
@@ -98,12 +99,26 @@ int main(int argc, char** argv) {
             if (v == "off") spec = 0;
             else if (v == "ngram") spec = 1;
             else if (v == "mtp") spec = 2;
-            else if (v == "draft") spec = 4;
-            else spec = 3;
-        } else if (a == "--draft")
-            draft_path = need("--draft");
-        else if (a == "--spec-n")
+            else if (v == "auto") spec = 3;
+            else if (v == "draft") {
+                std::fprintf(stderr, "--spec draft removed: Qwen3.6/3.8 MTP replaces the external draft model. "
+                                     "Use --spec mtp or --spec auto.\n");
+                return 2;
+            } else {
+                std::fprintf(stderr, "unknown --spec %s (off|ngram|mtp|auto)\n", v.c_str());
+                return 2;
+            }
+        } else if (a == "--draft") {
+            std::fprintf(stderr, "--draft removed: Qwen3.6/3.8 MTP replaces the external draft model. "
+                                 "Use --spec mtp or --spec auto.\n");
+            return 2;
+        } else if (a == "--spec-n")
             spec_n = std::atoi(need("--spec-n"));
+        else if (a == "--dump-mtp-draft") {
+            dump_mtp = 3;
+            if (i + 1 < argc && argv[i + 1][0] != '-') dump_mtp = std::atoi(need("--dump-mtp-draft"));
+            if (dump_mtp <= 0) dump_mtp = 3;
+        }
         else if (a == "--threads")
             threads = std::atoi(need("--threads"));
         else if (a == "--max-layers")
@@ -115,6 +130,8 @@ int main(int argc, char** argv) {
             language_only = 0;
         else if (a == "--batch")
             batch_n = std::atoi(need("--batch"));
+        else if (a == "--mixed")
+            mixed = true;
         else if (a == "--prompt-n")
             prompt_n = std::atoi(need("--prompt-n"));
         else if (a == "--kv-type") {
@@ -249,13 +266,6 @@ int main(int argc, char** argv) {
 #endif
     }
 
-    if (!image_path.empty() && spec == 4) {
-        std::fprintf(stderr, "image: draft spec disabled (draft cannot see vision embeds)\n");
-        spec = 0;
-        draft_path.clear();
-    }
-    if (!draft_path.empty() && spec != 0) spec = 4;
-
     RapidSessionConfig sc{};
     sc.enable_thinking = thinking ? 1 : 0;
     sc.preserve_thinking = 0;
@@ -271,52 +281,10 @@ int main(int argc, char** argv) {
         return 1;
     }
 
-    RapidLLM* draft_eng = nullptr;
-    RapidSession* draft_sess = nullptr;
-    if (!draft_path.empty()) {
-        if (spec == 0) {
-            std::fprintf(stderr, "draft ignored because --spec off\n");
-        } else {
-            RapidConfig dcfg = cfg;
-            dcfg.model_path = draft_path.c_str();
-            std::fprintf(stderr, "loading draft %s ...\n", draft_path.c_str());
-            std::fflush(stderr);
-            draft_eng = rapidllm_load(&dcfg, &err);
-            if (!draft_eng) {
-                std::fprintf(stderr, "draft load failed: %s\n", err.message);
-                rapidllm_session_free(sess);
-                rapidllm_free(eng);
-                return 1;
-            }
-            RapidSessionConfig dsc = sc;
-            dsc.spec = 0;
-            dsc.spec_n = 0;
-            draft_sess = rapidllm_session_new(draft_eng, &dsc, &err);
-            if (!draft_sess) {
-                std::fprintf(stderr, "draft session: %s\n", err.message);
-                rapidllm_free(draft_eng);
-                rapidllm_session_free(sess);
-                rapidllm_free(eng);
-                return 1;
-            }
-            if (rapidllm_session_set_draft(sess, draft_sess, &err) != RAPID_OK) {
-                std::fprintf(stderr, "attach draft: %s\n", err.message);
-                rapidllm_session_free(draft_sess);
-                rapidllm_free(draft_eng);
-                rapidllm_session_free(sess);
-                rapidllm_free(eng);
-                return 1;
-            }
-            std::fprintf(stderr, "draft attached vocab=%d spec=%d\n", rapidllm_vocab(draft_eng), spec);
-        }
-    }
-
     if (serve) {
         const int rc = rapidllm::serve::serve_listen(host.c_str(), port, eng, sess, model);
         rapidllm_session_free(sess);
         rapidllm_free(eng);
-        if (draft_sess) rapidllm_session_free(draft_sess);
-        if (draft_eng) rapidllm_free(draft_eng);
         return rc;
     }
 
@@ -328,8 +296,6 @@ int main(int argc, char** argv) {
             std::fprintf(stderr, "image: %s\n", err.message);
             rapidllm_session_free(sess);
             rapidllm_free(eng);
-            if (draft_sess) rapidllm_session_free(draft_sess);
-            if (draft_eng) rapidllm_free(draft_eng);
             return 1;
         }
         std::fprintf(stderr, "image %s vis_tokens=%d\n", image_path.c_str(), n_vis);
@@ -366,10 +332,68 @@ int main(int argc, char** argv) {
     std::fprintf(stderr, "generate n_prompt=%d max_new=%d\n", n, max_new);
     std::fflush(stderr);
 
+    if (dump_mtp > 0) {
+        if (rapidllm_prefill(sess, ids.data(), n, &err) != RAPID_OK) {
+            std::fprintf(stderr, "prefill: %s\n", err.message);
+            rapidllm_session_free(sess);
+            rapidllm_free(eng);
+            return 1;
+        }
+        RapidSampleParams sp{};
+        sp.greedy = 1;
+        int32_t first = 0;
+        if (rapidllm_sample(sess, &sp, &first, &err) != RAPID_OK) {
+            std::fprintf(stderr, "sample: %s\n", err.message);
+            rapidllm_session_free(sess);
+            rapidllm_free(eng);
+            return 1;
+        }
+        std::vector<int32_t> a(static_cast<size_t>(dump_mtp), 0), b(static_cast<size_t>(dump_mtp), 0);
+        const int na = rapidllm_mtp_draft(sess, first, dump_mtp, a.data(), &err);
+        const int nb = rapidllm_mtp_draft(sess, first, dump_mtp, b.data(), &err);
+        std::printf("mtp_first=%d has_mtp=%d cuda=%d\n", first, rapidllm_has_mtp(sess),
+                    rapidllm_uses_cuda(sess));
+        std::printf("mtp_draft1:");
+        for (int i = 0; i < na; ++i) std::printf(" %d", a[static_cast<size_t>(i)]);
+        std::printf("\nmtp_draft2:");
+        for (int i = 0; i < nb; ++i) std::printf(" %d", b[static_cast<size_t>(i)]);
+        std::printf("\n");
+        int same = (na == nb && na > 0);
+        int nonzero = 0;
+        for (int i = 0; i < na && same; ++i) {
+            if (a[static_cast<size_t>(i)] != b[static_cast<size_t>(i)]) same = 0;
+            if (a[static_cast<size_t>(i)] != 0) nonzero = 1;
+        }
+        std::printf("mtp_draft_match=%d mtp_draft_nonzero=%d n=%d\n", same, nonzero, na);
+        rapidllm_session_free(sess);
+        rapidllm_free(eng);
+        return (same && nonzero) ? 0 : 1;
+    }
+
     RapidSampleParams sp{};
     sp.greedy = 1;
     sp.temperature = 0.f;
     std::vector<int32_t> out(static_cast<size_t>(max_new));
+
+    std::vector<int32_t> packed;
+    std::vector<int> packed_lens;
+    if (mixed && batch_n > 1) {
+        packed_lens.assign(static_cast<size_t>(batch_n), n);
+        packed.resize(static_cast<size_t>(batch_n) * static_cast<size_t>(n));
+        const int vocab = rapidllm_vocab(eng);
+        const int span = vocab > 20000 ? 10000 : (vocab > 256 ? vocab - 256 : 1);
+        for (int b = 0; b < batch_n; ++b) {
+            for (int i = 0; i < n; ++i) {
+                int32_t tok = ids[static_cast<size_t>(i)];
+                if (prompt_n > 0)
+                    tok = 256 + ((i + b * 9973) % span);
+                else
+                    tok = 256 + ((tok + b * 17 + i) % span);
+                packed[static_cast<size_t>(b) * n + i] = tok;
+            }
+        }
+        std::fprintf(stderr, "mixed_batch n_seq=%d n_prompt=%d\n", batch_n, n);
+    }
 
     if (bench) {
         // Same as vLLM bakeoff: generate after load is warmed, then the timed run.
@@ -377,7 +401,12 @@ int main(int argc, char** argv) {
         if (batch_n > 1) {
             std::vector<int32_t> wout(static_cast<size_t>(batch_n) * max_new, 0);
             std::vector<int> wn(static_cast<size_t>(batch_n), 0);
-            w = rapidllm_generate_batch(sess, ids.data(), n, batch_n, &sp, wout.data(), max_new, wn.data(), &err);
+            if (mixed)
+                w = rapidllm_generate_batch_var(sess, packed.data(), packed_lens.data(), batch_n, &sp, wout.data(),
+                                                max_new, wn.data(), &err);
+            else
+                w = rapidllm_generate_batch(sess, ids.data(), n, batch_n, &sp, wout.data(), max_new, wn.data(),
+                                            &err);
         } else {
             w = rapidllm_generate(sess, ids.data(), n, &sp, out.data(), max_new, &err);
         }
@@ -397,7 +426,12 @@ int main(int argc, char** argv) {
     if (batch_n > 1) {
         out.assign(static_cast<size_t>(batch_n) * max_new, 0);
         out_n.assign(static_cast<size_t>(batch_n), 0);
-        got = rapidllm_generate_batch(sess, ids.data(), n, batch_n, &sp, out.data(), max_new, out_n.data(), &err);
+        if (mixed)
+            got = rapidllm_generate_batch_var(sess, packed.data(), packed_lens.data(), batch_n, &sp, out.data(),
+                                              max_new, out_n.data(), &err);
+        else
+            got = rapidllm_generate_batch(sess, ids.data(), n, batch_n, &sp, out.data(), max_new, out_n.data(),
+                                          &err);
     } else {
         got = rapidllm_generate(sess, ids.data(), n, &sp, out.data(), max_new, &err);
     }
@@ -416,6 +450,21 @@ int main(int argc, char** argv) {
     std::printf("tokens:");
     for (int i = 0; i < got; ++i) std::printf(" %d", out[i]);
     std::printf("\ntext: %s\n", decoded);
+    if (batch_n > 1) {
+        int zseq = 0;
+        for (int b = 0; b < batch_n; ++b) {
+            const int nn = out_n.empty() ? 0 : out_n[static_cast<size_t>(b)];
+            bool allz = nn > 0;
+            for (int i = 0; i < nn; ++i) {
+                if (out[static_cast<size_t>(b) * max_new + i] != 0) {
+                    allz = false;
+                    break;
+                }
+            }
+            if (allz) ++zseq;
+        }
+        std::fprintf(stderr, "batch_zero_seqs=%d/%d\n", zseq, batch_n);
+    }
 
     if (bench) {
         const double tps = sec > 0 ? got / sec : 0;
@@ -425,9 +474,14 @@ int main(int argc, char** argv) {
         const double decode_tps = (decode_s > 0 && n_dec > 0) ? n_dec / decode_s : 0;
         std::printf("thinking=off\n");
         std::printf("fuse=%s isa=%s device=%s\n", fuse ? "on" : "off", rapidllm::ops::simd_isa_name(),
-                    rapidllm_uses_cuda(sess) ? "cuda" : "cpu");
+                    rapidllm_device_name(sess));
         std::printf("tok/s=%.4f decode_tok/s=%.4f prefill_s=%.4f decode_s=%.4f n_new=%d batch=%d sec=%.4f\n", tps,
                     decode_tps, prefill_s, decode_s, got, batch_n, sec);
+        // Same meters as llama-cli `[ Prompt: | Generation: ]`, plus Wall.
+        // tok/s= above stays n_new/(prefill+decode). Prompt uses n_prompt/prefill_s.
+        const double prompt_tps = (prefill_s > 0 && n > 0) ? static_cast<double>(n) / prefill_s : 0;
+        std::printf("[ Prompt: %.1f t/s | Generation: %.1f t/s | Wall: %.4f t/s ]\n", prompt_tps, decode_tps,
+                    tps);
     }
 
     RapidSpecStats ss{};
@@ -437,7 +491,5 @@ int main(int argc, char** argv) {
 
     rapidllm_session_free(sess);
     rapidllm_free(eng);
-    if (draft_sess) rapidllm_session_free(draft_sess);
-    if (draft_eng) rapidllm_free(draft_eng);
     return 0;
 }

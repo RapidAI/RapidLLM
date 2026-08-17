@@ -31,6 +31,10 @@ int main() {
     // Last two equal, no longer suffix hit → copy last token.
     expect_eq(draft({7, 8, 8}, 8, 3), {8, 8, 8}, "last two equal");
 
+    // Unigram hit on an earlier 0 copies only the real tail (31 0), not an
+    // invented 11-token period-2 fill.
+    expect_eq(draft({4, 5, 0, 31, 0}, 0, 11), {31, 0}, "no period2 fill on 4 5 0 31 0");
+
     // No suffix hit and last two differ → empty.
     expect_eq(draft({10, 11, 12}, 13, 3), {}, "no match");
 

@@ -128,6 +128,9 @@ struct ModelDesc {
     int mtp_n_layers = 1;
     bool mtp_dedicated_embeddings = false;
     bool has_mtp = false;
+    // llama.cpp Qwen3.5 convert tiles V heads (r, k) from grouped (k, r).
+    // Q/K stay grouped; GDN must use src_h = h % nk instead of h / (nv/nk).
+    bool gdn_v_tiled = false;
 
     int mixer_slot(int i) const;
     LayerKind kind_of(int i) const { return layers.at(static_cast<size_t>(i)).kind; }

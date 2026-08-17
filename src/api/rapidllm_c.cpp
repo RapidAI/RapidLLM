@@ -27,6 +27,7 @@ struct RapidLLM {
     bool kv_i8 = false;
     bool fuse = true;
     bool use_cuda = false;
+    bool use_vulkan = false;
 };
 
 struct RapidSession {
@@ -34,6 +35,13 @@ struct RapidSession {
     std::unique_ptr<Session> sess;
     RapidSessionConfig sc{};
 };
+
+static SpecKind spec_kind(int spec) {
+    if (spec == 0) return SpecKind::Off;
+    if (spec == 1) return SpecKind::Ngram;
+    if (spec == 2) return SpecKind::Mtp;
+    return SpecKind::Auto;
+}
 
 static void set_err(RapidError* e, RapidStatus c, const std::string& m) {
     if (!e) return;
@@ -65,11 +73,18 @@ RapidLLM* rapidllm_load(const RapidConfig* cfg, RapidError* err) {
                 return nullptr;
             }
             eng->use_cuda = true;
+        } else if (std::strcmp(dev, "vulkan") == 0 || std::strcmp(dev, "vk") == 0) {
+            eng->use_vulkan = true;
         } else if (std::strcmp(dev, "cpu") != 0) {
-            set_err(err, RAPID_ERR_DEVICE, "device must be cpu or cuda");
+            set_err(err, RAPID_ERR_DEVICE, "device must be cpu, cuda, or vulkan");
             return nullptr;
         }
-        eng->dev = create_device(DeviceKind::CPU);
+        try {
+            eng->dev = create_device(eng->use_vulkan ? DeviceKind::Vulkan : DeviceKind::CPU);
+        } catch (const std::exception& e) {
+            set_err(err, RAPID_ERR_DEVICE, e.what());
+            return nullptr;
+        }
         eng->ctx = cfg->ctx > 0 ? cfg->ctx : 32768;
         eng->kv_i8 = cfg->kv_i8 != 0;
         eng->fuse = cfg->fuse != 0;
@@ -205,20 +220,6 @@ RapidSession* rapidllm_session_new(RapidLLM* e, const RapidSessionConfig* sc, Ra
     }
 }
 
-int rapidllm_session_set_draft(RapidSession* target, RapidSession* draft, RapidError* err) {
-    try {
-        if (!target || !target->sess) {
-            set_err(err, RAPID_ERR_RANGE, "null target session");
-            return RAPID_ERR_RANGE;
-        }
-        target->sess->set_draft(draft && draft->sess ? draft->sess.get() : nullptr);
-        return RAPID_OK;
-    } catch (const std::exception& e) {
-        set_err(err, RAPID_ERR_INTERNAL, e.what());
-        return RAPID_ERR_INTERNAL;
-    }
-}
-
 void rapidllm_session_set_max_new(RapidSession* s, int max_new_tokens) {
     if (!s) return;
     s->sc.max_new_tokens = max_new_tokens > 0 ? max_new_tokens : 16;
@@ -267,9 +268,43 @@ int rapidllm_generate(RapidSession* s, const int32_t* ids, int n, const RapidSam
         cfg.greedy = !sp || sp->greedy || sp->temperature <= 0.f;
         cfg.enable_thinking = s->sc.enable_thinking != 0;
         cfg.ctx = s->eng->ctx;
-        cfg.spec = static_cast<SpecKind>(s->sc.spec);
+        cfg.spec = spec_kind(s->sc.spec);
         cfg.spec_n = s->sc.spec_n > 0 ? s->sc.spec_n : 3;
         const int got = s->sess->generate(ids, n, out, cap, cfg);
+        if (err) err->code = RAPID_OK;
+        return got;
+    } catch (const std::exception& e) {
+        set_err(err, RAPID_ERR_INTERNAL, e.what());
+        return -1;
+    }
+}
+
+int rapidllm_generate_batch_var(RapidSession* s, const int32_t* ids, const int* lens, int n_seq,
+                                const RapidSampleParams* sp, int32_t* out, int cap_each, int* out_n,
+                                RapidError* err) {
+    try {
+        if (!s || !s->sess || !ids || !lens || n_seq <= 0) {
+            set_err(err, RAPID_ERR_RANGE, "batch_var generate args");
+            return -1;
+        }
+        GenerateConfig cfg;
+        cfg.max_new_tokens = s->sc.max_new_tokens > 0 ? s->sc.max_new_tokens : 16;
+        cfg.greedy = !sp || sp->greedy || sp->temperature <= 0.f;
+        cfg.enable_thinking = s->sc.enable_thinking != 0;
+        cfg.ctx = s->eng->ctx;
+        cfg.spec = SpecKind::Off;
+        cfg.spec_n = 0;
+        std::vector<const int32_t*> ptrs(static_cast<size_t>(n_seq));
+        int off = 0;
+        for (int i = 0; i < n_seq; ++i) {
+            if (lens[i] <= 0) {
+                set_err(err, RAPID_ERR_RANGE, "batch_var lens");
+                return -1;
+            }
+            ptrs[static_cast<size_t>(i)] = ids + off;
+            off += lens[i];
+        }
+        const int got = s->sess->generate_batch(ptrs.data(), lens, n_seq, out, out_n, cap_each, cfg);
         if (err) err->code = RAPID_OK;
         return got;
     } catch (const std::exception& e) {
@@ -319,5 +354,30 @@ void rapidllm_bench_stats(RapidSession* s, double* prefill_s, double* decode_s, 
 }
 
 int rapidllm_uses_cuda(const RapidSession* s) { return s && s->sess && s->sess->uses_cuda() ? 1 : 0; }
+int rapidllm_uses_vulkan(const RapidSession* s) {
+    return s && s->eng && s->eng->use_vulkan ? 1 : 0;
+}
+const char* rapidllm_device_name(const RapidSession* s) {
+    if (s && s->sess && s->sess->uses_cuda()) return "cuda";
+    if (s && s->eng && s->eng->use_vulkan) return "vulkan";
+    return "cpu";
+}
+
+int rapidllm_has_mtp(const RapidSession* s) { return s && s->sess && s->sess->has_mtp() ? 1 : 0; }
+
+int rapidllm_mtp_draft(RapidSession* s, int32_t first, int n, int32_t* out, RapidError* err) {
+    try {
+        if (!s || !s->sess || !out || n <= 0) {
+            set_err(err, RAPID_ERR_RANGE, "mtp_draft args");
+            return -1;
+        }
+        const int got = s->sess->mtp_draft(first, n, out);
+        if (err) err->code = RAPID_OK;
+        return got;
+    } catch (const std::exception& e) {
+        set_err(err, RAPID_ERR_INTERNAL, e.what());
+        return -1;
+    }
+}
 
 } // extern "C"

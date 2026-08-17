@@ -37,6 +37,17 @@ int main() {
         if (t.src_name.find("visual") != std::string::npos) saw_visual = true;
     }
     CHECK(!saw_visual);
+    CHECK(map_gguf_name("blk.64.nextn.eh_proj.weight") == "mtp.fc");
+    CHECK(map_gguf_name("blk.64.nextn.enorm.weight") == "mtp.pre_fc_norm_embedding");
+    CHECK(map_gguf_name("blk.64.nextn.hnorm.weight") == "mtp.pre_fc_norm_hidden");
+    CHECK(map_gguf_name("blk.64.nextn.shared_head_norm.weight") == "mtp.norm");
+    CHECK(map_gguf_name("blk.64.nextn.attn_q.weight") == "mtp.layers[0].attn.wq");
+    CHECK(map_gguf_name("nextn.fc.weight") == "mtp.fc");
+    CHECK(map_gguf_name("blk.0.attn_q.weight") == "layers[0].attn.wq");
+    CHECK(map_gguf_name("blk.0.ssm_a") == "layers[0].delta.leftover.a_log");
+    CHECK(map_gguf_name("blk.0.ssm_a_log") == "layers[0].delta.leftover.a_log");
+    CHECK(map_gguf_name("blk.0.ssm_a.weight") == "layers[0].delta.leftover.in_proj_a");
+    CHECK(map_gguf_name("blk.0.ssm_alpha.weight") == "layers[0].delta.leftover.in_proj_a");
     CHECK(map_hf_name("model.visual.patch_embed.proj.weight") == "visual.patch_embed");
     CHECK(map_hf_name("model.visual.blocks.0.attn.qkv.weight") == "visual.blocks[0].attn.qkv");
     CHECK(map_hf_name("model.visual.merger.linear_fc2.bias") == "visual.merger.fc2_bias");

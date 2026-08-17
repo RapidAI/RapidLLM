@@ -26,6 +26,7 @@ set(RAPIDLLM_SOURCES
   src/frontend/gguf_loader.cpp
   src/frontend/weight_store.cpp
   src/backend/cpu/cpu_device.cpp
+  src/backend/vulkan/vulkan_device.cpp
   src/runtime/thread_pool.cpp
   src/runtime/dual_cache.cpp
   src/runtime/planner.cpp
@@ -33,7 +34,6 @@ set(RAPIDLLM_SOURCES
   src/runtime/sampler.cpp
   src/runtime/session.cpp
   src/runtime/ngram_draft.cpp
-  src/runtime/image_io.cpp
   src/kernels/ops.cpp
   src/kernels/cpu_caps.cpp
   src/kernels/ops_simd_avx2.cpp
@@ -45,9 +45,15 @@ set(RAPIDLLM_SOURCES
   src/api/rapidllm_c.cpp
   src/server/http_serve.cpp
 )
+if(EXISTS "${CMAKE_SOURCE_DIR}/src/runtime/image_io.cpp")
+  list(APPEND RAPIDLLM_SOURCES src/runtime/image_io.cpp)
+endif()
 
 add_library(rapidllm_core STATIC ${RAPIDLLM_SOURCES})
 target_link_libraries(rapidllm_core PUBLIC Threads::Threads)
+if(NOT WIN32)
+  target_link_libraries(rapidllm_core PUBLIC ${CMAKE_DL_LIBS})
+endif()
 target_include_directories(rapidllm_core PUBLIC
   ${CMAKE_SOURCE_DIR}/include
   ${CMAKE_SOURCE_DIR}/src
@@ -66,9 +72,36 @@ if(RAPIDLLM_WITH_CUDA)
   enable_language(CUDA)
   target_sources(rapidllm_core PRIVATE
     src/kernels/cuda/gemv_dp4a.cu
+    src/kernels/cuda/gemv_q6_t2.cu
+    src/kernels/cuda/gemv_q6_t2_1row.cu
+    src/kernels/cuda/gemv_q6_t2_hbm.cu
+    src/kernels/cuda/gemv_q4_t2_dual_hbm.cu
+    src/kernels/cuda/gemv_q6_t4.cu
+    src/kernels/cuda/gemv_q6_t12.cu
+    src/kernels/cuda/gemv_q6_t12_1row.cu
+    src/kernels/cuda/gemv_q4_t12_dual.cu
+    src/kernels/cuda/gdn_t12.cu
     src/kernels/cuda/cuda_engine.cu
   )
   target_compile_definitions(rapidllm_core PUBLIC RAPIDLLM_WITH_CUDA=1)
+  set(_fi_home "$ENV{FLASHINFER_HOME}")
+  if(NOT _fi_home)
+    set(_fi_home "/home/znsoft/vllm-env/lib/python3.12/site-packages/flashinfer/data")
+  endif()
+  if(EXISTS "${_fi_home}/include/flashinfer/attention/prefill.cuh")
+    target_sources(rapidllm_core PRIVATE src/kernels/cuda/flashinfer_attn.cu)
+    target_include_directories(rapidllm_core PRIVATE "${_fi_home}/include")
+    if(EXISTS "${_fi_home}/cutlass/include")
+      target_include_directories(rapidllm_core PRIVATE "${_fi_home}/cutlass/include")
+    endif()
+    if(EXISTS "${_fi_home}/cccl/libcudacxx/include")
+      target_include_directories(rapidllm_core PRIVATE "${_fi_home}/cccl/libcudacxx/include")
+    endif()
+    target_compile_definitions(rapidllm_core PRIVATE RAPIDLLM_FLASHINFER=1)
+    set_source_files_properties(src/kernels/cuda/flashinfer_attn.cu PROPERTIES
+      CUDA_ARCHITECTURES "89")
+    message(STATUS "FlashInfer prefill: ${_fi_home}")
+  endif()
   set_target_properties(rapidllm_core PROPERTIES CUDA_ARCHITECTURES "75;86;89")
   # Legacy default stream (stream 0) cannot be captured; per-thread stream can.
   target_compile_options(rapidllm_core PRIVATE
@@ -128,7 +161,10 @@ rapidllm_test(test_cuda_decode tests/test_cuda_decode.cpp)
 rapidllm_test(test_batch tests/test_batch.cpp)
 rapidllm_test(test_protocol tests/test_protocol.cpp)
 rapidllm_test(test_ngram_draft tests/test_ngram_draft.cpp)
-rapidllm_test(test_vision tests/test_vision.cpp)
+rapidllm_test(test_vulkan tests/test_vulkan.cpp)
+if(EXISTS "${CMAKE_SOURCE_DIR}/tests/test_vision.cpp")
+  rapidllm_test(test_vision tests/test_vision.cpp)
+endif()
 
 enable_testing()
 add_test(NAME ir COMMAND test_ir)

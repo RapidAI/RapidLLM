@@ -2,6 +2,7 @@
 
 #include "rapidllm/api.h"
 
+#include <cstddef>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -46,8 +47,15 @@ std::string render_anthropic(const std::string& id, const std::string& model, co
                              int new_n);
 std::string render_models(const std::string& model);
 std::string render_error(int status, std::string_view type, std::string_view message);
+std::string sse_data(std::string_view payload, std::string_view event = {});
+
+// Optional live SSE writer. Return false to abort. When null, frames are collected in the response body.
+using SseEmit = bool (*)(void* ctx, const char* data, size_t n);
 
 HttpResponse handle_http(const HttpRequest& req, RapidLLM* eng, RapidSession* sess, const std::string& model_id);
+
+HttpResponse handle_http(const HttpRequest& req, RapidLLM* eng, RapidSession* sess, const std::string& model_id,
+                         SseEmit emit, void* emit_ctx);
 
 int serve_listen(const char* host, int port, RapidLLM* eng, RapidSession* sess, const std::string& model_id);
 

@@ -1,4 +1,5 @@
 #include "rapidllm/backend/device.h"
+#include "rapidllm/backend/vulkan_device.h"
 
 #include <algorithm>
 #include <cstring>
@@ -37,8 +38,7 @@ public:
 
 std::unique_ptr<Device> create_device(DeviceKind k) {
     if (k == DeviceKind::CPU) return std::make_unique<CpuDevice>();
-    if (k == DeviceKind::Vulkan)
-        throw std::runtime_error("Vulkan device requires -DRAPIDLLM_WITH_VULKAN=ON and a Vulkan 1.2 GPU");
+    if (k == DeviceKind::Vulkan) return create_vulkan_device();
     if (k == DeviceKind::CUDA)
         throw std::runtime_error("CUDA uses --device cuda (cuda_gen engine), not DeviceKind::CUDA here");
     throw std::runtime_error("unknown device");
