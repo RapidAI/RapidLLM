@@ -77,6 +77,38 @@ if(RAPIDLLM_WITH_CUDA)
     src/kernels/cuda/gemv_q6_t2_hbm.cu
     src/kernels/cuda/gemv_q4_t2_dual_hbm.cu
     src/kernels/cuda/gemv_q6_t4.cu
+    src/kernels/cuda/gemv_t4_1row.cu
+    src/kernels/cuda/gemv_t4_pipe.cu
+    src/kernels/cuda/gemv_t4_q6_ku.cu
+    src/kernels/cuda/gemv_t4_q6_t12tile.cu
+    src/kernels/cuda/gemv_t4_q6_xs.cu
+    src/kernels/cuda/gemv_t4_occ.cu
+    src/kernels/cuda/gemv_t4_q6_pipe.cu
+    src/kernels/cuda/gemv_t4_q8.cu
+    src/kernels/cuda/gemv_t4_q6_2row.cu
+    src/kernels/cuda/gemv_t4_q4_2row.cu
+    src/kernels/cuda/gemv_t4_q4_sx.cu
+    src/kernels/cuda/gemv_t4_q4_p3.cu
+    src/kernels/cuda/gemv_t4_u2.cu
+    src/kernels/cuda/gemv_t4_q4_r8.cu
+    src/kernels/cuda/gemv_t4_q6_q8.cu
+    src/kernels/cuda/gemv_t4_q4_x2.cu
+    src/kernels/cuda/gemv_t4_q6_ho.cu
+    src/kernels/cuda/gemv_t4_q6q4.cu
+    src/kernels/cuda/gemv_t4_q4_tc.cu
+    src/kernels/cuda/gemv_t4_q6_i8.cu
+    src/kernels/cuda/gemv_t4_q4_p2.cu
+    src/kernels/cuda/gemv_t4_q4_xs.cu
+    src/kernels/cuda/gemv_t4_ur2.cu
+    src/kernels/cuda/gemv_t4_q4_mmq.cu
+    src/kernels/cuda/gemv_t4_q6_gm.cu
+    src/kernels/cuda/gemv_t4_sk.cu
+    src/kernels/cuda/gemv_t4_q6_ilp.cu
+    src/kernels/cuda/gemv_q6_t1_2row.cu
+    src/kernels/cuda/gemv_q4_t2_dual_1row.cu
+    src/kernels/cuda/gemv_q6_t2_2row.cu
+    src/kernels/cuda/gemv_q6_t2_splitk.cu
+    src/kernels/cuda/mtp_attn_decode.cu
     src/kernels/cuda/gemv_q6_t12.cu
     src/kernels/cuda/gemv_q6_t12_1row.cu
     src/kernels/cuda/gemv_q4_t12_dual.cu

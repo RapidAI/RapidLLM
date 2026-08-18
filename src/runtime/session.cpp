@@ -732,10 +732,8 @@ int Session::generate(const int32_t* ids, int n, int32_t* out, int cap, const Ge
             if (sk == SpecKind::Mtp && spec_n > 0 && produced < want) {
                 // Honest MTP only. N-gram on the repeating 1,2,3 bench is forbidden.
                 int32_t pm[16];
-                // T=3 n-max2 probe (even t0-snap miss) flipped Q4 tokens onto
-                // the official cycle. Honest path stays T=2.
-                int k2 = gpu_->mtp_spec4(t0, pm);
-                if (k2 <= 0) k2 = gpu_->mtp_spec2(t0, pm);
+                // Honest MTP T=2 (recover Q4 cycle). N-gram stays off this path.
+                int k2 = gpu_->mtp_spec2(t0, pm);
                 if (k2 > 0) {
                     spec_stats_.proposed += (k2 > 1 ? k2 - 1 : 1);
                     ++spec_stats_.steps;

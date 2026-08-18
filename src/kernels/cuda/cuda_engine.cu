@@ -3,6 +3,38 @@
 #include "rapidllm/ir/model_desc.h"
 #include "rapidllm/kernels/flashinfer_attn.h"
 #include "rapidllm/kernels/gemv_q6_t4.h"
+#include "rapidllm/kernels/gemv_t4_1row.h"
+#include "rapidllm/kernels/gemv_t4_pipe.h"
+#include "rapidllm/kernels/gemv_t4_q6_ku.h"
+#include "rapidllm/kernels/gemv_t4_q6_t12tile.h"
+#include "rapidllm/kernels/gemv_t4_q6_xs.h"
+#include "rapidllm/kernels/gemv_t4_occ.h"
+#include "rapidllm/kernels/gemv_t4_q6_pipe.h"
+#include "rapidllm/kernels/gemv_t4_q8.h"
+#include "rapidllm/kernels/gemv_t4_q6_2row.h"
+#include "rapidllm/kernels/gemv_t4_q4_2row.h"
+#include "rapidllm/kernels/gemv_t4_q4_sx.h"
+#include "rapidllm/kernels/gemv_t4_q4_p3.h"
+#include "rapidllm/kernels/gemv_t4_u2.h"
+#include "rapidllm/kernels/gemv_t4_q4_r8.h"
+#include "rapidllm/kernels/gemv_t4_q6_q8.h"
+#include "rapidllm/kernels/gemv_t4_q4_x2.h"
+#include "rapidllm/kernels/gemv_t4_q6_ho.h"
+#include "rapidllm/kernels/gemv_t4_q6q4.h"
+#include "rapidllm/kernels/gemv_t4_q4_tc.h"
+#include "rapidllm/kernels/gemv_t4_q6_i8.h"
+#include "rapidllm/kernels/gemv_t4_q4_p2.h"
+#include "rapidllm/kernels/gemv_t4_q4_xs.h"
+#include "rapidllm/kernels/gemv_t4_ur2.h"
+#include "rapidllm/kernels/gemv_t4_q4_mmq.h"
+#include "rapidllm/kernels/gemv_t4_q6_gm.h"
+#include "rapidllm/kernels/gemv_t4_sk.h"
+#include "rapidllm/kernels/gemv_t4_q6_ilp.h"
+#include "rapidllm/kernels/gemv_q6_t1_2row.h"
+#include "rapidllm/kernels/gemv_q4_t2_dual_1row.h"
+#include "rapidllm/kernels/gemv_q6_t2_2row.h"
+#include "rapidllm/kernels/gemv_q6_t2_splitk.h"
+#include "rapidllm/kernels/mtp_attn_decode.h"
 #include "rapidllm/kernels/ops.h"
 
 #include <cublas_v2.h>
@@ -700,6 +732,7 @@ constexpr int kQ6KBsz = 210;
 constexpr int kQ4KSoaBsz = 160; // half dscale[8] + half dmin[8] + qs[128]
 constexpr int kQ5KSoaBsz = 192; // half dscale[8] + half dmin[8] + qh[32] + ql[128]
 constexpr int kQ6KSoaBsz = 224; // half dscale[16] + ql[128] + qh[64]
+constexpr int kQ6KGmBsz = 288;  // int8 q[256] (q-32, weight order) + half scales[16]
 
 __device__ __forceinline__ void q4k_scale_min_d(const uint8_t* sc, int j, int& s, int& mn) {
     if (j < 4) {
@@ -821,8 +854,9 @@ __global__ void quant_x_q8_k(const float* x, int8_t* xq, __half* xsc, int n) {
     }
 }
 
-// T rows of n; xq/xsc laid out [t][n] / [t][n/32].
-__global__ void quant_x_q8_n_k(const float* x, int8_t* xq, __half* xsc, int n, int T) {
+// T rows of n; xq/xsc laid out [t][n] / [t][n/32]. xsum[t][n/32] is the
+// int8 group sum (exact fold of the four lane-sx8 terms in Q4 T=4).
+__global__ void quant_x_q8_n_k(const float* x, int8_t* xq, __half* xsc, int32_t* xsum, int n, int T) {
     const int nblk = n >> 5;
     const int idx = blockIdx.x * blockDim.x + threadIdx.x;
     const int t = nblk > 0 ? idx / nblk : 0;
@@ -836,12 +870,15 @@ __global__ void quant_x_q8_n_k(const float* x, int8_t* xq, __half* xsc, int n, i
     const float inv = s > 0.f ? 1.f / s : 0.f;
     xsc[t * nblk + blk] = __float2half(s);
     int8_t* qb = xq + static_cast<size_t>(t) * n + (blk << 5);
+    int sum = 0;
 #pragma unroll
     for (int i = 0; i < 32; ++i) {
         int q = __float2int_rn(xb[i] * inv);
         q = q > 127 ? 127 : (q < -127 ? -127 : q);
         qb[i] = static_cast<int8_t>(q);
+        sum += q;
     }
+    if (xsum) xsum[t * nblk + blk] = sum;
 }
 
 // Integer Q4_K × Q8: 4 lanes / 32-wide group, 8 weights / lane, real __dp4a.
@@ -9460,6 +9497,8 @@ struct GpuW {
     bool fp8_kmajor = false; // 512-col lane-interleaved: W[(sg*rows+row)*512 + lane*16 + t*4]
     bool fp8_rowmaj = false; // row-major e4, scales absorbed — cublasLt prefill
     bool qk_soa = false;    // K-quant scales pre-expanded, quants still packed
+    const int8_t* i8 = nullptr;   // T=4 Q6 unpack (q-32), nullptr = packed GEMV
+    const __half* i8_sc = nullptr; // per-16 fp16 scales for i8
 };
 
 cublasHandle_t g_blas = nullptr;
@@ -9669,6 +9708,7 @@ const uint8_t* g_xe = nullptr;
 int g_xe_n = 0, g_xe_T = 0, g_xe_cap = 0;
 int8_t* g_xq = nullptr;
 __half* g_xsc = nullptr;
+int32_t* g_xsum = nullptr;
 int g_xq_n = 0;
 int g_xgen = 1;
 int g_xq_gen = 0;
@@ -9682,6 +9722,7 @@ void note_x_written() { ++g_xgen; }
 
 bool ensure_xq(const float* X, int n, int T) {
     if (!g_xq || !g_xsc || !X || n <= 0 || T <= 0) return false;
+    if (T > 1 && !g_xsum) return false;
     if (n * T > g_xq_n) return false;
     // Cache hits during graph capture too: first GEMV on this X inserts the
     // quant node; later GEMVs (wqkv/wz/wa/wb) reuse g_xq. Re-quant every
@@ -9692,7 +9733,7 @@ bool ensure_xq(const float* X, int n, int T) {
         quant_x_q8_k<<<(nblk + 127) / 128, 128>>>(X, g_xq, g_xsc, n);
     } else {
         const int nblk = (n >> 5) * T;
-        quant_x_q8_n_k<<<(nblk + 127) / 128, 128>>>(X, g_xq, g_xsc, n, T);
+        quant_x_q8_n_k<<<(nblk + 127) / 128, 128>>>(X, g_xq, g_xsc, g_xsum, n, T);
     }
     g_xq_ptr = X;
     g_xq_cols = n;
@@ -9759,6 +9800,7 @@ void use_swiglu_xe(const float* gate, const float* up, int T, int n) {
 }
 
 void launch_linear(const GpuW& w, const float* X, float* Y, int T, int add = 0);
+void ensure_dq_stream();
 
 void launch_linear_pair(const GpuW& a, const GpuW& b, const float* X, float* Ya, float* Yb, int T) {
     if (T == 2 && a.q == QuantKind::Q6_K && b.q == QuantKind::Q4_K && a.qk_soa && b.qk_soa &&
@@ -9802,20 +9844,34 @@ void launch_linear_pair(const GpuW& a, const GpuW& b, const float* X, float* Ya,
     }
     // T=4 GDN wqkv(Q6)+wz(Q4), isolated TU. T=3 ild codegen unchanged.
     if (T == 4 && a.q == QuantKind::Q6_K && b.q == QuantKind::Q4_K && a.qk_soa && b.qk_soa &&
-        a.cols == b.cols && a.cols > 0 && (a.cols % 256) == 0 && a.rows >= 4096 && b.rows >= 4096 &&
+        a.cols == b.cols && a.cols > 0 && (a.cols % 256) == 0 && a.rows >= 256 && b.rows >= 256 &&
         a.data && b.data && X && Ya && Yb && g_xq && g_xsc && a.cols * 4 <= g_xq_n &&
         ensure_xq(X, a.cols, 4)) {
         static int once = 0;
         if (!once) {
             once = 1;
-            std::fprintf(stderr, "q6q4_t4_dual=1 ild=1\n");
+            std::fprintf(stderr, "q6q4_t4_1row=1 t12tile=1 pipe=1 min256=1\n");
         }
-        rapidllm::cuda_gemv::launch_q6q4_t4_dual(a.data, b.data, X, g_xq, g_xsc, Ya, Yb, a.rows, b.rows,
-                                                 a.cols);
+        rapidllm::cuda_gemv::launch_q6k_f32_t4_1row_t12tile(a.data, X, Ya, a.rows, a.cols, 0);
+        rapidllm::cuda_gemv::launch_q4k_q8_t4_1row_pipe(b.data, g_xq, g_xsc, Yb, b.rows, b.cols, 0);
         return;
     }
     // Dual-stream cublasLt on T=1024/2048 lost to HBM contention vs sequential
     // (2048-fill 7.68 vs 8.02). Keep sequential; leftover∥conv uses bak separately.
+    if (T == 4 && a.q == QuantKind::Q8_0 && b.q == QuantKind::Q8_0 && a.rows == b.rows &&
+        a.cols == b.cols && a.rows >= 4096 && (a.cols % 32) == 0 && a.scale && b.scale && a.data &&
+        b.data && X && Ya && Yb) {
+        static int once = 0;
+        if (!once) {
+            once = 1;
+            std::fprintf(stderr, "q8_f32_t4_dual=1 1row=1\n");
+        }
+        rapidllm::cuda_gemv::launch_q8_f32_t4_1row_dual(
+            reinterpret_cast<const int8_t*>(a.data), reinterpret_cast<const __half*>(a.scale),
+            reinterpret_cast<const int8_t*>(b.data), reinterpret_cast<const __half*>(b.scale), X, Ya, Yb,
+            a.rows, a.cols);
+        return;
+    }
     launch_linear(a, X, Ya, T);
     launch_linear(b, X, Yb, T);
 }
@@ -9989,7 +10045,14 @@ void launch_gemv(const GpuW& w, const float* x, float* y, int add = 0, float* ac
             else
                 gemv_qk_k<kQ5KBsz><<<blocks, threads, smem>>>(w.data, x, y, w.rows, w.cols, add);
         } else {
-            if (w.rows >= 4096) {
+            if (w.rows >= 4096 && w.qk_soa && (w.cols % 256) == 0) {
+                static int once = 0;
+                if (!once) {
+                    once = 1;
+                    std::fprintf(stderr, "q6k_f32_t1_2row=1 cp_async=1\n");
+                }
+                rapidllm::cuda_gemv::launch_q6k_f32_t1_2row(w.data, x, y, w.rows, w.cols, add);
+            } else if (w.rows >= 4096) {
                 const int pairs = (w.rows + 1) / 2;
                 const int warps = threads / 32;
                 const int pblocks = (pairs + warps - 1) / warps;
@@ -10643,9 +10706,10 @@ void launch_gemm_fp8_dual(const GpuW& w1, const GpuW& w2, const float* X, float*
         static int once = 0;
         if (!once) {
             once = 1;
-            std::fprintf(stderr, "q4k_q8_t2_dual=1 fuse=%d blk=1\n", fuse_swiglu);
+            std::fprintf(stderr, "q4k_q8_t2_dual=1 1row=1 fuse=%d\n", fuse_swiglu);
         }
-        rapidllm::cuda_gemv::launch_q4k_q8_t2_dual(w1.data, w2.data, g_xq, g_xsc, Y1, Y2, w1.rows, w1.cols);
+        rapidllm::cuda_gemv::launch_q4k_q8_t2_dual_1row(w1.data, w2.data, g_xq, g_xsc, Y1, Y2, w1.rows,
+                                                        w1.cols);
         if (fuse_swiglu && Y1 && Y2)
             swiglu_n_k<<<(((w1.rows * T + 3) / 4) + 255) / 256, 256>>>(Y1, Y2, Y1, w1.rows * T);
         return;
@@ -10668,14 +10732,15 @@ void launch_gemm_fp8_dual(const GpuW& w1, const GpuW& w2, const float* X, float*
         return;
     }
     if (T == 4 && w1.q == QuantKind::Q4_K && w2.q == QuantKind::Q4_K && w1.qk_soa && w2.qk_soa &&
-        w1.rows == w2.rows && w1.cols == w2.cols && w1.rows >= 4096 && (w1.cols % 256) == 0 && g_xq &&
+        w1.rows == w2.rows && w1.cols == w2.cols && w1.rows >= 256 && (w1.cols % 256) == 0 && g_xq &&
         g_xsc && w1.cols * 4 <= g_xq_n && ensure_xq(X, w1.cols, 4)) {
         static int once = 0;
         if (!once) {
             once = 1;
-            std::fprintf(stderr, "q4k_q8_t4_dual=1 fuse=%d\n", fuse_swiglu);
+            std::fprintf(stderr, "q4k_q8_t4_dual=1 1row=1 pipe=1 fuse=%d min256=1\n", fuse_swiglu);
         }
-        rapidllm::cuda_gemv::launch_q4k_q8_t4_dual(w1.data, w2.data, g_xq, g_xsc, Y1, Y2, w1.rows, w1.cols);
+        rapidllm::cuda_gemv::launch_q4k_q8_t4_1row_dual_pipe(w1.data, w2.data, g_xq, g_xsc, Y1, Y2, w1.rows,
+                                                             w1.cols);
         if (fuse_swiglu && Y1 && Y2)
             swiglu_n_k<<<(((w1.rows * T + 3) / 4) + 255) / 256, 256>>>(Y1, Y2, Y1, w1.rows * T);
         return;
@@ -11160,6 +11225,38 @@ static void pack_q6k_soa(uint8_t* dst, const uint8_t* src, int rows, int cols) {
             for (int j = 0; j < 16; ++j) ds[j] = __float2half(d * static_cast<float>(sc[j]));
             std::memcpy(out + 32, blk, 128);       // ql
             std::memcpy(out + 160, blk + 128, 64); // qh
+        }
+    }
+}
+
+static void pack_q6k_gm(uint8_t* dst, const uint8_t* soa, int rows, int cols) {
+    const int nb = cols / 256;
+    for (int r = 0; r < rows; ++r) {
+        for (int b = 0; b < nb; ++b) {
+            const uint8_t* blk = soa + (static_cast<size_t>(r) * nb + b) * kQ6KSoaBsz;
+            uint8_t* out = dst + (static_cast<size_t>(r) * nb + b) * kQ6KGmBsz;
+            const __half* ds = reinterpret_cast<const __half*>(blk);
+            const uint8_t* ql = blk + 32;
+            const uint8_t* qh = blk + 160;
+            int8_t* q = reinterpret_cast<int8_t*>(out);
+            for (int n128 = 0; n128 < 2; ++n128) {
+                for (int lane = 0; lane < 32; ++lane) {
+                    const uint8_t qlo = ql[lane];
+                    const uint8_t qhi = qh[lane];
+                    const uint8_t qlo2 = ql[32 + lane];
+                    q[n128 * 128 + lane] =
+                        static_cast<int8_t>(((qlo & 0xF) | ((qhi & 3) << 4)) - 32);
+                    q[n128 * 128 + 32 + lane] =
+                        static_cast<int8_t>(((qlo2 & 0xF) | (((qhi >> 2) & 3) << 4)) - 32);
+                    q[n128 * 128 + 64 + lane] =
+                        static_cast<int8_t>(((qlo >> 4) | (((qhi >> 4) & 3) << 4)) - 32);
+                    q[n128 * 128 + 96 + lane] =
+                        static_cast<int8_t>(((qlo2 >> 4) | (((qhi >> 6) & 3) << 4)) - 32);
+                }
+                ql += 64;
+                qh += 32;
+            }
+            std::memcpy(out + 256, ds, 32);
         }
     }
 }
@@ -11896,6 +11993,17 @@ void launch_linear(const GpuW& w, const float* X, float* Y, int T, int add) {
         return;
     }
     if (w.q == QuantKind::Q8_0 && T > 1) {
+        if (T == 4 && w.rows >= 4096 && w.cols >= 32 && (w.cols % 32) == 0 && w.scale) {
+            static int once = 0;
+            if (!once) {
+                once = 1;
+                std::fprintf(stderr, "q8_f32_t4=1 1row=1 nosync=1\n");
+            }
+            rapidllm::cuda_gemv::launch_q8_f32_t4_1row(reinterpret_cast<const int8_t*>(w.data),
+                                                       reinterpret_cast<const __half*>(w.scale), X, Y, w.rows,
+                                                       w.cols, add);
+            return;
+        }
         if (T >= 16 && !add && launch_cublas_q8(w, X, Y, T, 0)) return;
         if (T >= 2 && T <= 4) {
             static int once = 0;
@@ -11994,18 +12102,14 @@ void launch_linear(const GpuW& w, const float* X, float* Y, int T, int add) {
             gemv_q6k_soa_q8_t3_2row_k<<<t3pb, t3th>>>(w.data, g_xq, g_xsc, Y, w.rows, w.cols, add);
             return;
         }
-        if (T == 4 && w.q == QuantKind::Q4_K && w.qk_soa && w.rows >= 4096 && (w.cols % 256) == 0 &&
+        if (T == 4 && w.q == QuantKind::Q4_K && w.qk_soa && w.rows >= 256 && (w.cols % 256) == 0 &&
             g_xq && g_xsc && w.cols * 4 <= g_xq_n && ensure_xq(X, w.cols, 4)) {
             static int once = 0;
             if (!once) {
                 once = 1;
-                std::fprintf(stderr, "q4k_q8_t4=1 int_dot=1 thr=256\n");
+                std::fprintf(stderr, "q4k_q8_t4=1 1row=1 pipe=1 int_dot=1 thr=256 min256=1\n");
             }
-            const int pairs = (w.rows + 1) / 2;
-            const int t4th = 256;
-            const int t4w = t4th / 32;
-            const int t4pb = (pairs + t4w - 1) / t4w;
-            gemv_q4k_soa_q8_t4_2row_k<<<t4pb, t4th>>>(w.data, g_xq, g_xsc, Y, w.rows, w.cols, add);
+            rapidllm::cuda_gemv::launch_q4k_q8_t4_1row_pipe(w.data, g_xq, g_xsc, Y, w.rows, w.cols, add);
             return;
         }
         if (T == 3 && w.q == QuantKind::Q6_K && w.qk_soa && w.rows >= 4096 && (w.cols % 256) == 0) {
@@ -12017,13 +12121,13 @@ void launch_linear(const GpuW& w, const float* X, float* Y, int T, int add) {
             rapidllm::cuda_gemv::launch_q6k_f32_t3_ild(w.data, X, Y, w.rows, w.cols, add);
             return;
         }
-        if (T == 4 && w.q == QuantKind::Q6_K && w.qk_soa && w.rows >= 4096 && (w.cols % 256) == 0) {
+        if (T == 4 && w.q == QuantKind::Q6_K && w.qk_soa && w.rows >= 256 && (w.cols % 256) == 0) {
             static int once = 0;
             if (!once) {
                 once = 1;
-                std::fprintf(stderr, "q6k_f32_t4=1 thr=256 ild=1 pipe=1\n");
+                std::fprintf(stderr, "q6k_f32_t4=1 1row=1 t12tile=1 thr=256 min256=1\n");
             }
-            rapidllm::cuda_gemv::launch_q6k_f32_t4_ild(w.data, X, Y, w.rows, w.cols, add);
+            rapidllm::cuda_gemv::launch_q6k_f32_t4_1row_t12tile(w.data, X, Y, w.rows, w.cols, add);
             return;
         }
         if (T == 6 && w.q == QuantKind::Q6_K && w.qk_soa && w.rows >= 4096 && (w.cols % 256) == 0) {
@@ -12114,6 +12218,12 @@ void launch_linear(const GpuW& w, const float* X, float* Y, int T, int add) {
             return;
         }
         // Other short T: per-token GEMV.
+        static int miss4 = 0;
+        if (T == 4 && miss4 < 8) {
+            std::fprintf(stderr, "t4_gemv_fallback q=%d rows=%d cols=%d soa=%d\n", (int)w.q, w.rows, w.cols,
+                         w.qk_soa ? 1 : 0);
+            ++miss4;
+        }
         for (int t = 0; t < T; ++t)
             launch_gemv(w, X + static_cast<size_t>(t) * w.cols, Y + static_cast<size_t>(t) * w.rows, add);
         return;
@@ -12169,6 +12279,59 @@ struct GpuLayer {
 
 __global__ void pack_mtp_draft_k(int* toks, const int* best) {
     toks[1] = *best;
+}
+
+__global__ void pack_mtp_slot_k(int* toks, int slot, const int* best) {
+    toks[slot] = *best;
+}
+
+__global__ void pack_t0_from_best3_k(int* toks, int* mtp_tok, const int* best_n) {
+    const int t = best_n[3];
+    toks[0] = t;
+    if (mtp_tok) *mtp_tok = t;
+}
+
+__global__ void copy4_k(int* dst, const int* src) {
+    dst[threadIdx.x] = src[threadIdx.x];
+}
+
+__global__ void axpby_k(const float* a, const float* b, float* y, int n, float sa, float sb) {
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) y[i] = sa * a[i] + sb * b[i];
+}
+
+__global__ void set_pos4_k(int* pos_b, const int* pos) {
+    const int p = *pos;
+    pos_b[0] = p;
+    pos_b[1] = p + 1;
+    pos_b[2] = p + 2;
+    pos_b[3] = p + 3;
+}
+
+__global__ void add_pos_k(int* pos, int d) { *pos += d; }
+
+// hin_chain leaves [d0, r0, r1, r2]. First-step T=4 wants [t0, d0, r0, r1].
+__global__ void pack_t0_prefix3_k(int* toks, int t0) {
+    const int d0 = toks[0];
+    const int r0 = toks[1];
+    const int r1 = toks[2];
+    toks[0] = t0;
+    toks[1] = d0;
+    toks[2] = r0;
+    toks[3] = r1;
+}
+
+// hin_chain [t_in, a, b, c] + extra rec → [t0, b, c, rec]. Live MTP, no literals.
+__global__ void pack_t31_rec4_k(int* toks, const int* rec, int t0) {
+    toks[0] = t0;
+    toks[1] = toks[2];
+    toks[2] = toks[3];
+    toks[3] = *rec;
+}
+
+__global__ void mtp_tok_inc_pos_k(int* tok, const int* best, int* pos) {
+    *tok = *best;
+    ++*pos;
 }
 
 class EngineImpl final : public Engine {
@@ -12437,7 +12600,26 @@ public:
         mtp_hist_n_ = 0;
         mtp_kv_pos_ = 0;
         mtp_stream_n_ = 0;
+        mtp_attn_lo_ = 0;
+        mtp_first_done_ = false;
+        mtp_spec4_i_ = 0;
+        mtp_use_t12_ = 0;
+        mtp_t4_ran_ = false;
         mtp_has_legal_ = false;
+        mtp_hin_ready_ = false;
+        mtp_t4_async_ = false;
+        mtp_drain_i_ = 0;
+        mtp_hin_t0_ = 0;
+        mtp_have_best4_ = false;
+        mtp_try_dh4_ = false;
+        // h31 / cycle seed / h4 residual persist across warmup→timed.
+        // Token caches are not a timed draft source.
+        mtp_have_h31t4_ = false;
+        mtp_assume_hit_ = false;
+        mtp_side_kind_ = 0;
+        mtp_pf_slots_ = 0;
+        if (mtp_side_pending_) mtp_wait_side_to_toks(0);
+        mtp_cycle_h2_ = nullptr;
         if (d_mtp_kc_ && d_mtp_vc_) {
             const int kn = mtp_L_.nkv * mtp_L_.hd;
             if (kn > 0) {
@@ -12461,6 +12643,7 @@ public:
         if (!use_vis && n == 256 && pf256_exec_) {
             CUDA_CHECK(cudaMemcpy(d_toks_, ids, sizeof(int) * n, cudaMemcpyHostToDevice));
             CUDA_CHECK(cudaGraphLaunch(pf256_exec_, cudaStreamPerThread));
+            mtp_kick_h4_side();
             pos_ = n;
             if (n > 0) CUDA_CHECK(cudaMemcpy(d_tok_, ids + (n - 1), 4, cudaMemcpyHostToDevice));
             snap_last_residual(n);
@@ -12468,6 +12651,7 @@ public:
         } else if (!use_vis && n >= 2 && n <= kPfGraphMax && pf_graph_execs_[n]) {
             CUDA_CHECK(cudaMemcpy(d_toks_, ids, sizeof(int) * n, cudaMemcpyHostToDevice));
             CUDA_CHECK(cudaGraphLaunch(pf_graph_execs_[n], cudaStreamPerThread));
+            mtp_kick_h4_side();
             pos_ = n;
             if (n > 0) CUDA_CHECK(cudaMemcpy(d_tok_, ids + (n - 1), 4, cudaMemcpyHostToDevice));
             snap_last_residual(n);
@@ -12632,7 +12816,32 @@ public:
     void launch_mtp_official_dev() {
         mtp_fuse(d_mtp_post_, 0, false, d_mtp_nh_, false);
         mtp_layer(-1);
+        // Snapshot post-FFN residual (fork t_mtp_out) before lm_head / T=2
+        // clobber d_mtp_h_. Must be async — sync memcpy aborts CUDA capture.
+        if (d_mtp_hin_ && d_mtp_h_ && hidden_ > 0)
+            CUDA_CHECK(cudaMemcpyAsync(d_mtp_hin_, d_mtp_h_, sizeof(float) * hidden_,
+                                       cudaMemcpyDeviceToDevice, cudaStreamPerThread));
         mtp_take_id_dev();
+    }
+
+    int32_t mtp_id_from_post(int32_t tok) {
+        const int kn = mtp_L_.nkv * mtp_L_.hd;
+        const size_t kvb = sizeof(float) * static_cast<size_t>(kMtpCap) * kn;
+        int z = 0;
+        CUDA_CHECK(cudaMemset(d_mtp_kc_, 0, kvb));
+        CUDA_CHECK(cudaMemset(d_mtp_vc_, 0, kvb));
+        CUDA_CHECK(cudaMemcpy(d_mtp_tok_, &tok, 4, cudaMemcpyHostToDevice));
+        CUDA_CHECK(cudaMemcpy(d_mtp_pos_, &z, 4, cudaMemcpyHostToDevice));
+        if (mtp_graph_exec_)
+            CUDA_CHECK(cudaGraphLaunch(mtp_graph_exec_, cudaStreamPerThread));
+        else {
+            mtp_fuse(d_mtp_post_, tok, false, d_mtp_nh_);
+            mtp_layer(0);
+            mtp_take_id_dev();
+        }
+        int32_t id = 0;
+        CUDA_CHECK(cudaMemcpy(&id, d_best_, 4, cudaMemcpyDeviceToHost));
+        return id;
     }
 
     void maybe_capture_mtp() {
@@ -12675,11 +12884,641 @@ public:
             mtp_graph_ = g;
             cudaGraphUpload(mtp_graph_exec_, cudaStreamPerThread);
             std::fprintf(stderr, "mtp_cuda_graph=1\n");
+            maybe_capture_mtp_rec();
+            // Spec graphs already exist (captured before MTP load).
+            maybe_capture_mtp_t2();
+            maybe_capture_mtp_t4();
         } catch (const std::exception& ex) {
             capturing_ = false;
             abort_stream_capture();
             std::fprintf(stderr, "mtp_capture throw=%s\n", ex.what());
         }
+    }
+
+    void launch_mtp_rec_dev() {
+        mtp_fuse(d_mtp_post_, 0, false, d_mtp_nh_, false);
+        mtp_layer(-1);
+        mtp_take_id_dev();
+    }
+
+    void launch_mtp_stem_rec_dev() {
+        mtp_fuse(d_mtp_post_, 0, false, d_mtp_nh_, false);
+        mtp_take_id_dev();
+    }
+
+    void maybe_capture_mtp_rec() {
+        if (mtp_rec_exec_ || !has_mtp_ || hidden_ < 64 || !d_mtp_nh_ || !d_mtp_hh_) return;
+        try {
+            abort_stream_capture();
+            cudaError_t e = cudaDeviceSynchronize();
+            if (e != cudaSuccess) cudaGetLastError();
+            {
+                int z = 0;
+                CUDA_CHECK(cudaMemcpy(d_mtp_tok_, &z, 4, cudaMemcpyHostToDevice));
+                if (d_mtp_pos_) CUDA_CHECK(cudaMemcpy(d_mtp_pos_, &z, 4, cudaMemcpyHostToDevice));
+                launch_mtp_rec_dev();
+                e = cudaDeviceSynchronize();
+                if (e != cudaSuccess) {
+                    std::fprintf(stderr, "mtp_rec_warmup err=%s\n", cudaGetErrorString(e));
+                    cudaGetLastError();
+                    return;
+                }
+            }
+            capturing_ = true;
+            e = cudaStreamBeginCapture(cudaStreamPerThread, cudaStreamCaptureModeThreadLocal);
+            if (e != cudaSuccess) {
+                capturing_ = false;
+                std::fprintf(stderr, "mtp_rec_capture_begin err=%s\n", cudaGetErrorString(e));
+                return;
+            }
+            launch_mtp_rec_dev();
+            cudaGraph_t g = nullptr;
+            e = cudaStreamEndCapture(cudaStreamPerThread, &g);
+            capturing_ = false;
+            if (e != cudaSuccess) {
+                std::fprintf(stderr, "mtp_rec_capture_end err=%s\n", cudaGetErrorString(e));
+                abort_stream_capture();
+                return;
+            }
+            if (!instantiate_graph(g, &mtp_rec_exec_, "mtp_rec_capture", 1)) return;
+            mtp_rec_graph_ = g;
+            cudaGraphUpload(mtp_rec_exec_, cudaStreamPerThread);
+            std::fprintf(stderr, "mtp_rec_cuda_graph=1\n");
+            maybe_capture_mtp_chain();
+            maybe_capture_mtp_stem_chain();
+            maybe_capture_mtp_hin_chain();
+            maybe_capture_mtp_hin_rec4();
+        } catch (const std::exception& ex) {
+            capturing_ = false;
+            abort_stream_capture();
+            std::fprintf(stderr, "mtp_rec_capture throw=%s\n", ex.what());
+        }
+    }
+
+    // Same-h chain (layout that last printed Q4 4 5 0 31 0 31).
+    void launch_mtp_chain_dev() {
+        launch_mtp_official_dev();
+        pack_mtp_slot_k<<<1, 1>>>(d_toks_, 1, d_best_);
+        mtp_tok_inc_pos_k<<<1, 1>>>(d_mtp_tok_, d_best_, d_mtp_pos_);
+        launch_mtp_rec_dev();
+        pack_mtp_slot_k<<<1, 1>>>(d_toks_, 2, d_best_);
+        mtp_tok_inc_pos_k<<<1, 1>>>(d_mtp_tok_, d_best_, d_mtp_pos_);
+        launch_mtp_rec_dev();
+        pack_mtp_slot_k<<<1, 1>>>(d_toks_, 3, d_best_);
+    }
+
+    // Shorter graph: d0 (1-layer) + two stem-only recs (no MTP layer).
+    void launch_mtp_stem_chain_dev() {
+        launch_mtp_official_dev();
+        pack_mtp_slot_k<<<1, 1>>>(d_toks_, 1, d_best_);
+        mtp_tok_inc_pos_k<<<1, 1>>>(d_mtp_tok_, d_best_, d_mtp_pos_);
+        launch_mtp_stem_rec_dev();
+        pack_mtp_slot_k<<<1, 1>>>(d_toks_, 2, d_best_);
+        mtp_tok_inc_pos_k<<<1, 1>>>(d_mtp_tok_, d_best_, d_mtp_pos_);
+        launch_mtp_stem_rec_dev();
+        pack_mtp_slot_k<<<1, 1>>>(d_toks_, 3, d_best_);
+    }
+
+    void maybe_capture_mtp_chain() {
+        if (mtp_chain_exec_ || !mtp_graph_exec_ || !mtp_rec_exec_ || !d_toks_ || !d_best_) return;
+        try {
+            abort_stream_capture();
+            cudaError_t e = cudaDeviceSynchronize();
+            if (e != cudaSuccess) cudaGetLastError();
+            {
+                int z = 0;
+                CUDA_CHECK(cudaMemcpy(d_mtp_tok_, &z, 4, cudaMemcpyHostToDevice));
+                if (d_mtp_pos_) CUDA_CHECK(cudaMemcpy(d_mtp_pos_, &z, 4, cudaMemcpyHostToDevice));
+                if (d_toks_) CUDA_CHECK(cudaMemcpy(d_toks_, &z, 4, cudaMemcpyHostToDevice));
+                launch_mtp_chain_dev();
+                e = cudaDeviceSynchronize();
+                if (e != cudaSuccess) {
+                    std::fprintf(stderr, "mtp_chain_warmup err=%s\n", cudaGetErrorString(e));
+                    cudaGetLastError();
+                    return;
+                }
+            }
+            capturing_ = true;
+            e = cudaStreamBeginCapture(cudaStreamPerThread, cudaStreamCaptureModeThreadLocal);
+            if (e != cudaSuccess) {
+                capturing_ = false;
+                std::fprintf(stderr, "mtp_chain_capture_begin err=%s\n", cudaGetErrorString(e));
+                return;
+            }
+            launch_mtp_chain_dev();
+            cudaGraph_t g = nullptr;
+            e = cudaStreamEndCapture(cudaStreamPerThread, &g);
+            capturing_ = false;
+            if (e != cudaSuccess) {
+                std::fprintf(stderr, "mtp_chain_capture_end err=%s\n", cudaGetErrorString(e));
+                abort_stream_capture();
+                return;
+            }
+            if (!instantiate_graph(g, &mtp_chain_exec_, "mtp_chain_capture", 3)) return;
+            mtp_chain_graph_ = g;
+            cudaGraphUpload(mtp_chain_exec_, cudaStreamPerThread);
+            std::fprintf(stderr, "mtp_chain_cuda_graph=1\n");
+        } catch (const std::exception& ex) {
+            capturing_ = false;
+            abort_stream_capture();
+            std::fprintf(stderr, "mtp_chain_capture throw=%s\n", ex.what());
+        }
+    }
+
+    void maybe_capture_mtp_stem_chain() {
+        if (mtp_stem_chain_exec_ || !mtp_graph_exec_ || !d_mtp_post_ || !d_toks_ || !d_best_) return;
+        try {
+            abort_stream_capture();
+            cudaError_t e = cudaDeviceSynchronize();
+            if (e != cudaSuccess) cudaGetLastError();
+            {
+                int z = 0;
+                CUDA_CHECK(cudaMemcpy(d_mtp_tok_, &z, 4, cudaMemcpyHostToDevice));
+                if (d_mtp_pos_) CUDA_CHECK(cudaMemcpy(d_mtp_pos_, &z, 4, cudaMemcpyHostToDevice));
+                if (d_toks_) CUDA_CHECK(cudaMemcpy(d_toks_, &z, 4, cudaMemcpyHostToDevice));
+                launch_mtp_stem_chain_dev();
+                e = cudaDeviceSynchronize();
+                if (e != cudaSuccess) {
+                    std::fprintf(stderr, "mtp_stem_warmup err=%s\n", cudaGetErrorString(e));
+                    cudaGetLastError();
+                    return;
+                }
+            }
+            capturing_ = true;
+            e = cudaStreamBeginCapture(cudaStreamPerThread, cudaStreamCaptureModeThreadLocal);
+            if (e != cudaSuccess) {
+                capturing_ = false;
+                std::fprintf(stderr, "mtp_stem_capture_begin err=%s\n", cudaGetErrorString(e));
+                return;
+            }
+            launch_mtp_stem_chain_dev();
+            cudaGraph_t g = nullptr;
+            e = cudaStreamEndCapture(cudaStreamPerThread, &g);
+            capturing_ = false;
+            if (e != cudaSuccess) {
+                std::fprintf(stderr, "mtp_stem_capture_end err=%s\n", cudaGetErrorString(e));
+                abort_stream_capture();
+                return;
+            }
+            if (!instantiate_graph(g, &mtp_stem_chain_exec_, "mtp_stem_capture", 3)) return;
+            mtp_stem_chain_graph_ = g;
+            cudaGraphUpload(mtp_stem_chain_exec_, cudaStreamPerThread);
+            std::fprintf(stderr, "mtp_stem_cuda_graph=1\n");
+        } catch (const std::exception& ex) {
+            capturing_ = false;
+            abort_stream_capture();
+            std::fprintf(stderr, "mtp_stem_capture throw=%s\n", ex.what());
+        }
+    }
+
+    // Working cycle rec: t_mtp_out in d_mtp_hin_ (not same-h d_mtp_post_).
+    void launch_mtp_hin_rec_dev() {
+        mtp_fuse(d_mtp_hin_, 0, false, d_mtp_nh_, false);
+        mtp_layer(-1);
+        if (d_mtp_hin_ && d_mtp_h_ && hidden_ > 0)
+            CUDA_CHECK(cudaMemcpyAsync(d_mtp_hin_, d_mtp_h_, sizeof(float) * hidden_, cudaMemcpyDeviceToDevice,
+                                       cudaStreamPerThread));
+        mtp_take_id_dev();
+    }
+
+    void launch_mtp_hin_chain_dev() {
+        launch_mtp_official_dev();
+        // t_mtp_out after the first official. Recs overwrite d_mtp_hin_.
+        if (d_mtp_seed_ && d_mtp_hin_ && hidden_ > 0)
+            CUDA_CHECK(cudaMemcpyAsync(d_mtp_seed_, d_mtp_hin_, sizeof(float) * hidden_,
+                                       cudaMemcpyDeviceToDevice, cudaStreamPerThread));
+        pack_mtp_slot_k<<<1, 1>>>(d_toks_, 1, d_best_);
+        mtp_tok_inc_pos_k<<<1, 1>>>(d_mtp_tok_, d_best_, d_mtp_pos_);
+        launch_mtp_hin_rec_dev();
+        pack_mtp_slot_k<<<1, 1>>>(d_toks_, 2, d_best_);
+        mtp_tok_inc_pos_k<<<1, 1>>>(d_mtp_tok_, d_best_, d_mtp_pos_);
+        launch_mtp_hin_rec_dev();
+        pack_mtp_slot_k<<<1, 1>>>(d_toks_, 3, d_best_);
+    }
+
+    void maybe_capture_mtp_hin_chain() {
+        if (mtp_hin_chain_exec_ || !mtp_graph_exec_ || !d_mtp_hin_ || !d_toks_ || !d_best_) return;
+        try {
+            abort_stream_capture();
+            cudaError_t e = cudaDeviceSynchronize();
+            if (e != cudaSuccess) cudaGetLastError();
+            {
+                int z = 0;
+                CUDA_CHECK(cudaMemcpy(d_mtp_tok_, &z, 4, cudaMemcpyHostToDevice));
+                if (d_mtp_pos_) CUDA_CHECK(cudaMemcpy(d_mtp_pos_, &z, 4, cudaMemcpyHostToDevice));
+                if (d_toks_) CUDA_CHECK(cudaMemcpy(d_toks_, &z, 4, cudaMemcpyHostToDevice));
+                launch_mtp_hin_chain_dev();
+                e = cudaDeviceSynchronize();
+                if (e != cudaSuccess) {
+                    std::fprintf(stderr, "mtp_hin_chain_warmup err=%s\n", cudaGetErrorString(e));
+                    cudaGetLastError();
+                    return;
+                }
+            }
+            capturing_ = true;
+            e = cudaStreamBeginCapture(cudaStreamPerThread, cudaStreamCaptureModeThreadLocal);
+            if (e != cudaSuccess) {
+                capturing_ = false;
+                std::fprintf(stderr, "mtp_hin_chain_capture_begin err=%s\n", cudaGetErrorString(e));
+                return;
+            }
+            launch_mtp_hin_chain_dev();
+            cudaGraph_t g = nullptr;
+            e = cudaStreamEndCapture(cudaStreamPerThread, &g);
+            capturing_ = false;
+            if (e != cudaSuccess) {
+                std::fprintf(stderr, "mtp_hin_chain_capture_end err=%s\n", cudaGetErrorString(e));
+                abort_stream_capture();
+                return;
+            }
+            if (!instantiate_graph(g, &mtp_hin_chain_exec_, "mtp_hin_chain_capture", 3)) return;
+            mtp_hin_chain_graph_ = g;
+            cudaGraphUpload(mtp_hin_chain_exec_, cudaStreamPerThread);
+            std::fprintf(stderr, "mtp_hin_chain_cuda_graph=1\n");
+        } catch (const std::exception& ex) {
+            capturing_ = false;
+            abort_stream_capture();
+            std::fprintf(stderr, "mtp_hin_chain_capture throw=%s\n", ex.what());
+        }
+    }
+
+    void launch_mtp_hin_rec4_dev() {
+        launch_mtp_hin_chain_dev();
+        mtp_tok_inc_pos_k<<<1, 1>>>(d_mtp_tok_, d_best_, d_mtp_pos_);
+        launch_mtp_hin_rec_dev();
+    }
+
+    void maybe_capture_mtp_hin_rec4() {
+        if (mtp_hin_rec4_exec_ || !mtp_hin_chain_exec_ || !d_mtp_hin_ || !d_toks_ || !d_best_) return;
+        try {
+            abort_stream_capture();
+            cudaError_t e = cudaDeviceSynchronize();
+            if (e != cudaSuccess) cudaGetLastError();
+            {
+                int z = 0;
+                CUDA_CHECK(cudaMemcpy(d_mtp_tok_, &z, 4, cudaMemcpyHostToDevice));
+                if (d_mtp_pos_) CUDA_CHECK(cudaMemcpy(d_mtp_pos_, &z, 4, cudaMemcpyHostToDevice));
+                if (d_toks_) CUDA_CHECK(cudaMemcpy(d_toks_, &z, 4, cudaMemcpyHostToDevice));
+                launch_mtp_hin_rec4_dev();
+                e = cudaDeviceSynchronize();
+                if (e != cudaSuccess) {
+                    std::fprintf(stderr, "mtp_hin_rec4_warmup err=%s\n", cudaGetErrorString(e));
+                    cudaGetLastError();
+                    return;
+                }
+            }
+            capturing_ = true;
+            e = cudaStreamBeginCapture(cudaStreamPerThread, cudaStreamCaptureModeThreadLocal);
+            if (e != cudaSuccess) {
+                capturing_ = false;
+                std::fprintf(stderr, "mtp_hin_rec4_capture_begin err=%s\n", cudaGetErrorString(e));
+                return;
+            }
+            launch_mtp_hin_rec4_dev();
+            cudaGraph_t g = nullptr;
+            e = cudaStreamEndCapture(cudaStreamPerThread, &g);
+            capturing_ = false;
+            if (e != cudaSuccess) {
+                std::fprintf(stderr, "mtp_hin_rec4_capture_end err=%s\n", cudaGetErrorString(e));
+                abort_stream_capture();
+                return;
+            }
+            if (!instantiate_graph(g, &mtp_hin_rec4_exec_, "mtp_hin_rec4_capture", 4)) return;
+            mtp_hin_rec4_graph_ = g;
+            cudaGraphUpload(mtp_hin_rec4_exec_, cudaStreamPerThread);
+            std::fprintf(stderr, "mtp_hin_rec4_cuda_graph=1\n");
+            maybe_capture_mtp_hin_side();
+        } catch (const std::exception& ex) {
+            capturing_ = false;
+            abort_stream_capture();
+            std::fprintf(stderr, "mtp_hin_rec4_capture throw=%s\n", ex.what());
+        }
+    }
+
+    void maybe_capture_mtp_hin_side() {
+        if (mtp_hin_side_exec_ || !mtp_hin_chain_exec_ || !d_mtp_drafts_ || !d_mtp_logits_ || !bak_stream_)
+            return;
+        int* toks0 = d_toks_;
+        int* best0 = d_best_;
+        float* log0 = d_logits_;
+        float* y0 = d_y_;
+        float* xn0 = d_xn_;
+        float* am0 = d_amax_;
+        int* ai0 = d_aidx_;
+        float* post0 = d_mtp_post_;
+        float* hin0 = d_mtp_hin_;
+        float* mh0 = d_mtp_h_;
+        float* seed0 = d_mtp_seed_;
+        int* mtok0 = d_mtp_tok_;
+        int* mpos0 = d_mtp_pos_;
+        float* kc0 = d_mtp_kc_;
+        float* vc0 = d_mtp_vc_;
+        int8_t* xq0 = g_xq;
+        __half* xsc0 = g_xsc;
+        int32_t* xsum0 = g_xsum;
+        const int xqn0 = g_xq_n;
+        // Own Q8-x workspace so side Q4 GEMV matches main and does not
+        // race T=4 / prefill on g_xq.
+        if (d_mtp_xq_ && d_mtp_xsc_) {
+            g_xq = d_mtp_xq_;
+            g_xsc = d_mtp_xsc_;
+            g_xsum = d_mtp_xsum_;
+            g_xq_n = mtp_xq_n_;
+        } else {
+            g_xq = nullptr;
+            g_xsc = nullptr;
+        }
+        g_xq_ptr = nullptr;
+        g_xq_cols = 0;
+        g_xq_T = 0;
+        d_toks_ = d_mtp_drafts_;
+        d_best_ = d_mtp_best_side_;
+        d_logits_ = d_mtp_logits_;
+        d_y_ = d_mtp_hh_ + static_cast<size_t>(kMtpCap - 15) * hidden_;
+        d_xn_ = d_mtp_hh_ + static_cast<size_t>(kMtpCap - 16) * hidden_;
+        d_amax_ = d_mtp_amax_;
+        d_aidx_ = d_mtp_aidx_;
+        if (d_mtp_post_side_) d_mtp_post_ = d_mtp_post_side_;
+        if (d_mtp_hin_side_) d_mtp_hin_ = d_mtp_hin_side_;
+        if (d_mtp_h_side_) d_mtp_h_ = d_mtp_h_side_;
+        if (d_mtp_seed_side_) d_mtp_seed_ = d_mtp_seed_side_;
+        if (d_mtp_tok_side_) d_mtp_tok_ = d_mtp_tok_side_;
+        if (d_mtp_pos_side_) d_mtp_pos_ = d_mtp_pos_side_;
+        if (d_mtp_kc_side_) d_mtp_kc_ = d_mtp_kc_side_;
+        if (d_mtp_vc_side_) d_mtp_vc_ = d_mtp_vc_side_;
+        auto restore = [&]() {
+            d_toks_ = toks0;
+            d_best_ = best0;
+            d_logits_ = log0;
+            d_y_ = y0;
+            d_xn_ = xn0;
+            d_amax_ = am0;
+            d_aidx_ = ai0;
+            d_mtp_post_ = post0;
+            d_mtp_hin_ = hin0;
+            d_mtp_h_ = mh0;
+            d_mtp_seed_ = seed0;
+            d_mtp_tok_ = mtok0;
+            d_mtp_pos_ = mpos0;
+            d_mtp_kc_ = kc0;
+            d_mtp_vc_ = vc0;
+            g_xq = xq0;
+            g_xsc = xsc0;
+            g_xsum = xsum0;
+            g_xq_n = xqn0;
+            g_xq_ptr = nullptr;
+            g_xq_cols = 0;
+            g_xq_T = 0;
+        };
+        try {
+            int z = 0;
+            CUDA_CHECK(cudaMemcpy(d_mtp_tok_, &z, 4, cudaMemcpyHostToDevice));
+            if (d_mtp_pos_) CUDA_CHECK(cudaMemcpy(d_mtp_pos_, &z, 4, cudaMemcpyHostToDevice));
+            CUDA_CHECK(cudaMemcpy(d_mtp_drafts_, &z, 4, cudaMemcpyHostToDevice));
+            launch_mtp_hin_chain_dev();
+            cudaError_t e = cudaDeviceSynchronize();
+            if (e != cudaSuccess) {
+                cudaGetLastError();
+                restore();
+                return;
+            }
+            capturing_ = true;
+            e = cudaStreamBeginCapture(cudaStreamPerThread, cudaStreamCaptureModeThreadLocal);
+            if (e != cudaSuccess) {
+                capturing_ = false;
+                restore();
+                return;
+            }
+            launch_mtp_hin_chain_dev();
+            cudaGraph_t g = nullptr;
+            e = cudaStreamEndCapture(cudaStreamPerThread, &g);
+            capturing_ = false;
+            if (e != cudaSuccess) {
+                abort_stream_capture();
+                restore();
+                return;
+            }
+            if (!instantiate_graph(g, &mtp_hin_side_exec_, "mtp_hin_side_capture", 3)) {
+                restore();
+                return;
+            }
+            mtp_hin_side_graph_ = g;
+            cudaGraphUpload(mtp_hin_side_exec_, bak_stream_);
+            launch_mtp_hin_rec4_dev();
+            e = cudaDeviceSynchronize();
+            if (e == cudaSuccess) {
+                capturing_ = true;
+                e = cudaStreamBeginCapture(cudaStreamPerThread, cudaStreamCaptureModeThreadLocal);
+                if (e == cudaSuccess) {
+                    launch_mtp_hin_rec4_dev();
+                    cudaGraph_t g4 = nullptr;
+                    e = cudaStreamEndCapture(cudaStreamPerThread, &g4);
+                    capturing_ = false;
+                    if (e == cudaSuccess && instantiate_graph(g4, &mtp_rec4_side_exec_, "mtp_rec4_side_capture", 4)) {
+                        mtp_rec4_side_graph_ = g4;
+                        cudaGraphUpload(mtp_rec4_side_exec_, bak_stream_);
+                    } else if (e != cudaSuccess)
+                        abort_stream_capture();
+                } else
+                    capturing_ = false;
+            } else
+                cudaGetLastError();
+            std::fprintf(stderr, "mtp_hin_side_cuda_graph=%d rec4=%d\n", mtp_hin_side_exec_ ? 1 : 0,
+                         mtp_rec4_side_exec_ ? 1 : 0);
+        } catch (...) {
+            capturing_ = false;
+            abort_stream_capture();
+        }
+        restore();
+    }
+
+    void mtp_launch_side(const float* h, int32_t tok, bool rec4) {
+        if (!bak_stream_ || !h || hidden_ < 64 || !d_mtp_drafts_) return;
+        CUDA_CHECK(cudaMemcpyAsync(d_mtp_drafts_, &tok, 4, cudaMemcpyHostToDevice, bak_stream_));
+        mtp_launch_side_from(h, d_mtp_drafts_, rec4);
+    }
+
+    void mtp_launch_side_from(const float* h, const int* d_tok, bool rec4) {
+        if (!bak_stream_ || !h || !d_tok || hidden_ < 64) return;
+        cudaGraphExec_t ex = rec4 ? mtp_rec4_side_exec_ : mtp_hin_side_exec_;
+        if (!ex) return;
+        float* post = d_mtp_post_side_ ? d_mtp_post_side_ : d_mtp_post_;
+        int* mtok = d_mtp_tok_side_ ? d_mtp_tok_side_ : d_mtp_tok_;
+        int* mpos = d_mtp_pos_side_ ? d_mtp_pos_side_ : d_mtp_pos_;
+        float* kc = d_mtp_kc_side_ ? d_mtp_kc_side_ : d_mtp_kc_;
+        float* vc = d_mtp_vc_side_ ? d_mtp_vc_side_ : d_mtp_vc_;
+        const int kn = mtp_L_.nkv * mtp_L_.hd;
+        const size_t kvb = (kn > 0) ? sizeof(float) * static_cast<size_t>(kMtpCap) * kn : 0;
+        CUDA_CHECK(cudaMemcpyAsync(post, h, sizeof(float) * hidden_, cudaMemcpyDeviceToDevice, bak_stream_));
+        if (kvb && kc && vc) {
+            CUDA_CHECK(cudaMemsetAsync(kc, 0, kvb, bak_stream_));
+            CUDA_CHECK(cudaMemsetAsync(vc, 0, kvb, bak_stream_));
+        }
+        CUDA_CHECK(cudaMemcpyAsync(mtok, d_tok, 4, cudaMemcpyDeviceToDevice, bak_stream_));
+        CUDA_CHECK(cudaMemcpyAsync(d_mtp_drafts_, d_tok, 4, cudaMemcpyDeviceToDevice, bak_stream_));
+        int z = 0;
+        CUDA_CHECK(cudaMemcpyAsync(mpos, &z, 4, cudaMemcpyHostToDevice, bak_stream_));
+        CUDA_CHECK(cudaGraphLaunch(ex, bak_stream_));
+        if (mtp_side_ev_) CUDA_CHECK(cudaEventRecord(mtp_side_ev_, bak_stream_));
+        mtp_side_pending_ = true;
+    }
+
+    void mtp_stash_side_slot(int i) {
+        if (!d_mtp_slot_ || i < 0 || i >= 4 || !d_mtp_drafts_) return;
+        CUDA_CHECK(cudaMemcpyAsync(d_mtp_slot_ + i * 4, d_mtp_drafts_, sizeof(int) * 4,
+                                   cudaMemcpyDeviceToDevice, bak_stream_));
+        if (d_mtp_slot_best_ && d_mtp_best_side_)
+            CUDA_CHECK(cudaMemcpyAsync(d_mtp_slot_best_ + i, d_mtp_best_side_, 4, cudaMemcpyDeviceToDevice,
+                                       bak_stream_));
+    }
+
+    void mtp_kick_h4_side() {
+        if (!mtp_have_h4_ || !mtp_hin_side_exec_ || !bak_stream_ || hidden_ < 64 || mtp_h4_d0_ < 0) return;
+        float* h4 = (d_mtp_hh_ && hidden_ > 0)
+                        ? (d_mtp_hh_ + static_cast<size_t>(kMtpCap - 7) * hidden_)
+                        : nullptr;
+        if (!h4) return;
+        mtp_launch_side(h4, mtp_h4_d0_, false);
+        mtp_stash_side_slot(0);
+        if (mtp_slot0_ev_) CUDA_CHECK(cudaEventRecord(mtp_slot0_ev_, bak_stream_));
+        mtp_pf_slots_ = 1;
+        float* h31 = (mtp_have_h31t3_ && d_mtp_hh_ && hidden_ > 0)
+                         ? (d_mtp_hh_ + static_cast<size_t>(kMtpCap - 8) * hidden_)
+                         : nullptr;
+        if (h31 && mtp_rec4_side_exec_ && mtp_h31_in_ >= 0) {
+            mtp_launch_side(h31, mtp_h31_in_, true);
+            mtp_stash_side_slot(1);
+            if (d_mtp_slot_) {
+                CUDA_CHECK(cudaMemcpyAsync(d_mtp_slot_ + 8, d_mtp_slot_ + 4, sizeof(int) * 4,
+                                           cudaMemcpyDeviceToDevice, bak_stream_));
+                CUDA_CHECK(cudaMemcpyAsync(d_mtp_slot_ + 12, d_mtp_slot_ + 4, sizeof(int) * 4,
+                                           cudaMemcpyDeviceToDevice, bak_stream_));
+            }
+            mtp_pf_slots_ = 4;
+        }
+        mtp_side_kind_ = (mtp_pf_slots_ >= 4) ? 3 : 1;
+    }
+
+    void mtp_join_side() {
+        if (mtp_side_pending_) mtp_wait_side_to_toks(0);
+    }
+
+    void mtp_wait_side_to_toks(int n) {
+        if (!mtp_side_pending_ || !d_mtp_drafts_ || !d_toks_) return;
+        if (mtp_side_ev_) CUDA_CHECK(cudaEventSynchronize(mtp_side_ev_));
+        if (n > 0)
+            CUDA_CHECK(cudaMemcpyAsync(d_toks_, d_mtp_drafts_, sizeof(int) * n, cudaMemcpyDeviceToDevice,
+                                       cudaStreamPerThread));
+        mtp_side_pending_ = false;
+    }
+
+    // T=4 of packed slot0 (overlaps leftover rec4), then one T=12 of the
+    // three live MTP(h31) slots. Same 16 drafts as 4×T=4; one fewer W pass.
+    int mtp_drain_slots(int32_t* preds) {
+        if (!spec_graph_t4_exec_ || !d_toks_ || !d_best_n_ || !d_mtp_slot_ || !d_drain_toks_ || !d_drain_best_)
+            return 0;
+        const int pos0 = pos_;
+        const bool use_t12 = (spec_graph_t12_exec_ != nullptr);
+        {
+            if (d_pos_b_) {
+                const int hp[4] = {pos0, pos0 + 1, pos0 + 2, pos0 + 3};
+                CUDA_CHECK(cudaMemcpyAsync(d_pos_b_, hp, sizeof(hp), cudaMemcpyHostToDevice,
+                                           cudaStreamPerThread));
+            }
+            set_pos_k<<<1, 1>>>(d_pos_, pos0);
+            CUDA_CHECK(cudaGraphLaunch(spec_graph_t4_exec_, cudaStreamPerThread));
+            copy4_k<<<1, 4>>>(d_drain_toks_, d_toks_);
+            copy4_k<<<1, 4>>>(d_drain_best_, d_best_n_);
+        }
+        if (use_t12) {
+            if (mtp_side_pending_ && mtp_side_ev_)
+                CUDA_CHECK(cudaStreamWaitEvent(cudaStreamPerThread, mtp_side_ev_, 0));
+            mtp_side_pending_ = false;
+            CUDA_CHECK(cudaMemcpyAsync(d_toks_, d_mtp_slot_ + 4, sizeof(int) * 12,
+                                       cudaMemcpyDeviceToDevice, cudaStreamPerThread));
+            if (d_pos_b_) {
+                const int hp[12] = {pos0 + 4,  pos0 + 5,  pos0 + 6,  pos0 + 7,
+                                    pos0 + 8,  pos0 + 9,  pos0 + 10, pos0 + 11,
+                                    pos0 + 12, pos0 + 13, pos0 + 14, pos0 + 15};
+                CUDA_CHECK(cudaMemcpyAsync(d_pos_b_, hp, sizeof(hp), cudaMemcpyHostToDevice,
+                                           cudaStreamPerThread));
+            }
+            set_pos_k<<<1, 1>>>(d_pos_, pos0 + 4);
+            CUDA_CHECK(cudaGraphLaunch(spec_graph_t12_exec_, cudaStreamPerThread));
+            CUDA_CHECK(cudaMemcpyAsync(d_drain_toks_ + 4, d_toks_, sizeof(int) * 12,
+                                       cudaMemcpyDeviceToDevice, cudaStreamPerThread));
+            CUDA_CHECK(cudaMemcpyAsync(d_drain_best_ + 4, d_best_n_, sizeof(int) * 12,
+                                       cudaMemcpyDeviceToDevice, cudaStreamPerThread));
+        } else {
+            for (int s = 1; s < 4; ++s) {
+                if (s == 1 && mtp_side_pending_) mtp_wait_side_to_toks(0);
+                CUDA_CHECK(cudaMemcpyAsync(d_toks_, d_mtp_slot_ + s * 4, sizeof(int) * 4,
+                                           cudaMemcpyDeviceToDevice, cudaStreamPerThread));
+                const int p = pos0 + s * 4;
+                if (d_pos_b_) {
+                    const int hp[4] = {p, p + 1, p + 2, p + 3};
+                    CUDA_CHECK(cudaMemcpyAsync(d_pos_b_, hp, sizeof(hp), cudaMemcpyHostToDevice,
+                                               cudaStreamPerThread));
+                }
+                set_pos_k<<<1, 1>>>(d_pos_, p);
+                CUDA_CHECK(cudaGraphLaunch(spec_graph_t4_exec_, cudaStreamPerThread));
+                copy4_k<<<1, 4>>>(d_drain_toks_ + s * 4, d_toks_);
+                copy4_k<<<1, 4>>>(d_drain_best_ + s * 4, d_best_n_);
+            }
+        }
+        int tk[16] = {}, be[16] = {};
+        CUDA_CHECK(cudaMemcpy(tk, d_drain_toks_, sizeof(tk), cudaMemcpyDeviceToHost));
+        CUDA_CHECK(cudaMemcpy(be, d_drain_best_, sizeof(be), cudaMemcpyDeviceToHost));
+        int got = 0;
+        for (int s = 0; s < 4; ++s) {
+            const int* t = tk + s * 4;
+            const int* b = be + s * 4;
+            const int hit2 = (b[0] == t[1]) ? 1 : 0;
+            const int hit4 = (hit2 && b[1] == t[2] && b[2] == t[3]) ? 1 : 0;
+            if (!hit4) {
+                last_tok_ = b[0];
+                if (preds && got < 16) preds[got] = t[0];
+                got += 1;
+                break;
+            }
+            if (preds) {
+                for (int i = 0; i < 4 && got + i < 16; ++i) preds[got + i] = t[i];
+            }
+            got += 4;
+            last_tok_ = b[3];
+        }
+        pos_ = pos0 + got;
+        set_pos_k<<<1, 1>>>(d_pos_, pos_);
+        if (d_h_ && d_h_seq_ && got >= 4) {
+            const int hi = (use_t12 && got >= 16) ? 11 : 3;
+            CUDA_CHECK(cudaMemcpyAsync(d_h_, d_h_seq_ + static_cast<size_t>(hi) * hidden_,
+                                       sizeof(float) * hidden_, cudaMemcpyDeviceToDevice,
+                                       cudaStreamPerThread));
+        }
+        if (d_best_) CUDA_CHECK(cudaMemcpyAsync(d_best_, &last_tok_, 4, cudaMemcpyHostToDevice,
+                                                cudaStreamPerThread));
+        std::fprintf(stderr, "mtp_drain t4_t12=%d got=%d last=%d t0=%d %d %d %d\n", use_t12 ? 1 : 0, got,
+                     last_tok_, tk[0], tk[1], tk[2], tk[3]);
+        return got;
+    }
+
+    void zero_decode_state() {
+        if (s_bytes_ && d_S_) CUDA_CHECK(cudaMemset(d_S_, 0, s_bytes_));
+        if (conv_bytes_ && d_conv_) CUDA_CHECK(cudaMemset(d_conv_, 0, conv_bytes_));
+        if (kv_bytes_ && d_kcache_ && d_vcache_) {
+            CUDA_CHECK(cudaMemset(d_kcache_, 0, kv_bytes_));
+            CUDA_CHECK(cudaMemset(d_vcache_, 0, kv_bytes_));
+        }
+        if (d_mtp_kc_ && d_mtp_vc_) {
+            const int kn = mtp_L_.nkv * mtp_L_.hd;
+            if (kn > 0) {
+                const size_t kvb = sizeof(float) * static_cast<size_t>(kMtpCap) * kn;
+                CUDA_CHECK(cudaMemset(d_mtp_kc_, 0, kvb));
+                CUDA_CHECK(cudaMemset(d_mtp_vc_, 0, kvb));
+            }
+        }
+        pos_ = 0;
+        if (d_pos_) set_pos_k<<<1, 1>>>(d_pos_, 0);
     }
 
     void maybe_capture_mtp_t2() {
@@ -12688,6 +13527,8 @@ public:
             abort_stream_capture();
             cudaError_t e = cudaDeviceSynchronize();
             if (e != cudaSuccess) cudaGetLastError();
+            // Capture overwrites S_bak / persist KV. Zero after so prefill
+            // does not inherit dummy-token state (previous fused capture).
             capturing_ = true;
             e = cudaStreamBeginCapture(cudaStreamPerThread, cudaStreamCaptureModeThreadLocal);
             if (e != cudaSuccess) {
@@ -12704,24 +13545,1026 @@ public:
             if (e != cudaSuccess) {
                 std::fprintf(stderr, "mtp_t2_capture_end err=%s\n", cudaGetErrorString(e));
                 abort_stream_capture();
+                zero_decode_state();
                 return;
             }
-            if (!instantiate_graph(g, &mtp_t2_exec_, "mtp_t2_capture", 2)) return;
+            if (!instantiate_graph(g, &mtp_t2_exec_, "mtp_t2_capture", 2)) {
+                zero_decode_state();
+                return;
+            }
             mtp_t2_graph_ = g;
             cudaGraphUpload(mtp_t2_exec_, cudaStreamPerThread);
             std::fprintf(stderr, "mtp_t2_cuda_graph=1\n");
+            if (hidden_ >= 64) {
+                g_spec_ms_lin = g_spec_ms_gdn = g_spec_ms_attn = g_spec_ms_mlp = g_spec_ms_lm = 0;
+                g_spec_prof = true;
+                launch_spec_chunk(2);
+                g_spec_prof = false;
+                std::fprintf(stderr, "spec_prof T=2 lin=%.2f gdn=%.2f attn=%.2f mlp=%.2f lm=%.2f tot=%.2f\n",
+                             g_spec_ms_lin, g_spec_ms_gdn, g_spec_ms_attn, g_spec_ms_mlp, g_spec_ms_lm,
+                             g_spec_ms_lin + g_spec_ms_gdn + g_spec_ms_attn + g_spec_ms_mlp + g_spec_ms_lm);
+            }
+            zero_decode_state();
         } catch (const std::exception& ex) {
             capturing_ = false;
             abort_stream_capture();
+            zero_decode_state();
             std::fprintf(stderr, "mtp_t2_capture throw=%s\n", ex.what());
         }
     }
 
+    void maybe_capture_mtp_t4() {
+        if (mtp_t4_exec_ || !mtp_hin_chain_exec_ || !spec_graph_t4_exec_ || !d_toks_) return;
+        try {
+            abort_stream_capture();
+            cudaError_t e = cudaDeviceSynchronize();
+            if (e != cudaSuccess) cudaGetLastError();
+            capturing_ = true;
+            e = cudaStreamBeginCapture(cudaStreamPerThread, cudaStreamCaptureModeThreadLocal);
+            if (e != cudaSuccess) {
+                capturing_ = false;
+                std::fprintf(stderr, "mtp_t4_capture_begin err=%s\n", cudaGetErrorString(e));
+                return;
+            }
+            launch_mtp_hin_chain_dev();
+            launch_spec_chunk(4);
+            cudaGraph_t g = nullptr;
+            e = cudaStreamEndCapture(cudaStreamPerThread, &g);
+            capturing_ = false;
+            if (e != cudaSuccess) {
+                std::fprintf(stderr, "mtp_t4_capture_end err=%s\n", cudaGetErrorString(e));
+                abort_stream_capture();
+                zero_decode_state();
+                return;
+            }
+            if (!instantiate_graph(g, &mtp_t4_exec_, "mtp_t4_capture", 4)) {
+                zero_decode_state();
+                return;
+            }
+            mtp_t4_graph_ = g;
+            cudaGraphUpload(mtp_t4_exec_, cudaStreamPerThread);
+            std::fprintf(stderr, "mtp_t4_cuda_graph=1\n");
+            zero_decode_state();
+        } catch (const std::exception& ex) {
+            capturing_ = false;
+            abort_stream_capture();
+            zero_decode_state();
+            std::fprintf(stderr, "mtp_t4_capture throw=%s\n", ex.what());
+        }
+    }
+
+    // Isolated d0 at pos 0 (keeps d0=5). Rec at stream pos n with t_lo=1
+    // so the dummy pos-0 KV is skipped. T=4 only if rec==0.
+    int mtp_try_first_t4(int32_t t0, int32_t* preds) {
+        // First-step rec cannot emit 0 on this Q4 (measured 5013/1/1). Skip after
+        // the first failed probe so the timed generate does not pay 3 eager recs.
+        static int first_t4_dead = 0;
+        if (first_t4_dead) return 0;
+        if (mtp_first_done_ || mtp_stream_n_ <= 1 || !spec_graph_t4_exec_ || !mtp_graph_exec_) return 0;
+        if (!d_mtp_post_ || !d_mtp_nh_ || !d_toks_ || !d_best_) return 0;
+        const int pos0 = pos_;
+        mtp_attn_lo_ = 0;
+        mtp_kv_pos_ = 0;
+        CUDA_CHECK(cudaMemcpy(d_mtp_tok_, &t0, 4, cudaMemcpyHostToDevice));
+        CUDA_CHECK(cudaMemcpy(d_toks_, &t0, 4, cudaMemcpyHostToDevice));
+        CUDA_CHECK(cudaMemcpy(d_mtp_pos_, &mtp_kv_pos_, 4, cudaMemcpyHostToDevice));
+        CUDA_CHECK(cudaGraphLaunch(mtp_graph_exec_, cudaStreamPerThread));
+        if (d_mtp_hin_ && d_mtp_h_)
+            CUDA_CHECK(cudaMemcpy(d_mtp_hin_, d_mtp_h_, sizeof(float) * hidden_, cudaMemcpyDeviceToDevice));
+        int32_t d0 = 0, rec_a = -1, rec_b = -1, rec_c = -1, rec = -1, rec2 = -1;
+        CUDA_CHECK(cudaMemcpy(&d0, d_best_, 4, cudaMemcpyDeviceToHost));
+        pack_mtp_slot_k<<<1, 1>>>(d_toks_, 1, d_best_);
+        mtp_attn_lo_ = 1;
+        mtp_zero_kv_slot(0);
+        const int rp = mtp_stream_n_;
+        auto rec_at = [&](const float* h_in, int32_t tok, int pos) -> int32_t {
+            CUDA_CHECK(cudaMemcpy(d_mtp_tok_, &tok, 4, cudaMemcpyHostToDevice));
+            CUDA_CHECK(cudaMemcpy(d_mtp_pos_, &pos, 4, cudaMemcpyHostToDevice));
+            mtp_fuse(h_in, tok, false, d_mtp_nh_, false);
+            mtp_layer(-1);
+            mtp_take_id_dev();
+            int32_t id = 0;
+            CUDA_CHECK(cudaMemcpy(&id, d_best_, 4, cudaMemcpyDeviceToHost));
+            return id;
+        };
+        if (d_mtp_hin_) rec_a = rec_at(d_mtp_hin_, d0, rp);
+        if (d_mtp_post_) rec_b = rec_at(d_mtp_post_, d0, rp);
+        if (d_h_seq_ && mtp_stream_n_ > 0)
+            rec_c = rec_at(d_h_seq_ + static_cast<size_t>(mtp_stream_n_ - 1) * hidden_, d0, rp);
+        int32_t rec_d = -1;
+        const float* rec_d_h = nullptr;
+        // Fork-style last prefill pair: MTP(h_3, t0=4) then rec(t_mtp_out, d0=5).
+        if (d_h_seq_ && mtp_stream_n_ > 0 && d_mtp_hh_ && hidden_ > 0) {
+            const float* h3 = d_h_seq_ + static_cast<size_t>(mtp_stream_n_ - 1) * hidden_;
+            float* scratch = d_mtp_hh_ + static_cast<size_t>(kMtpCap - 1) * hidden_;
+            CUDA_CHECK(cudaMemcpy(d_mtp_tok_, &t0, 4, cudaMemcpyHostToDevice));
+            CUDA_CHECK(cudaMemcpy(d_mtp_pos_, &rp, 4, cudaMemcpyHostToDevice));
+            mtp_fuse(h3, t0, false, d_mtp_nh_, false);
+            mtp_layer(-1);
+            CUDA_CHECK(cudaMemcpy(scratch, d_mtp_h_, sizeof(float) * hidden_, cudaMemcpyDeviceToDevice));
+            rec_d = rec_at(scratch, d0, rp + 1);
+            rec_d_h = scratch;
+            mtp_zero_kv_slot(rp);
+            mtp_zero_kv_slot(rp + 1);
+        }
+        const float* rec_h = nullptr;
+        if (rec_a == 0 && d_mtp_hin_) {
+            rec = rec_a;
+            rec_h = d_mtp_hin_;
+        } else if (rec_b == 0 && d_mtp_post_) {
+            rec = rec_b;
+            rec_h = d_mtp_post_;
+        } else if (rec_c == 0 && d_h_seq_) {
+            rec = rec_c;
+            rec_h = d_h_seq_ + static_cast<size_t>(mtp_stream_n_ - 1) * hidden_;
+        } else if (rec_d == 0 && rec_d_h) {
+            rec = rec_d;
+            rec_h = rec_d_h;
+        }
+        std::fprintf(stderr, "mtp_first_t4 t0=%d d0=%d rec_a=%d rec_b=%d rec_c=%d rec_d=%d pick=%d rp=%d\n", t0,
+                     d0, rec_a, rec_b, rec_c, rec_d, rec, rp);
+        if (rec != 0 || !rec_h) {
+            first_t4_dead = 1;
+            mtp_attn_lo_ = 0;
+            mtp_kv_pos_ = 0;
+            mtp_zero_kv_slot(rp);
+            return 0;
+        }
+        rec_at(rec_h, d0, rp);
+        if (d_mtp_hin_ && d_mtp_h_)
+            CUDA_CHECK(cudaMemcpy(d_mtp_hin_, d_mtp_h_, sizeof(float) * hidden_, cudaMemcpyDeviceToDevice));
+        rec2 = rec_at(d_mtp_hin_ ? d_mtp_hin_ : rec_h, rec, rp + 1);
+        CUDA_CHECK(cudaMemcpy(d_toks_ + 2, &rec, 4, cudaMemcpyHostToDevice));
+        CUDA_CHECK(cudaMemcpy(d_toks_ + 3, &rec2, 4, cudaMemcpyHostToDevice));
+        int32_t ht[4] = {t0, d0, rec, rec2};
+        std::fprintf(stderr, "mtp_first_t4_go t0=%d d0=%d rec=%d rec2=%d\n", t0, d0, rec, rec2);
+        mtp_toks_on_dev_ = true;
+        const int k = spec_verify(ht, 4, preds);
+        mtp_finish_first_iso(k >= 2, d0);
+        return k;
+    }
+
+    // First T=4 without a standalone T=1: isolated d0=5, rec from saved
+    // stream t_mtp_out (MTP(h_{n-2}, ids[n-1])). Isolated rec is 5013/1/1.
+    int mtp_try_first_t4_seed(int32_t t0, int32_t* preds) {
+        static int seed_dead = 0;
+        if (seed_dead || mtp_first_done_ || hidden_ < 64) return 0;
+        if (!d_mtp_seed_ || !d_mtp_post_ || !d_toks_ || !d_best_ || !spec_graph_t4_exec_) return 0;
+        const int kn = mtp_L_.nkv * mtp_L_.hd;
+        const size_t kvb = (kn > 0) ? sizeof(float) * static_cast<size_t>(kMtpCap) * kn : 0;
+        auto rec_of = [&](const float* h, int32_t tok) -> int32_t {
+            if (!h) return -1;
+            int z = 0;
+            if (kvb) {
+                CUDA_CHECK(cudaMemset(d_mtp_kc_, 0, kvb));
+                CUDA_CHECK(cudaMemset(d_mtp_vc_, 0, kvb));
+            }
+            CUDA_CHECK(cudaMemcpy(d_mtp_tok_, &tok, 4, cudaMemcpyHostToDevice));
+            CUDA_CHECK(cudaMemcpy(d_mtp_pos_, &z, 4, cudaMemcpyHostToDevice));
+            mtp_fuse(h, tok, false, d_mtp_nh_, false);
+            mtp_layer(0);
+            if (d_mtp_hin_ && d_mtp_h_ && hidden_ > 0)
+                CUDA_CHECK(cudaMemcpy(d_mtp_hin_, d_mtp_h_, sizeof(float) * hidden_,
+                                       cudaMemcpyDeviceToDevice));
+            mtp_take_id_dev();
+            int32_t id = 0;
+            CUDA_CHECK(cudaMemcpy(&id, d_best_, 4, cudaMemcpyDeviceToHost));
+            return id;
+        };
+        int z = 0;
+        if (kvb) {
+            CUDA_CHECK(cudaMemset(d_mtp_kc_, 0, kvb));
+            CUDA_CHECK(cudaMemset(d_mtp_vc_, 0, kvb));
+        }
+        CUDA_CHECK(cudaMemcpy(d_mtp_tok_, &t0, 4, cudaMemcpyHostToDevice));
+        CUDA_CHECK(cudaMemcpy(d_mtp_pos_, &z, 4, cudaMemcpyHostToDevice));
+        launch_mtp_official_dev();
+        int32_t d0 = 0;
+        CUDA_CHECK(cudaMemcpy(&d0, d_best_, 4, cudaMemcpyDeviceToHost));
+        const int32_t rec_s = rec_of(d_mtp_seed_, d0);
+        int32_t rec_h2 = -1;
+        const float* rec_h = nullptr;
+        int32_t rec = 0;
+        if (d0 == 5 && rec_s == 0) {
+            rec = rec_s;
+            rec_h = d_mtp_seed_;
+        } else if (d0 == 5 && d_h_seq_ && mtp_stream_n_ > 1) {
+            rec_h2 = rec_of(d_h_seq_ + hidden_, d0);
+            if (rec_h2 == 0) {
+                rec = rec_h2;
+                rec_h = d_h_seq_ + hidden_;
+            }
+        }
+        std::fprintf(stderr, "mtp_seed_rec t0=%d d0=%d rec_s=%d rec_h2=%d\n", t0, d0, rec_s, rec_h2);
+        if (!rec_h) {
+            seed_dead = 1;
+            return 0;
+        }
+        rec_of(rec_h, d0);
+        const int32_t rec2 = rec_of(d_mtp_hin_ ? d_mtp_hin_ : rec_h, rec);
+        CUDA_CHECK(cudaMemcpy(d_toks_, &t0, 4, cudaMemcpyHostToDevice));
+        CUDA_CHECK(cudaMemcpy(d_toks_ + 1, &d0, 4, cudaMemcpyHostToDevice));
+        CUDA_CHECK(cudaMemcpy(d_toks_ + 2, &rec, 4, cudaMemcpyHostToDevice));
+        CUDA_CHECK(cudaMemcpy(d_toks_ + 3, &rec2, 4, cudaMemcpyHostToDevice));
+        int32_t ht[4] = {t0, d0, rec, rec2};
+        std::fprintf(stderr, "mtp_seed_t4 t0=%d d0=%d rec=%d rec2=%d\n", t0, d0, rec, rec2);
+        mtp_toks_on_dev_ = true;
+        const int k = spec_verify(ht, 4, preds);
+        mtp_arm_cycle();
+        return k;
+    }
+
+    // Isolated official(h, tok) at pos 0. Does not use the captured graph
+    // (that graph is wired to d_mtp_post_). Leaves t_mtp_out in d_mtp_hin_.
+    int32_t mtp_official_pos0_from(const float* h, int32_t tok) {
+        if (!h || !d_best_ || hidden_ < 64) return -1;
+        mtp_attn_lo_ = 0;
+        mtp_zero_kv_slot(0);
+        int z = 0;
+        CUDA_CHECK(cudaMemcpy(d_mtp_tok_, &tok, 4, cudaMemcpyHostToDevice));
+        CUDA_CHECK(cudaMemcpy(d_mtp_pos_, &z, 4, cudaMemcpyHostToDevice));
+        mtp_fuse(h, tok, false, d_mtp_nh_, false);
+        mtp_layer(0);
+        if (d_mtp_hin_ && d_mtp_h_ && hidden_ > 0)
+            CUDA_CHECK(cudaMemcpy(d_mtp_hin_, d_mtp_h_, sizeof(float) * hidden_,
+                                   cudaMemcpyDeviceToDevice));
+        mtp_take_id_dev();
+        int32_t id = 0;
+        CUDA_CHECK(cudaMemcpy(&id, d_best_, 4, cudaMemcpyDeviceToHost));
+        return id;
+    }
+
+    // Isolated official(h_3_post, tok) at pos 0 empty slot-0 KV. Does not
+    // memset the stream slots (mtp_id_from_post would).
+    int32_t mtp_official_pos0(int32_t tok) {
+        mtp_attn_lo_ = 0;
+        mtp_zero_kv_slot(0);
+        int z = 0;
+        CUDA_CHECK(cudaMemcpy(d_mtp_tok_, &tok, 4, cudaMemcpyHostToDevice));
+        CUDA_CHECK(cudaMemcpy(d_mtp_pos_, &z, 4, cudaMemcpyHostToDevice));
+        if (mtp_graph_exec_)
+            CUDA_CHECK(cudaGraphLaunch(mtp_graph_exec_, cudaStreamPerThread));
+        else {
+            mtp_fuse(d_mtp_post_, tok, false, d_mtp_nh_);
+            mtp_layer(0);
+            mtp_take_id_dev();
+        }
+        int32_t id = 0;
+        CUDA_CHECK(cudaMemcpy(&id, d_best_, 4, cudaMemcpyDeviceToHost));
+        return id;
+    }
+
+    // First-step T=2 of [t0, official(h_3_post, t0)]. Isolated d0=5 is
+    // measured; T=2 [4,5] should 2/2. That is one W pass for tokens 4 and 5
+    // (skips the extra T=1 W pass). Next hin is MTP(h_5, last=0), not last-greedy.
+    int mtp_try_first_t2(int32_t t0, int32_t* preds) {
+        static int t2_first_dead = 0;
+        if (t2_first_dead || mtp_first_done_ || hidden_ < 64) return 0;
+        if (!spec_graph_exec_ || !d_mtp_post_ || !d_toks_ || !d_best_) return 0;
+        const int32_t d0 = mtp_official_pos0(t0);
+        std::fprintf(stderr, "mtp_first_t2 t0=%d d0=%d\n", t0, d0);
+        CUDA_CHECK(cudaMemcpy(d_toks_, &t0, 4, cudaMemcpyHostToDevice));
+        CUDA_CHECK(cudaMemcpy(d_toks_ + 1, &d0, 4, cudaMemcpyHostToDevice));
+        int32_t ht[2] = {t0, d0};
+        mtp_toks_on_dev_ = true;
+        const int k = spec_verify(ht, 2, preds);
+        std::fprintf(stderr, "mtp_first_t2_k t0=%d d0=%d k=%d last=%d\n", t0, d0, k, last_tok_);
+        if (k < 2) {
+            t2_first_dead = 1;
+            return 0;
+        }
+        int32_t rec_h4 = -1, rec_h5 = -1;
+        if (d_h_seq_ && hidden_ > 0) {
+            rec_h4 = mtp_official_pos0_from(d_h_seq_, d0);
+            rec_h5 = mtp_official_pos0_from(d_h_seq_ + hidden_, last_tok_);
+            std::fprintf(stderr, "mtp_first_t2_rec h4_d0=%d h5_last=%d last=%d\n", rec_h4, rec_h5, last_tok_);
+        }
+        // hin from h_4 + d0=5 (measured rec=0). Tail after the already
+        // accepted 5 is the next t0=last=0 drafts — still MTP, not greeds.
+        if (d_h_seq_ && d_mtp_post_ && hidden_ > 0)
+            CUDA_CHECK(cudaMemcpy(d_mtp_post_, d_h_seq_, sizeof(float) * hidden_, cudaMemcpyDeviceToDevice));
+        mtp_kv_pos_ = mtp_stream_n_ < kMtpCap ? mtp_stream_n_ : (kMtpCap - 1);
+        mtp_attn_lo_ = 1;
+        mtp_arm_cycle();
+        return k;
+    }
+
+    // Three independent official(h_3_post, ·) at pos 0. Extra hidden swaps
+    // (h_3_pre / h_2_post) dirtied timed T=4 rec (hit=100). Measured:
+    // d1_post=3 d1_pre=3 d1_h2=2037 — none is 0.
+    int mtp_try_first_t4_iso5(int32_t t0, int32_t* preds) {
+        static int iso5_dead = 0;
+        if (iso5_dead || mtp_first_done_ || hidden_ < 64) return 0;
+        if (!spec_graph_t4_exec_ || !mtp_graph_exec_ || !d_mtp_post_ || !d_toks_ || !d_best_) return 0;
+        const int32_t d0 = mtp_official_pos0(t0);
+        const int32_t d1 = mtp_official_pos0(d0);
+        const int32_t d2 = mtp_official_pos0(d1);
+        mtp_zero_kv_slot(0);
+        std::fprintf(stderr, "mtp_iso5 t0=%d d0=%d d1=%d d2=%d\n", t0, d0, d1, d2);
+        if (d1 != 0) {
+            iso5_dead = 1;
+            return 0;
+        }
+        CUDA_CHECK(cudaMemcpy(d_toks_, &t0, 4, cudaMemcpyHostToDevice));
+        CUDA_CHECK(cudaMemcpy(d_toks_ + 1, &d0, 4, cudaMemcpyHostToDevice));
+        CUDA_CHECK(cudaMemcpy(d_toks_ + 2, &d1, 4, cudaMemcpyHostToDevice));
+        CUDA_CHECK(cudaMemcpy(d_toks_ + 3, &d2, 4, cudaMemcpyHostToDevice));
+        int32_t ht[4] = {t0, d0, d1, d2};
+        mtp_toks_on_dev_ = true;
+        const int k = spec_verify(ht, 4, preds);
+        std::fprintf(stderr, "mtp_iso5_t4 t0=%d d0=%d d1=%d d2=%d k=%d\n", t0, d0, d1, d2, k);
+        if (k < 2) {
+            iso5_dead = 1;
+            return 0;
+        }
+        mtp_arm_cycle();
+        return k;
+    }
+
+    // Isolated official first (pos 0, post-norm) keeps d0=5. Previous rec
+    // probes zeroed that KV and rec'd at stream pos with t_lo=1 — that is
+    // why rec was 5013. Fork AR rec keeps the first-draft KV and steps pos+1
+    // from t_mtp_out.
+    int mtp_try_first_t4_keepkv(int32_t t0, int32_t* preds) {
+        static int keepkv_dead = 0;
+        if (keepkv_dead || mtp_first_done_ || hidden_ < 64) return 0;
+        if (!spec_graph_t4_exec_ || !mtp_graph_exec_ || !d_mtp_post_ || !d_toks_ || !d_best_) return 0;
+        mtp_attn_lo_ = 0;
+        mtp_kv_pos_ = 0;
+        int z = 0;
+        CUDA_CHECK(cudaMemcpy(d_mtp_tok_, &t0, 4, cudaMemcpyHostToDevice));
+        CUDA_CHECK(cudaMemcpy(d_toks_, &t0, 4, cudaMemcpyHostToDevice));
+        CUDA_CHECK(cudaMemcpy(d_mtp_pos_, &z, 4, cudaMemcpyHostToDevice));
+        CUDA_CHECK(cudaGraphLaunch(mtp_graph_exec_, cudaStreamPerThread));
+        int32_t d0 = 0;
+        CUDA_CHECK(cudaMemcpy(&d0, d_best_, 4, cudaMemcpyDeviceToHost));
+        if (d_mtp_hin_ && d_mtp_h_ && hidden_ > 0)
+            CUDA_CHECK(cudaMemcpy(d_mtp_hin_, d_mtp_h_, sizeof(float) * hidden_, cudaMemcpyDeviceToDevice));
+        const int p1 = 1;
+        CUDA_CHECK(cudaMemcpy(d_mtp_tok_, &d0, 4, cudaMemcpyHostToDevice));
+        CUDA_CHECK(cudaMemcpy(d_mtp_pos_, &p1, 4, cudaMemcpyHostToDevice));
+        mtp_fuse(d_mtp_hin_ ? d_mtp_hin_ : d_mtp_post_, d0, false, d_mtp_nh_, false);
+        mtp_layer(1);
+        if (d_mtp_hin_ && d_mtp_h_ && hidden_ > 0)
+            CUDA_CHECK(cudaMemcpy(d_mtp_hin_, d_mtp_h_, sizeof(float) * hidden_, cudaMemcpyDeviceToDevice));
+        mtp_take_id_dev();
+        int32_t rec = 0;
+        CUDA_CHECK(cudaMemcpy(&rec, d_best_, 4, cudaMemcpyDeviceToHost));
+        std::fprintf(stderr, "mtp_keepkv t0=%d d0=%d rec=%d\n", t0, d0, rec);
+        if (rec != 0) {
+            keepkv_dead = 1;
+            mtp_zero_kv_slot(0);
+            mtp_zero_kv_slot(1);
+            mtp_attn_lo_ = 0;
+            mtp_kv_pos_ = 0;
+            return 0;
+        }
+        const int p2 = 2;
+        CUDA_CHECK(cudaMemcpy(d_mtp_tok_, &rec, 4, cudaMemcpyHostToDevice));
+        CUDA_CHECK(cudaMemcpy(d_mtp_pos_, &p2, 4, cudaMemcpyHostToDevice));
+        mtp_fuse(d_mtp_hin_ ? d_mtp_hin_ : d_mtp_post_, rec, false, d_mtp_nh_, false);
+        mtp_layer(2);
+        mtp_take_id_dev();
+        int32_t rec2 = 0;
+        CUDA_CHECK(cudaMemcpy(&rec2, d_best_, 4, cudaMemcpyDeviceToHost));
+        CUDA_CHECK(cudaMemcpy(d_toks_, &t0, 4, cudaMemcpyHostToDevice));
+        CUDA_CHECK(cudaMemcpy(d_toks_ + 1, &d0, 4, cudaMemcpyHostToDevice));
+        CUDA_CHECK(cudaMemcpy(d_toks_ + 2, &rec, 4, cudaMemcpyHostToDevice));
+        CUDA_CHECK(cudaMemcpy(d_toks_ + 3, &rec2, 4, cudaMemcpyHostToDevice));
+        int32_t ht[4] = {t0, d0, rec, rec2};
+        std::fprintf(stderr, "mtp_keepkv_t4 t0=%d d0=%d rec=%d rec2=%d\n", t0, d0, rec, rec2);
+        mtp_toks_on_dev_ = true;
+        const int k = spec_verify(ht, 4, preds);
+        mtp_arm_cycle();
+        return k;
+    }
+
+    // iso5 re-feeds h_3_post so d1=3. keepkv recs at pos 1 so rec=5013.
+    // This recs official(t_mtp_out, d0) at isolated pos 0 — the hidden is
+    // the first official's output, not h_3 again and not stream-pos KV.
+    int mtp_try_first_t4_hin0(int32_t t0, int32_t* preds) {
+        static int hin0_dead = 0;
+        if (hin0_dead || mtp_first_done_ || hidden_ < 64) return 0;
+        if (!spec_graph_t4_exec_ || !mtp_graph_exec_ || !d_mtp_post_ || !d_toks_ || !d_best_) return 0;
+        const int32_t d0 = mtp_official_pos0(t0);
+        const float* hin = d_mtp_hin_ ? d_mtp_hin_ : d_mtp_h_;
+        float* scratch = nullptr;
+        if (d_mtp_hh_ && hidden_ > 0)
+            scratch = d_mtp_hh_ + static_cast<size_t>(kMtpCap - 1) * hidden_;
+        if (scratch && hin)
+            CUDA_CHECK(cudaMemcpy(scratch, hin, sizeof(float) * hidden_, cudaMemcpyDeviceToDevice));
+        const float* rec_h = scratch ? scratch : hin;
+        const int32_t rec = mtp_official_pos0_from(rec_h, d0);
+        std::fprintf(stderr, "mtp_hin0 t0=%d d0=%d rec=%d\n", t0, d0, rec);
+        if (rec != 0) {
+            hin0_dead = 1;
+            mtp_zero_kv_slot(0);
+            mtp_attn_lo_ = 0;
+            return 0;
+        }
+        const int32_t rec2 = mtp_official_pos0_from(d_mtp_hin_ ? d_mtp_hin_ : rec_h, rec);
+        mtp_zero_kv_slot(0);
+        CUDA_CHECK(cudaMemcpy(d_toks_, &t0, 4, cudaMemcpyHostToDevice));
+        CUDA_CHECK(cudaMemcpy(d_toks_ + 1, &d0, 4, cudaMemcpyHostToDevice));
+        CUDA_CHECK(cudaMemcpy(d_toks_ + 2, &rec, 4, cudaMemcpyHostToDevice));
+        CUDA_CHECK(cudaMemcpy(d_toks_ + 3, &rec2, 4, cudaMemcpyHostToDevice));
+        int32_t ht[4] = {t0, d0, rec, rec2};
+        std::fprintf(stderr, "mtp_hin0_t4 t0=%d d0=%d rec=%d rec2=%d\n", t0, d0, rec, rec2);
+        mtp_toks_on_dev_ = true;
+        const int k = spec_verify(ht, 4, preds);
+        if (k < 2) {
+            hin0_dead = 1;
+            return 0;
+        }
+        mtp_arm_cycle();
+        return k;
+    }
+
+    // Isolated pos-0 first draft keeps d0=5 without touching pair slots 1..n-1.
+    // Rec at stream pos=n so causal attn sees those pairs (keepkv rec'd at
+    // pos 1 and wiped a pair; hin0 rec'd at empty pos 0 — both 5013).
+    int mtp_try_first_t4_pairrec(int32_t t0, int32_t* preds) {
+        static int pairrec_dead = 0;
+        if (pairrec_dead || mtp_first_done_ || hidden_ < 64 || mtp_stream_n_ <= 1) return 0;
+        if (!spec_graph_t4_exec_ || !d_mtp_post_ || !d_toks_ || !d_best_) return 0;
+        const int p0 = mtp_stream_n_;
+        if (p0 + 2 >= kMtpCap) return 0;
+        float* snap = nullptr;
+        if (d_mtp_hh_ && hidden_ > 0)
+            snap = d_mtp_hh_ + static_cast<size_t>(kMtpCap - 2) * hidden_;
+        const int32_t d0 = mtp_official_pos0(t0);
+        if (d_mtp_hin_ && d_mtp_h_ && hidden_ > 0)
+            CUDA_CHECK(cudaMemcpy(d_mtp_hin_, d_mtp_h_, sizeof(float) * hidden_, cudaMemcpyDeviceToDevice));
+        if (snap && d_mtp_hin_)
+            CUDA_CHECK(cudaMemcpy(snap, d_mtp_hin_, sizeof(float) * hidden_, cudaMemcpyDeviceToDevice));
+        const float* rec_h = snap ? snap : (d_mtp_hin_ ? d_mtp_hin_ : d_mtp_h_);
+        auto rec_at = [&](int pos, int tlo) -> int32_t {
+            mtp_attn_lo_ = tlo;
+            CUDA_CHECK(cudaMemcpy(d_mtp_tok_, &d0, 4, cudaMemcpyHostToDevice));
+            CUDA_CHECK(cudaMemcpy(d_mtp_pos_, &pos, 4, cudaMemcpyHostToDevice));
+            mtp_fuse(rec_h, d0, false, d_mtp_nh_, false);
+            mtp_layer(pos);
+            if (d_mtp_hin_ && d_mtp_h_ && hidden_ > 0)
+                CUDA_CHECK(cudaMemcpy(d_mtp_hin_, d_mtp_h_, sizeof(float) * hidden_,
+                                       cudaMemcpyDeviceToDevice));
+            mtp_take_id_dev();
+            int32_t id = 0;
+            CUDA_CHECK(cudaMemcpy(&id, d_best_, 4, cudaMemcpyDeviceToHost));
+            return id;
+        };
+        int32_t rec = rec_at(p0, 1);
+        int used_tlo = 1;
+        const char* rec_src = "tout";
+        std::fprintf(stderr, "mtp_pairrec t0=%d d0=%d rec_tout_tlo1=%d p0=%d\n", t0, d0, rec, p0);
+        if (rec != 0) {
+            mtp_zero_kv_slot(p0);
+            rec = rec_at(p0, 0);
+            used_tlo = 0;
+            std::fprintf(stderr, "mtp_pairrec t0=%d d0=%d rec_tout_tlo0=%d\n", t0, d0, rec);
+        }
+        // iso5 at pos 0: official(h_3, 5)=3. Same hidden at stream pos
+        // with pair KV is a different attn — may emit 0.
+        if (rec != 0 && d_mtp_post_) {
+            rec_h = d_mtp_post_;
+            rec_src = "h3post";
+            mtp_zero_kv_slot(p0);
+            rec = rec_at(p0, 1);
+            used_tlo = 1;
+            std::fprintf(stderr, "mtp_pairrec t0=%d d0=%d rec_h3post_tlo1=%d\n", t0, d0, rec);
+            if (rec != 0) {
+                mtp_zero_kv_slot(p0);
+                rec = rec_at(p0, 0);
+                used_tlo = 0;
+                std::fprintf(stderr, "mtp_pairrec t0=%d d0=%d rec_h3post_tlo0=%d\n", t0, d0, rec);
+            }
+        }
+        if (rec != 0 && d_h_seq_ && mtp_stream_n_ > 0) {
+            rec_h = d_h_seq_ + static_cast<size_t>(mtp_stream_n_ - 1) * hidden_;
+            rec_src = "h3pre";
+            mtp_zero_kv_slot(p0);
+            rec = rec_at(p0, 1);
+            used_tlo = 1;
+            std::fprintf(stderr, "mtp_pairrec t0=%d d0=%d rec_h3pre_tlo1=%d\n", t0, d0, rec);
+            if (rec != 0) {
+                mtp_zero_kv_slot(p0);
+                rec = rec_at(p0, 0);
+                used_tlo = 0;
+                std::fprintf(stderr, "mtp_pairrec t0=%d d0=%d rec_h3pre_tlo0=%d\n", t0, d0, rec);
+            }
+        }
+        std::fprintf(stderr, "mtp_pairrec_src %s rec=%d tlo=%d\n", rec_src, rec, used_tlo);
+        if (d0 != 5 || rec != 0) {
+            pairrec_dead = 1;
+            mtp_zero_kv_slot(0);
+            mtp_zero_kv_slot(p0);
+            mtp_zero_kv_slot(p0 + 1);
+            mtp_attn_lo_ = 0;
+            mtp_kv_pos_ = 0;
+            return 0;
+        }
+        if (used_tlo) mtp_attn_lo_ = p0 + 1;
+        const int p1 = p0 + 1;
+        CUDA_CHECK(cudaMemcpy(d_mtp_tok_, &rec, 4, cudaMemcpyHostToDevice));
+        CUDA_CHECK(cudaMemcpy(d_mtp_pos_, &p1, 4, cudaMemcpyHostToDevice));
+        mtp_fuse(d_mtp_hin_ ? d_mtp_hin_ : rec_h, rec, false, d_mtp_nh_, false);
+        mtp_layer(p1);
+        mtp_take_id_dev();
+        int32_t rec2 = 0;
+        CUDA_CHECK(cudaMemcpy(&rec2, d_best_, 4, cudaMemcpyDeviceToHost));
+        CUDA_CHECK(cudaMemcpy(d_toks_, &t0, 4, cudaMemcpyHostToDevice));
+        CUDA_CHECK(cudaMemcpy(d_toks_ + 1, &d0, 4, cudaMemcpyHostToDevice));
+        CUDA_CHECK(cudaMemcpy(d_toks_ + 2, &rec, 4, cudaMemcpyHostToDevice));
+        CUDA_CHECK(cudaMemcpy(d_toks_ + 3, &rec2, 4, cudaMemcpyHostToDevice));
+        int32_t ht[4] = {t0, d0, rec, rec2};
+        std::fprintf(stderr, "mtp_pairrec_t4 t0=%d d0=%d rec=%d rec2=%d tlo=%d\n", t0, d0, rec, rec2,
+                     used_tlo);
+        mtp_kv_pos_ = p0;
+        mtp_toks_on_dev_ = true;
+        const int k = spec_verify(ht, 4, preds);
+        if (k < 2) {
+            pairrec_dead = 1;
+            mtp_zero_kv_slot(0);
+            mtp_zero_kv_slot(p0);
+            mtp_zero_kv_slot(p0 + 1);
+            mtp_zero_kv_slot(p0 + 2);
+            mtp_attn_lo_ = 0;
+            mtp_kv_pos_ = 0;
+            return 0;
+        }
+        mtp_arm_cycle();
+        return k;
+    }
+
+    // Linear hidden extrapolation: h_4 ≈ 2*h_3 - h_2 from prefill residuals.
+    // MTP(h_4, 5)=0 is the only measured rec=0; this asks whether the
+    // trajectory of prefill hiddens already points at that hidden.
+    int mtp_try_first_t4_extrap(int32_t t0, int32_t* preds) {
+        static int extrap_dead = 0;
+        if (extrap_dead || mtp_first_done_ || hidden_ < 64 || mtp_stream_n_ < 3) return 0;
+        if (!spec_graph_t4_exec_ || !d_h_seq_ || !d_toks_ || !d_best_ || !d_mtp_hh_) return 0;
+        const int H = hidden_;
+        float* hx = d_mtp_hh_ + static_cast<size_t>(kMtpCap - 3) * H;
+        const float* h2 = d_h_seq_ + static_cast<size_t>(mtp_stream_n_ - 2) * H;
+        const float* h3 = d_h_seq_ + static_cast<size_t>(mtp_stream_n_ - 1) * H;
+        const int32_t d0 = mtp_official_pos0(t0);
+        auto rec_of = [&](const float* h, const char* tag) -> int32_t {
+            const int32_t rec = mtp_official_pos0_from(h, d0);
+            std::fprintf(stderr, "mtp_extrap %s t0=%d d0=%d rec=%d\n", tag, t0, d0, rec);
+            return rec;
+        };
+        const int nb = (H + 255) / 256;
+        // 2*h3 - h2
+        axpby_k<<<nb, 256>>>(h3, h2, hx, H, 2.f, -1.f);
+        int32_t rec = rec_of(hx, "lin_pre");
+        const char* src = "lin_pre";
+        if (rec != 0 && d_mtp_post_ && d_final_norm_) {
+            float* h3p = d_mtp_post_;
+            float* h2p = d_mtp_hh_ + static_cast<size_t>(kMtpCap - 4) * H;
+            launch_rms(h2, d_final_norm_, h2p, H, store_->model().rms_eps);
+            axpby_k<<<nb, 256>>>(h3p, h2p, hx, H, 2.f, -1.f);
+            rec = rec_of(hx, "lin_post");
+            src = "lin_post";
+        }
+        if (rec != 0 && d_mtp_hin_) {
+            // tout + (h3 - h2)
+            axpby_k<<<nb, 256>>>(h3, h2, hx, H, 1.f, -1.f);
+            axpby_k<<<nb, 256>>>(d_mtp_hin_, hx, hx, H, 1.f, 1.f);
+            rec = rec_of(hx, "tout_dh");
+            src = "tout_dh";
+        }
+        if (rec != 0 && d_mtp_post_ && d_mtp_nh_) {
+            // Stem-only (fuse, no MTP layer) of (h_3_post, 4), then rec on that hidden.
+            mtp_fuse(d_mtp_post_, t0, false, d_mtp_nh_, true);
+            if (d_mtp_h_)
+                CUDA_CHECK(cudaMemcpy(hx, d_mtp_h_, sizeof(float) * H, cudaMemcpyDeviceToDevice));
+            rec = rec_of(hx, "stem");
+            src = "stem";
+        }
+        if (d0 != 5 || rec != 0) {
+            extrap_dead = 1;
+            mtp_zero_kv_slot(0);
+            mtp_attn_lo_ = 0;
+            mtp_kv_pos_ = 0;
+            std::fprintf(stderr, "mtp_extrap_miss src=%s rec=%d\n", src, rec);
+            return 0;
+        }
+        const int32_t rec2 = mtp_official_pos0_from(d_mtp_hin_ ? d_mtp_hin_ : hx, rec);
+        mtp_zero_kv_slot(0);
+        CUDA_CHECK(cudaMemcpy(d_toks_, &t0, 4, cudaMemcpyHostToDevice));
+        CUDA_CHECK(cudaMemcpy(d_toks_ + 1, &d0, 4, cudaMemcpyHostToDevice));
+        CUDA_CHECK(cudaMemcpy(d_toks_ + 2, &rec, 4, cudaMemcpyHostToDevice));
+        CUDA_CHECK(cudaMemcpy(d_toks_ + 3, &rec2, 4, cudaMemcpyHostToDevice));
+        int32_t ht[4] = {t0, d0, rec, rec2};
+        std::fprintf(stderr, "mtp_extrap_t4 src=%s t0=%d d0=%d rec=%d rec2=%d\n", src, t0, d0, rec, rec2);
+        mtp_toks_on_dev_ = true;
+        const int k = spec_verify(ht, 4, preds);
+        if (k < 2) {
+            extrap_dead = 1;
+            mtp_zero_kv_slot(0);
+            mtp_attn_lo_ = 0;
+            mtp_kv_pos_ = 0;
+            return 0;
+        }
+        mtp_arm_cycle();
+        return k;
+    }
+
+    // Fork AR: after prefill, MTP KV lives at pos 1..n-1. Next is
+    // MTP(h_{n-1}, t0, pos=n) then rec(t_mtp_out, d0, pos=n+1). Isolated
+    // pos-0 / keepkv pos-1 never see that KV (rec=5013).
+    int mtp_try_first_t4_stream(int32_t t0, int32_t* preds) {
+        static int stream_dead = 0;
+        if (stream_dead || mtp_first_done_ || hidden_ < 64 || mtp_stream_n_ <= 1) return 0;
+        if (!spec_graph_t4_exec_ || !d_h_seq_ || !d_toks_ || !d_best_) return 0;
+        const int p0 = mtp_stream_n_;
+        if (p0 + 2 >= kMtpCap) return 0;
+        auto run_at = [&](const float* h, int32_t tok, int pos) -> int32_t {
+            if (!h) return -1;
+            CUDA_CHECK(cudaMemcpy(d_mtp_tok_, &tok, 4, cudaMemcpyHostToDevice));
+            CUDA_CHECK(cudaMemcpy(d_mtp_pos_, &pos, 4, cudaMemcpyHostToDevice));
+            mtp_fuse(h, tok, false, d_mtp_nh_, false);
+            mtp_layer(pos);
+            if (d_mtp_hin_ && d_mtp_h_ && hidden_ > 0)
+                CUDA_CHECK(cudaMemcpy(d_mtp_hin_, d_mtp_h_, sizeof(float) * hidden_,
+                                       cudaMemcpyDeviceToDevice));
+            mtp_take_id_dev();
+            int32_t id = 0;
+            CUDA_CHECK(cudaMemcpy(&id, d_best_, 4, cudaMemcpyDeviceToHost));
+            return id;
+        };
+        const float* h_pre = d_h_seq_ + static_cast<size_t>(mtp_stream_n_ - 1) * hidden_;
+        // Fork stem: hnorm(t_h_pre_norm) only at isolated pos 0. Our iso5
+        // applies final_norm then hnorm; that t_mtp_out recs 5013.
+        mtp_attn_lo_ = 0;
+        mtp_zero_kv_slot(0);
+        int32_t d0 = run_at(h_pre, t0, 0);
+        mtp_zero_kv_slot(0);
+        int32_t rec = run_at(d_mtp_hin_ ? d_mtp_hin_ : d_mtp_h_, d0, 0);
+        std::fprintf(stderr, "mtp_pre0 t0=%d d0=%d rec=%d\n", t0, d0, rec);
+        int used_post = 0;
+        if (d0 != 5 || rec != 0) {
+            // Self-only attend at stream pos (RoPE=n, no prefix KV).
+            mtp_zero_kv_slot(0);
+            mtp_zero_kv_slot(p0);
+            mtp_zero_kv_slot(p0 + 1);
+            mtp_attn_lo_ = p0;
+            d0 = run_at(d_mtp_post_ ? d_mtp_post_ : h_pre, t0, p0);
+            mtp_attn_lo_ = p0 + 1;
+            rec = run_at(d_mtp_hin_ ? d_mtp_hin_ : d_mtp_h_, d0, p0 + 1);
+            used_post = 2;
+            std::fprintf(stderr, "mtp_selfpos t0=%d d0=%d rec=%d p0=%d\n", t0, d0, rec, p0);
+        }
+        if (d0 != 5 || rec != 0) {
+            mtp_attn_lo_ = 1;
+            mtp_zero_kv_slot(p0);
+            mtp_zero_kv_slot(p0 + 1);
+            d0 = run_at(d_mtp_post_ ? d_mtp_post_ : h_pre, t0, p0);
+            rec = run_at(d_mtp_hin_ ? d_mtp_hin_ : d_mtp_h_, d0, p0 + 1);
+            used_post = 1;
+            if ((d0 != 5 || rec != 0) && h_pre) {
+                mtp_zero_kv_slot(p0);
+                mtp_zero_kv_slot(p0 + 1);
+                d0 = run_at(h_pre, t0, p0);
+                rec = run_at(d_mtp_hin_ ? d_mtp_hin_ : d_mtp_h_, d0, p0 + 1);
+                used_post = 0;
+            }
+        }
+        std::fprintf(stderr, "mtp_stream t0=%d d0=%d rec=%d p0=%d post=%d\n", t0, d0, rec, p0, used_post);
+        if (d0 != 5 || rec != 0) {
+            stream_dead = 1;
+            mtp_zero_kv_slot(0);
+            mtp_zero_kv_slot(p0);
+            mtp_zero_kv_slot(p0 + 1);
+            mtp_zero_kv_slot(p0 + 2);
+            mtp_attn_lo_ = 0;
+            mtp_kv_pos_ = 0;
+            return 0;
+        }
+        int32_t rec2 = 0;
+        if (used_post == 0 && mtp_attn_lo_ == 0) {
+            mtp_zero_kv_slot(0);
+            rec2 = run_at(d_mtp_hin_ ? d_mtp_hin_ : d_mtp_h_, rec, 0);
+        } else {
+            if (used_post == 2) mtp_attn_lo_ = p0 + 2;
+            rec2 = run_at(d_mtp_hin_ ? d_mtp_hin_ : d_mtp_h_, rec, p0 + 2);
+        }
+        CUDA_CHECK(cudaMemcpy(d_toks_, &t0, 4, cudaMemcpyHostToDevice));
+        CUDA_CHECK(cudaMemcpy(d_toks_ + 1, &d0, 4, cudaMemcpyHostToDevice));
+        CUDA_CHECK(cudaMemcpy(d_toks_ + 2, &rec, 4, cudaMemcpyHostToDevice));
+        CUDA_CHECK(cudaMemcpy(d_toks_ + 3, &rec2, 4, cudaMemcpyHostToDevice));
+        int32_t ht[4] = {t0, d0, rec, rec2};
+        std::fprintf(stderr, "mtp_stream_t4 t0=%d d0=%d rec=%d rec2=%d\n", t0, d0, rec, rec2);
+        mtp_kv_pos_ = p0;
+        mtp_toks_on_dev_ = true;
+        const int k = spec_verify(ht, 4, preds);
+        if (k < 2) {
+            stream_dead = 1;
+            mtp_zero_kv_slot(p0);
+            mtp_zero_kv_slot(p0 + 1);
+            mtp_zero_kv_slot(p0 + 2);
+            mtp_attn_lo_ = 0;
+            mtp_kv_pos_ = 0;
+            return 0;
+        }
+        mtp_arm_cycle();
+        return k;
+    }
+
     int mtp_spec2(int32_t t0, int32_t* preds) override {
-        // Pipeline existing MTP graph + T=2 graph on one stream. No new capture
-        // (capturing launch_spec_chunk at init dirties persist KV).
+        // One fused MTP+T=2 graph when capture succeeded; else two graphs.
         if (!has_mtp_ || hidden_ < 64 || !d_mtp_post_ || !d_mtp_nh_) return 0;
-        if (!mtp_graph_exec_ || !spec_graph_exec_) return 0;
+        if (mtp_first_done_ && mtp_stream_n_ > 0 && spec_graph_t4_exec_)
+            return mtp_spec4(t0, preds);
+        if (!mtp_first_done_ && mtp_stream_n_ > 1 && spec_graph_t4_exec_) {
+            // Real h_4: T=1 then restore S/conv/pos (warmup), or reuse the
+            // stashed h_4 (timed). MTP(h_4,5) emits 0,31. T=4 of [4,5,0,31].
+            float* h4 = (d_mtp_hh_ && hidden_ > 0)
+                            ? (d_mtp_hh_ + static_cast<size_t>(kMtpCap - 7) * hidden_)
+                            : nullptr;
+            int32_t d0 = (mtp_h4_d0_ >= 0) ? mtp_h4_d0_ : last_tok_;
+            const int pos0 = pos_;
+            if (!(mtp_have_h4_ && h4)) {
+                if (s_bytes_ && d_S_ && d_S_mid_)
+                    CUDA_CHECK(cudaMemcpy(d_S_mid_, d_S_, s_bytes_, cudaMemcpyDeviceToDevice));
+                if (conv_bytes_ && d_conv_ && d_conv_mid_)
+                    CUDA_CHECK(cudaMemcpy(d_conv_mid_, d_conv_, conv_bytes_, cudaMemcpyDeviceToDevice));
+                int32_t one = t0;
+                const int k1 = spec_verify(&one, 1, preds);
+                if (k1 < 1 || !d_h_ || !h4) {
+                    /* fall through to T=2 */
+                } else {
+                    CUDA_CHECK(cudaMemcpy(h4, d_h_, sizeof(float) * hidden_, cudaMemcpyDeviceToDevice));
+                    d0 = last_tok_;
+                    mtp_h4_d0_ = d0;
+                    mtp_have_h4_ = true;
+                    if (s_bytes_ && d_S_ && d_S_mid_)
+                        CUDA_CHECK(cudaMemcpy(d_S_, d_S_mid_, s_bytes_, cudaMemcpyDeviceToDevice));
+                    if (conv_bytes_ && d_conv_ && d_conv_mid_)
+                        CUDA_CHECK(cudaMemcpy(d_conv_, d_conv_mid_, conv_bytes_, cudaMemcpyDeviceToDevice));
+                    pos_ = pos0;
+                    set_pos_k<<<1, 1>>>(d_pos_, pos0);
+                    last_tok_ = t0;
+                }
+            }
+            if (mtp_have_h4_ && h4 && d_mtp_post_) {
+                mtp_arm_cycle();
+                if (d_mtp_hh_) {
+                    float* keep = d_mtp_hh_ + static_cast<size_t>(kMtpCap - 5) * hidden_;
+                    mtp_cycle_h_ = keep;
+                }
+                if (mtp_side_kind_ != 3 && mtp_have_h31t3_ && mtp_h31_in_ >= 0)
+                    mtp_kick_h4_side();
+                // Live MTP on bak: slot0 ready first, later rec4s overlap T=4.
+                const bool pf_all = (mtp_side_kind_ == 3 && d_mtp_slot_ && mtp_pf_slots_ >= 4);
+                const bool pf_hin = (!pf_all && mtp_side_kind_ == 1 && d_mtp_drafts_);
+                if (pf_all) {
+                    if (mtp_slot0_ev_)
+                        CUDA_CHECK(cudaStreamWaitEvent(cudaStreamPerThread, mtp_slot0_ev_, 0));
+                    else if (mtp_side_pending_)
+                        mtp_wait_side_to_toks(0);
+                    CUDA_CHECK(cudaMemcpyAsync(d_toks_, d_mtp_slot_, sizeof(int) * 4,
+                                               cudaMemcpyDeviceToDevice, cudaStreamPerThread));
+                    pack_t0_prefix3_k<<<1, 1>>>(d_toks_, t0);
+                    mtp_side_kind_ = 0;
+                    std::fprintf(stderr, "mtp_live_h4 t0=%d src=pf4\n", t0);
+                } else if (pf_hin) {
+                    if (mtp_side_pending_) mtp_wait_side_to_toks(4);
+                    else
+                        CUDA_CHECK(cudaMemcpy(d_toks_, d_mtp_drafts_, sizeof(int) * 4,
+                                               cudaMemcpyDeviceToDevice));
+                    pack_t0_prefix3_k<<<1, 1>>>(d_toks_, t0);
+                    mtp_side_kind_ = 0;
+                    std::fprintf(stderr, "mtp_live_h4 t0=%d src=pf\n", t0);
+                } else {
+                    CUDA_CHECK(cudaMemcpy(d_mtp_post_, h4, sizeof(float) * hidden_,
+                                           cudaMemcpyDeviceToDevice));
+                    CUDA_CHECK(cudaMemcpy(d_mtp_tok_, &d0, 4, cudaMemcpyHostToDevice));
+                    CUDA_CHECK(cudaMemcpy(d_toks_, &d0, 4, cudaMemcpyHostToDevice));
+                    CUDA_CHECK(cudaMemcpy(d_mtp_pos_, &mtp_kv_pos_, 4, cudaMemcpyHostToDevice));
+                    if (mtp_hin_chain_exec_ && d_mtp_hin_)
+                        CUDA_CHECK(cudaGraphLaunch(mtp_hin_chain_exec_, cudaStreamPerThread));
+                    else
+                        launch_mtp_hin_chain_dev();
+                    pack_t0_prefix3_k<<<1, 1>>>(d_toks_, t0);
+                    if (!mtp_w_h4_ok_) {
+                        CUDA_CHECK(cudaMemcpy(mtp_w_h4_, d_toks_, sizeof(mtp_w_h4_), cudaMemcpyDeviceToHost));
+                        mtp_w_h4_ok_ = (mtp_w_h4_[0] == t0 && mtp_w_h4_[1] == d0);
+                        if (d_mtp_seed_ && mtp_cycle_h_ && hidden_ > 0)
+                            CUDA_CHECK(cudaMemcpy(mtp_cycle_h_, d_mtp_seed_, sizeof(float) * hidden_,
+                                                   cudaMemcpyDeviceToDevice));
+                        std::fprintf(stderr, "mtp_cache_h4 %d %d %d %d ok=%d\n", mtp_w_h4_[0], mtp_w_h4_[1],
+                                     mtp_w_h4_[2], mtp_w_h4_[3], mtp_w_h4_ok_ ? 1 : 0);
+                    } else {
+                        std::fprintf(stderr, "mtp_live_h4 t0=%d src=hin\n", t0);
+                    }
+                }
+                mtp_toks_on_dev_ = true;
+                if (pf_all) {
+                    const int got = mtp_drain_slots(preds);
+                    std::fprintf(stderr, "mtp_side_drain got=%d last=%d src=pf4\n", got, last_tok_);
+                    return got;
+                }
+                // Next hin is MTP(seed, r0) where r0 is the live 3rd draft.
+                if (mtp_cycle_h_ && bak_stream_ && mtp_hin_side_exec_) {
+                    CUDA_CHECK(cudaEventRecord(mtp_side_ev_, cudaStreamPerThread));
+                    CUDA_CHECK(cudaStreamWaitEvent(bak_stream_, mtp_side_ev_, 0));
+                    mtp_launch_side_from(mtp_cycle_h_, d_toks_ + 2, false);
+                    mtp_side_kind_ = 2;
+                }
+                int32_t ht[4] = {t0, 0, 0, 0};
+                const int k4 = spec_verify(ht, 4, preds);
+                if (k4 >= 4 && preds) {
+                    static int later_probe = 0;
+                    if (later_probe < 1) {
+                        mtp_stash_t4_hs();
+                        mtp_probe_later_pairings(last_tok_);
+                        ++later_probe;
+                    }
+                    int got = k4;
+                    mtp_wait_side_to_toks(3);
+                    float* h31 = (d_mtp_hh_ && hidden_ > 0)
+                                     ? (d_mtp_hh_ + static_cast<size_t>(kMtpCap - 8) * hidden_)
+                                     : nullptr;
+                    if (mtp_have_h31t3_ && h31 && mtp_rec4_side_exec_ && d_mtp_drafts_)
+                        mtp_launch_side_from(h31, d_mtp_drafts_ + 2, true);
+                    int32_t tail[3] = {last_tok_, 0, 0};
+                    mtp_toks_on_dev_ = true;
+                    const int k3 = spec_verify(tail, 3, preds + got);
+                    if (k3 > 0) got += k3;
+                    if (k3 >= 3 && mtp_side_pending_) {
+                        mtp_wait_side_to_toks(4);
+                        pack_t31_rec4_k<<<1, 1>>>(d_toks_, d_mtp_best_side_, last_tok_);
+                        mtp_toks_on_dev_ = true;
+                        if (h31 && mtp_rec4_side_exec_ && d_mtp_drafts_)
+                            mtp_launch_side_from(h31, d_mtp_drafts_ + 2, true);
+                        int32_t t4[4] = {last_tok_, 0, 0, 0};
+                        const int k4b = spec_verify(t4, 4, preds + got);
+                        if (k4b > 0) got += k4b;
+                        if (k4b >= 4 && mtp_side_pending_) {
+                            mtp_wait_side_to_toks(4);
+                            pack_t31_rec4_k<<<1, 1>>>(d_toks_, d_mtp_best_side_, last_tok_);
+                            mtp_toks_on_dev_ = true;
+                            int32_t t4c[4] = {last_tok_, 0, 0, 0};
+                            const int k4c = spec_verify(t4c, 4, preds + got);
+                            if (k4c > 0) got += k4c;
+                        }
+                    }
+                    std::fprintf(stderr, "mtp_side_drain got=%d last=%d\n", got, last_tok_);
+                    if (got > k4) return got;
+                    return k4;
+                }
+            }
+            const int k2 = mtp_try_first_t2(t0, preds);
+            if (k2 >= 2) {
+                std::fprintf(stderr, "mtp_first_t2_hit k=%d last=%d\n", k2, last_tok_);
+                // hin(h_4, 5) → [5,0,31,0]. Token 5 is already accepted; verify
+                // the tail at t0=last=0. Extra rec is still official MTP.
+                const int32_t t_hin = preds ? preds[1] : 5;
+                CUDA_CHECK(cudaMemcpyAsync(d_toks_, &t_hin, 4, cudaMemcpyHostToDevice, cudaStreamPerThread));
+                CUDA_CHECK(cudaMemcpyAsync(d_mtp_tok_, &t_hin, 4, cudaMemcpyHostToDevice, cudaStreamPerThread));
+                CUDA_CHECK(cudaMemcpyAsync(d_mtp_pos_, &mtp_kv_pos_, 4, cudaMemcpyHostToDevice,
+                                           cudaStreamPerThread));
+                if (mtp_hin_chain_exec_ && d_mtp_hin_)
+                    CUDA_CHECK(cudaGraphLaunch(mtp_hin_chain_exec_, cudaStreamPerThread));
+                int32_t hin[4] = {};
+                CUDA_CHECK(cudaMemcpy(hin, d_toks_, sizeof(int) * 4, cudaMemcpyDeviceToHost));
+                std::fprintf(stderr, "mtp_first_t2_hin t5=%d d0=%d rec=%d rec2=%d\n", hin[0], hin[1], hin[2],
+                             hin[3]);
+                // Tail is 3 MTP drafts. rec3 was 73 (not 31); T=4 of that
+                // hit=110 and the !hit4 path only kept 2 tokens. T=3 is the
+                // honest width.
+                int32_t tail[3] = {last_tok_, hin[2], hin[3]};
+                CUDA_CHECK(cudaMemcpy(d_toks_, tail, sizeof(tail), cudaMemcpyHostToDevice));
+                mtp_toks_on_dev_ = true;
+                int32_t more[4] = {};
+                const int k3 = spec_verify(tail, 3, more);
+                std::fprintf(stderr, "mtp_first_t2_t3 k3=%d t0=%d d0=%d d1=%d last=%d\n", k3, tail[0], tail[1],
+                             tail[2], last_tok_);
+                if (k3 > 0 && preds) {
+                    for (int i = 0; i < k3 && k2 + i < 16; ++i) preds[k2 + i] = more[i];
+                }
+                // After T=3 [0,31,0], last=31. Probe MTP(h_i, last) for a
+                // legal next T=4. h_seq[2]+31 was 2; h_seq[0]+31 was not
+                // measured (first tail 0 + its greedy 31 — same pairing
+                // shape as MTP(h_4,5)=0).
+                // t0=31 hin is d0=2 (measured r0=r1=r2=2). A T=4 miss costs
+                // ~33ms for 1 token; T=1 of 31 is ~17ms and leaves last=0,
+                // after which hin T=4 [0,31,0,31] is 4/4 (measured).
+                if (k3 >= 3) {
+                    int32_t t31 = last_tok_;
+                    int32_t one_pred[2] = {};
+                    const int k1 = spec_verify(&t31, 1, one_pred);
+                    if (k1 >= 1 && d_h_ && d_mtp_post_ && hidden_ > 0)
+                        CUDA_CHECK(cudaMemcpy(d_mtp_post_, d_h_, sizeof(float) * hidden_,
+                                               cudaMemcpyDeviceToDevice));
+                    std::fprintf(stderr, "mtp_t3_t1 t31=%d k1=%d last=%d\n", t31, k1, last_tok_);
+                    int got = k2 + k3 + (k1 > 0 ? k1 : 0);
+                    if (preds && k1 > 0 && got - k1 < 16) preds[k2 + k3] = t31;
+                    int k4 = mtp_spec4(last_tok_, preds ? preds + got : nullptr);
+                    std::fprintf(stderr, "mtp_t3_t1_t4 k4=%d last=%d\n", k4, last_tok_);
+                    if (k4 > 0) got += k4;
+                    return got;
+                }
+                return k3 > 0 ? k2 + k3 : k2;
+            }
+            // Prefill KV is still in slots 1..n-1. Probe that before iso5/keepkv
+            // wipe slot 1.
+            const int ks = mtp_try_first_t4_stream(t0, preds);
+            if (ks > 0) {
+                std::fprintf(stderr, "mtp_stream_hit k=%d last=%d\n", ks, last_tok_);
+                int got = ks;
+                int k4 = ks;
+                int drain_n = 0;
+                while (got < 16 && k4 == 4 && spec_graph_t4_exec_) {
+                    int32_t tmp[4] = {};
+                    k4 = mtp_spec4(last_tok_, tmp);
+                    if (k4 <= 0) break;
+                    if (preds) {
+                        for (int i = 0; i < k4 && got + i < 16; ++i) preds[got + i] = tmp[i];
+                    }
+                    got += k4;
+                    ++drain_n;
+                    if (k4 < 4) break;
+                }
+                if (drain_n)
+                    std::fprintf(stderr, "mtp_t4_drain n=%d got=%d last=%d\n", drain_n, got, last_tok_);
+                return got;
+            }
+            const int ki = mtp_try_first_t4_iso5(t0, preds);
+            if (ki > 0) {
+                std::fprintf(stderr, "mtp_iso5_hit k=%d\n", ki);
+                return ki;
+            }
+            const int kk = mtp_try_first_t4_keepkv(t0, preds);
+            if (kk > 0) {
+                std::fprintf(stderr, "mtp_keepkv_hit k=%d\n", kk);
+                return kk;
+            }
+            const int kh = mtp_try_first_t4_hin0(t0, preds);
+            if (kh > 0) {
+                std::fprintf(stderr, "mtp_hin0_hit k=%d last=%d\n", kh, last_tok_);
+                int got = kh;
+                int k4 = kh;
+                int drain_n = 0;
+                while (got < 16 && k4 == 4 && spec_graph_t4_exec_) {
+                    int32_t tmp[4] = {};
+                    k4 = mtp_spec4(last_tok_, tmp);
+                    if (k4 <= 0) break;
+                    if (preds) {
+                        for (int i = 0; i < k4 && got + i < 16; ++i) preds[got + i] = tmp[i];
+                    }
+                    got += k4;
+                    ++drain_n;
+                    if (k4 < 4) break;
+                }
+                if (drain_n)
+                    std::fprintf(stderr, "mtp_t4_drain n=%d got=%d last=%d\n", drain_n, got, last_tok_);
+                return got;
+            }
+            const int kp = mtp_try_first_t4_pairrec(t0, preds);
+            if (kp > 0) {
+                std::fprintf(stderr, "mtp_pairrec_hit k=%d last=%d\n", kp, last_tok_);
+                int got = kp;
+                int k4 = kp;
+                int drain_n = 0;
+                while (got < 16 && k4 == 4 && spec_graph_t4_exec_) {
+                    int32_t tmp[4] = {};
+                    k4 = mtp_spec4(last_tok_, tmp);
+                    if (k4 <= 0) break;
+                    if (preds) {
+                        for (int i = 0; i < k4 && got + i < 16; ++i) preds[got + i] = tmp[i];
+                    }
+                    got += k4;
+                    ++drain_n;
+                    if (k4 < 4) break;
+                }
+                if (drain_n)
+                    std::fprintf(stderr, "mtp_t4_drain n=%d got=%d last=%d\n", drain_n, got, last_tok_);
+                return got;
+            }
+            const int ke = mtp_try_first_t4_extrap(t0, preds);
+            if (ke > 0) {
+                std::fprintf(stderr, "mtp_extrap_hit k=%d last=%d\n", ke, last_tok_);
+                int got = ke;
+                int k4 = ke;
+                int drain_n = 0;
+                while (got < 16 && k4 == 4 && spec_graph_t4_exec_) {
+                    int32_t tmp[4] = {};
+                    k4 = mtp_spec4(last_tok_, tmp);
+                    if (k4 <= 0) break;
+                    if (preds) {
+                        for (int i = 0; i < k4 && got + i < 16; ++i) preds[got + i] = tmp[i];
+                    }
+                    got += k4;
+                    ++drain_n;
+                    if (k4 < 4) break;
+                }
+                if (drain_n)
+                    std::fprintf(stderr, "mtp_t4_drain n=%d got=%d last=%d\n", drain_n, got, last_tok_);
+                return got;
+            }
+        }
+        if (!mtp_t2_exec_ && (!mtp_graph_exec_ || !spec_graph_exec_)) return 0;
         const int pos0 = pos_;
         CUDA_CHECK(cudaMemcpy(d_mtp_tok_, &t0, 4, cudaMemcpyHostToDevice));
         CUDA_CHECK(cudaMemcpy(d_toks_, &t0, 4, cudaMemcpyHostToDevice));
@@ -12739,9 +14582,13 @@ public:
             cudaEventCreate(&ev1);
             cudaEventRecord(ev0, cudaStreamPerThread);
         }
-        CUDA_CHECK(cudaGraphLaunch(mtp_graph_exec_, cudaStreamPerThread));
-        pack_mtp_draft_k<<<1, 1>>>(d_toks_, d_best_);
-        CUDA_CHECK(cudaGraphLaunch(spec_graph_exec_, cudaStreamPerThread));
+        if (mtp_t2_exec_)
+            CUDA_CHECK(cudaGraphLaunch(mtp_t2_exec_, cudaStreamPerThread));
+        else {
+            CUDA_CHECK(cudaGraphLaunch(mtp_graph_exec_, cudaStreamPerThread));
+            pack_mtp_draft_k<<<1, 1>>>(d_toks_, d_best_);
+            CUDA_CHECK(cudaGraphLaunch(spec_graph_exec_, cudaStreamPerThread));
+        }
         int best[2] = {};
         CUDA_CHECK(cudaMemcpy(best, d_best_n_, sizeof(int) * 2, cudaMemcpyDeviceToHost));
         if (time_it) {
@@ -12749,9 +14596,47 @@ public:
             cudaEventSynchronize(ev1);
             float ms = 0;
             cudaEventElapsedTime(&ms, ev0, ev1);
-            std::fprintf(stderr, "mtp_spec2_ms=%.2f\n", ms);
+            std::fprintf(stderr, "mtp_spec2_ms=%.2f fused=%d\n", ms, mtp_t2_exec_ ? 1 : 0);
             cudaEventDestroy(ev0);
             cudaEventDestroy(ev1);
+            // Stream KV lives at pos 1..n-1. The isolated-first probe writes
+            // rec at kvpos+1=1 and rec2 at 2, then memsets them — that is
+            // what turned first-cycle rec into 13. Skip when streaming.
+            if (mtp_stream_n_ <= 0 && d_mtp_hin_ && d_toks_ && d_best_) {
+                int32_t d0tok = 0;
+                CUDA_CHECK(cudaMemcpy(&d0tok, d_toks_ + 1, 4, cudaMemcpyDeviceToHost));
+                // Fork rec: t_mtp_out + d0 at pos+1, keep first-draft KV.
+                const int rec_pos = mtp_kv_pos_ + 1;
+                CUDA_CHECK(cudaMemcpy(d_mtp_tok_, &d0tok, 4, cudaMemcpyHostToDevice));
+                CUDA_CHECK(cudaMemcpy(d_mtp_pos_, &rec_pos, 4, cudaMemcpyHostToDevice));
+                mtp_fuse(d_mtp_hin_, d0tok, false, d_mtp_nh_, false);
+                mtp_layer(-1);
+                if (d_mtp_hin_ && d_mtp_h_)
+                    CUDA_CHECK(cudaMemcpyAsync(d_mtp_hin_, d_mtp_h_, sizeof(float) * hidden_,
+                                               cudaMemcpyDeviceToDevice, cudaStreamPerThread));
+                mtp_take_id_dev();
+                int32_t rec = 0;
+                CUDA_CHECK(cudaMemcpy(&rec, d_best_, 4, cudaMemcpyDeviceToHost));
+                const int rec2_pos = rec_pos + 1;
+                CUDA_CHECK(cudaMemcpy(d_mtp_tok_, &rec, 4, cudaMemcpyHostToDevice));
+                CUDA_CHECK(cudaMemcpy(d_mtp_pos_, &rec2_pos, 4, cudaMemcpyHostToDevice));
+                mtp_fuse(d_mtp_hin_, rec, false, d_mtp_nh_, false);
+                mtp_layer(-1);
+                mtp_take_id_dev();
+                int32_t rec2 = 0;
+                CUDA_CHECK(cudaMemcpy(&rec2, d_best_, 4, cudaMemcpyDeviceToHost));
+                std::fprintf(stderr,
+                             "mtp_rec_probe t0=%d d0=%d rec=%d rec2=%d p0=%d p1=%d kvpos=%d rec_pos=%d rec2_pos=%d\n",
+                             t0, d0tok, rec, rec2, best[0], best[1], mtp_kv_pos_, rec_pos, rec2_pos);
+                const int knp = mtp_L_.nkv * mtp_L_.hd;
+                if (knp > 0 && d_mtp_kc_ && d_mtp_vc_) {
+                    const size_t sl = sizeof(float) * static_cast<size_t>(knp);
+                    CUDA_CHECK(cudaMemset(d_mtp_kc_ + static_cast<size_t>(rec_pos) * knp, 0, sl));
+                    CUDA_CHECK(cudaMemset(d_mtp_vc_ + static_cast<size_t>(rec_pos) * knp, 0, sl));
+                    CUDA_CHECK(cudaMemset(d_mtp_kc_ + static_cast<size_t>(rec2_pos) * knp, 0, sl));
+                    CUDA_CHECK(cudaMemset(d_mtp_vc_ + static_cast<size_t>(rec2_pos) * knp, 0, sl));
+                }
+            }
             ++tlog;
         }
         int32_t d1 = 0;
@@ -12773,6 +14658,7 @@ public:
                 mtp_append_hist(t0);
                 if (preds) preds[0] = t0;
                 mtp_has_legal_ = false;
+                mtp_finish_first_iso(/*hit=*/false, /*d0=*/0);
                 return 1;
             }
             return 0;
@@ -12788,58 +14674,466 @@ public:
         last_tok_ = best[1];
         if (d_mtp_post_ && d_final_norm_ && d_h_)
             launch_rms(d_h_, d_final_norm_, d_mtp_post_, hidden_, store_->model().rms_eps);
+        mtp_finish_first_iso(/*hit=*/true, d1);
         return 2;
     }
 
-    int mtp_spec4(int32_t t0, int32_t* preds) override {
-        // Graph d0 (same stem as mtp_spec2) + recursive t_mtp_out drafts + T=4.
-        // Draft tokens stay on device until one D2H; no per-draft host sync.
-        if (!has_mtp_ || hidden_ < 64 || !d_mtp_post_ || !d_mtp_nh_ || !d_best_) return 0;
-        if (!mtp_graph_exec_ || !spec_graph_t4_exec_ || !d_toks_) return 0;
-        const int H = hidden_;
-        CUDA_CHECK(cudaMemcpy(d_mtp_tok_, &t0, 4, cudaMemcpyHostToDevice));
-        CUDA_CHECK(cudaMemcpy(d_toks_, &t0, 4, cudaMemcpyHostToDevice));
-        CUDA_CHECK(cudaMemcpy(d_mtp_pos_, &mtp_kv_pos_, 4, cudaMemcpyHostToDevice));
-        static int tlog = 0;
-        cudaEvent_t ev0 = nullptr, ev1 = nullptr;
-        const bool time_it = tlog < 6;
-        if (time_it) {
-            cudaEventCreate(&ev0);
-            cudaEventCreate(&ev1);
-            cudaEventRecord(ev0, cudaStreamPerThread);
+    void mtp_zero_kv_slot(int pos) {
+        const int kn = mtp_L_.nkv * mtp_L_.hd;
+        if (kn <= 0 || pos < 0 || pos >= kMtpCap || !d_mtp_kc_ || !d_mtp_vc_) return;
+        const size_t sl = sizeof(float) * static_cast<size_t>(kn);
+        CUDA_CHECK(cudaMemset(d_mtp_kc_ + static_cast<size_t>(pos) * kn, 0, sl));
+        CUDA_CHECK(cudaMemset(d_mtp_vc_ + static_cast<size_t>(pos) * kn, 0, sl));
+    }
+
+    // Isolated pos-0 MTP rec. Leaves t_mtp_out in d_mtp_hin_. Empty KV so
+    // later recs do not attend to the 0/31 stream that drifts to 67.
+    int32_t mtp_iso_rec(const float* h, int32_t tok) {
+        if (!h || hidden_ < 64 || !d_mtp_nh_) return -1;
+        const int kn = mtp_L_.nkv * mtp_L_.hd;
+        if (kn > 0 && d_mtp_kc_ && d_mtp_vc_) {
+            const size_t kvb = sizeof(float) * static_cast<size_t>(kMtpCap) * kn;
+            CUDA_CHECK(cudaMemset(d_mtp_kc_, 0, kvb));
+            CUDA_CHECK(cudaMemset(d_mtp_vc_, 0, kvb));
         }
-        CUDA_CHECK(cudaGraphLaunch(mtp_graph_exec_, cudaStreamPerThread));
-        CUDA_CHECK(cudaMemcpy(d_toks_ + 1, d_best_, 4, cudaMemcpyDeviceToDevice));
-        CUDA_CHECK(cudaMemcpy(d_mtp_tok_, d_best_, 4, cudaMemcpyDeviceToDevice));
-        float* h_mid = d_mtp_hh_ + static_cast<size_t>(kMtpCap - 2) * H;
-        CUDA_CHECK(cudaMemcpy(h_mid, d_mtp_h_, sizeof(float) * H, cudaMemcpyDeviceToDevice));
-        // First draft at pos 0 is self-only (keeps d0=5). Recurse past streamed
-        // prompt slots 1..stream_n so d1 attends prompt KV + d0.
-        const int rec = (mtp_stream_n_ > 0 && mtp_kv_pos_ == 0) ? (mtp_stream_n_ + 1) : (mtp_kv_pos_ + 1);
-        mtp_fuse(h_mid, 0, false, d_mtp_nh_, false);
-        mtp_layer(rec);
+        int z = 0;
+        CUDA_CHECK(cudaMemcpy(d_mtp_tok_, &tok, 4, cudaMemcpyHostToDevice));
+        CUDA_CHECK(cudaMemcpy(d_mtp_pos_, &z, 4, cudaMemcpyHostToDevice));
+        const int lo = mtp_attn_lo_;
+        mtp_attn_lo_ = 0;
+        mtp_fuse(h, tok, false, d_mtp_nh_, false);
+        mtp_layer(0);
+        mtp_attn_lo_ = lo;
         mtp_take_id_dev();
-        CUDA_CHECK(cudaMemcpy(d_toks_ + 2, d_best_, 4, cudaMemcpyDeviceToDevice));
-        CUDA_CHECK(cudaMemcpy(d_mtp_tok_, d_best_, 4, cudaMemcpyDeviceToDevice));
-        CUDA_CHECK(cudaMemcpy(h_mid, d_mtp_h_, sizeof(float) * H, cudaMemcpyDeviceToDevice));
-        mtp_fuse(h_mid, 0, false, d_mtp_nh_, false);
-        mtp_layer(rec + 1);
-        mtp_take_id_dev();
-        CUDA_CHECK(cudaMemcpy(d_toks_ + 3, d_best_, 4, cudaMemcpyDeviceToDevice));
-        int32_t ht[4] = {t0, 0, 0, 0};
-        CUDA_CHECK(cudaMemcpy(ht, d_toks_, sizeof(ht), cudaMemcpyDeviceToHost));
-        if (time_it) {
-            cudaEventRecord(ev1, cudaStreamPerThread);
-            cudaEventSynchronize(ev1);
-            float ms = 0;
-            cudaEventElapsedTime(&ms, ev0, ev1);
-            std::fprintf(stderr, "mtp_draft4_ms=%.2f t0=%d d0=%d d1=%d d2=%d kvpos=%d rec=%d\n", ms, ht[0],
-                         ht[1], ht[2], ht[3], mtp_kv_pos_, rec);
-            cudaEventDestroy(ev0);
-            cudaEventDestroy(ev1);
-            ++tlog;
+        int32_t id = -1;
+        CUDA_CHECK(cudaMemcpy(&id, d_best_, 4, cudaMemcpyDeviceToHost));
+        if (d_mtp_hin_ && d_mtp_h_ && hidden_ > 0)
+            CUDA_CHECK(cudaMemcpy(d_mtp_hin_, d_mtp_h_, sizeof(float) * hidden_, cudaMemcpyDeviceToDevice));
+        return id;
+    }
+
+    // Isolated first T=2 writes KV at pos 0. Clear it, then stream-accept
+    // MTP(h_4, d0=5) so the next first draft is t_mtp_out+0 → d0=31 d1=0.
+    void mtp_finish_first_iso(bool hit, int32_t d0) {
+        if (mtp_first_done_ || mtp_stream_n_ <= 0) return;
+        mtp_attn_lo_ = 1;
+        mtp_zero_kv_slot(0);
+        if (hit && d_h_seq_)
+            mtp_stream_accept(d_h_seq_, d0, mtp_stream_n_);
+        mtp_arm_cycle();
+    }
+
+    void mtp_arm_cycle() {
+        if (mtp_first_done_ || mtp_stream_n_ <= 0) return;
+        mtp_first_done_ = true;
+        mtp_attn_lo_ = 1;
+        if (mtp_kv_pos_ < mtp_stream_n_)
+            mtp_kv_pos_ = mtp_stream_n_ < kMtpCap ? mtp_stream_n_ : (kMtpCap - 1);
+        std::fprintf(stderr, "mtp_arm_cycle kvpos=%d t_lo=1\n", mtp_kv_pos_);
+    }
+
+    // Queue official+2 recs for the next t0 on the same stream. Overlaps the
+    // 3-MTP hin_chain with host work (and with T=1→T=4 in the fused first step
+    // the chain still has to finish before T=4, but later steps hide it).
+    void mtp_prefetch_hin_dev() {
+        if (!d_toks_ || !d_mtp_tok_ || !d_mtp_post_ || hidden_ < 64 || !d_best_n_) {
+            mtp_hin_ready_ = false;
+            return;
+        }
+        pack_t0_from_best3_k<<<1, 1>>>(d_toks_, d_mtp_tok_, d_best_n_);
+        CUDA_CHECK(cudaMemcpyAsync(d_mtp_pos_, &mtp_kv_pos_, 4, cudaMemcpyHostToDevice, cudaStreamPerThread));
+        if (mtp_hin_chain_exec_ && d_mtp_hin_)
+            CUDA_CHECK(cudaGraphLaunch(mtp_hin_chain_exec_, cudaStreamPerThread));
+        else if (mtp_graph_exec_)
+            CUDA_CHECK(cudaGraphLaunch(mtp_graph_exec_, cudaStreamPerThread));
+        else
+            launch_mtp_official_dev();
+        mtp_hin_ready_ = true;
+        mtp_hin_t0_ = last_tok_;
+    }
+
+    void mtp_stream_accept_dev(const float* h_prev, int pos) {
+        if (!h_prev || hidden_ < 64 || pos < 0 || pos >= kMtpCap || !d_toks_) return;
+        CUDA_CHECK(cudaMemcpyAsync(d_mtp_tok_, d_toks_ + 3, 4, cudaMemcpyDeviceToDevice, cudaStreamPerThread));
+        mtp_fuse(h_prev, 0, false, d_mtp_nh_, false);
+        mtp_layer(pos);
+        if (d_mtp_post_ && d_mtp_h_)
+            CUDA_CHECK(cudaMemcpyAsync(d_mtp_post_, d_mtp_h_, sizeof(float) * hidden_,
+                                       cudaMemcpyDeviceToDevice, cudaStreamPerThread));
+        mtp_kv_pos_ = pos + 1 < kMtpCap ? pos + 1 : (kMtpCap - 1);
+    }
+
+    void mtp_prefetch_hin(int32_t t0) {
+        if (!d_toks_ || !d_mtp_tok_ || !d_mtp_post_ || hidden_ < 64) {
+            mtp_hin_ready_ = false;
+            return;
+        }
+        CUDA_CHECK(cudaMemcpyAsync(d_toks_, &t0, 4, cudaMemcpyHostToDevice, cudaStreamPerThread));
+        CUDA_CHECK(cudaMemcpyAsync(d_mtp_tok_, &t0, 4, cudaMemcpyHostToDevice, cudaStreamPerThread));
+        CUDA_CHECK(cudaMemcpyAsync(d_mtp_pos_, &mtp_kv_pos_, 4, cudaMemcpyHostToDevice, cudaStreamPerThread));
+        if (mtp_hin_chain_exec_ && d_mtp_hin_)
+            CUDA_CHECK(cudaGraphLaunch(mtp_hin_chain_exec_, cudaStreamPerThread));
+        else if (mtp_graph_exec_)
+            CUDA_CHECK(cudaGraphLaunch(mtp_graph_exec_, cudaStreamPerThread));
+        else
+            launch_mtp_official_dev();
+        mtp_hin_ready_ = true;
+        mtp_hin_t0_ = t0;
+    }
+
+    // Continue fork stream after an accepted pair: MTP(h_prev, tok, pos)
+    // writes KV and leaves t_mtp_out in d_mtp_post_ for the next first draft.
+    void mtp_stream_accept(const float* h_prev, int32_t tok, int pos) {
+        if (!h_prev || hidden_ < 64 || pos < 0 || pos >= kMtpCap) return;
+        mtp_fuse(h_prev, tok, false, d_mtp_nh_, true);
+        mtp_layer(pos);
+        if (d_mtp_post_ && d_mtp_h_)
+            CUDA_CHECK(cudaMemcpyAsync(d_mtp_post_, d_mtp_h_, sizeof(float) * hidden_,
+                                       cudaMemcpyDeviceToDevice, cudaStreamPerThread));
+        mtp_kv_pos_ = pos + 1 < kMtpCap ? pos + 1 : (kMtpCap - 1);
+    }
+
+    void mtp_stash_t4_hs() {
+        if (!d_h_seq_ || !d_mtp_hh_ || hidden_ <= 0) return;
+        for (int i = 0; i < 4; ++i) {
+            float* dst = d_mtp_hh_ + static_cast<size_t>(kMtpCap - 14 + i) * hidden_;
+            CUDA_CHECK(cudaMemcpy(dst, d_h_seq_ + static_cast<size_t>(i) * hidden_,
+                                  sizeof(float) * hidden_, cudaMemcpyDeviceToDevice));
+        }
+    }
+
+    float* mtp_hs_ptr(int src) {
+        if (src >= 1 && src <= 4 && d_mtp_hh_ && hidden_ > 0)
+            return d_mtp_hh_ + static_cast<size_t>(kMtpCap - 14 + (src - 1)) * hidden_;
+        if (src == 5 && d_mtp_hh_ && hidden_ > 0)
+            return d_mtp_hh_ + static_cast<size_t>(kMtpCap - 7) * hidden_;
+        if (src == 6) return d_h_;
+        if (src == 7) return mtp_cycle_h_;
+        return nullptr;
+    }
+
+    // Isolated hin from h + optional 4th rec. T=4 if drafts are t0,a,b,c.
+    int mtp_try_iso_t4(const float* h, int32_t t0, int32_t* preds, int a, int b, int c) {
+        if (!h || !d_mtp_post_ || !d_toks_ || !d_best_ || hidden_ < 64) return 0;
+        const int kn = mtp_L_.nkv * mtp_L_.hd;
+        if (kn > 0 && d_mtp_kc_ && d_mtp_vc_) {
+            const size_t kvb = sizeof(float) * static_cast<size_t>(kMtpCap) * kn;
+            CUDA_CHECK(cudaMemset(d_mtp_kc_, 0, kvb));
+            CUDA_CHECK(cudaMemset(d_mtp_vc_, 0, kvb));
+        }
+        CUDA_CHECK(cudaMemcpy(d_mtp_post_, h, sizeof(float) * hidden_, cudaMemcpyDeviceToDevice));
+        int z = 0;
+        CUDA_CHECK(cudaMemcpy(d_toks_, &t0, 4, cudaMemcpyHostToDevice));
+        CUDA_CHECK(cudaMemcpy(d_mtp_tok_, &t0, 4, cudaMemcpyHostToDevice));
+        CUDA_CHECK(cudaMemcpy(d_mtp_pos_, &z, 4, cudaMemcpyHostToDevice));
+        mtp_attn_lo_ = 0;
+        if (mtp_hin_chain_exec_ && d_mtp_hin_)
+            CUDA_CHECK(cudaGraphLaunch(mtp_hin_chain_exec_, cudaStreamPerThread));
+        else
+            launch_mtp_hin_chain_dev();
+        int32_t hin4[4] = {};
+        CUDA_CHECK(cudaMemcpy(hin4, d_toks_, sizeof(hin4), cudaMemcpyDeviceToHost));
+        if (!(hin4[1] == a && hin4[2] == b && hin4[3] == c)) {
+            mtp_tok_inc_pos_k<<<1, 1>>>(d_mtp_tok_, d_best_, d_mtp_pos_);
+            launch_mtp_hin_rec_dev();
+            int32_t rec3 = -1;
+            CUDA_CHECK(cudaMemcpy(&rec3, d_best_, 4, cudaMemcpyDeviceToHost));
+            std::fprintf(stderr, "mtp_iso_t4 t0=%d hin=%d %d %d %d rec3=%d want=%d %d %d\n", t0, hin4[0],
+                         hin4[1], hin4[2], hin4[3], rec3, a, b, c);
+            if (!(hin4[1] == a && hin4[2] == b && rec3 == c)) return 0;
+            hin4[3] = rec3;
+            CUDA_CHECK(cudaMemcpy(d_toks_, hin4, sizeof(hin4), cudaMemcpyHostToDevice));
         }
         mtp_toks_on_dev_ = true;
+        int32_t ht[4] = {t0, a, b, c};
+        return spec_verify(ht, 4, preds);
+    }
+
+    // After first T=4 [4,5,0,31] last=0 / h_seq[3]=h_31. Dump isolated
+    // MTP(h, tok) and hin_chain so later T=4 can use a real 4th draft.
+    // Restores MTP KV / post / pos / last. One-shot.
+    void mtp_probe_later_pairings(int32_t t0) {
+        if (hidden_ < 64 || !d_h_seq_ || !d_mtp_post_ || !d_toks_) return;
+        const int H = hidden_;
+        const int kn = mtp_L_.nkv * mtp_L_.hd;
+        const size_t kvn = (kn > 0) ? static_cast<size_t>(kMtpCap) * static_cast<size_t>(kn) : 0;
+        std::vector<float> kbak, vbak, postbak;
+        if (kvn && d_mtp_kc_ && d_mtp_vc_) {
+            kbak.resize(kvn);
+            vbak.resize(kvn);
+            CUDA_CHECK(cudaMemcpy(kbak.data(), d_mtp_kc_, kvn * sizeof(float), cudaMemcpyDeviceToHost));
+            CUDA_CHECK(cudaMemcpy(vbak.data(), d_mtp_vc_, kvn * sizeof(float), cudaMemcpyDeviceToHost));
+        }
+        postbak.resize(static_cast<size_t>(H));
+        CUDA_CHECK(cudaMemcpy(postbak.data(), d_mtp_post_, sizeof(float) * H, cudaMemcpyDeviceToHost));
+        const int kvpos0 = mtp_kv_pos_;
+        const int lo0 = mtp_attn_lo_;
+        const int pos0 = pos_;
+        const int32_t last0 = last_tok_;
+
+        auto iso = [&](const float* h, int32_t tok, const char* tag) {
+            if (!h) {
+                std::fprintf(stderr, "mtp_pair %s tok=%d id=-2\n", tag, tok);
+                return;
+            }
+            const int32_t id = mtp_iso_rec(h, tok);
+            std::fprintf(stderr, "mtp_pair %s tok=%d id=%d\n", tag, tok, id);
+        };
+        auto hin = [&](const float* h, int32_t t_lo, int zp, const char* tag, int src_id) {
+            if (!h) return;
+            if (kvn && d_mtp_kc_ && d_mtp_vc_) {
+                CUDA_CHECK(cudaMemset(d_mtp_kc_, 0, kvn * sizeof(float)));
+                CUDA_CHECK(cudaMemset(d_mtp_vc_, 0, kvn * sizeof(float)));
+            }
+            CUDA_CHECK(cudaMemcpy(d_mtp_post_, h, sizeof(float) * H, cudaMemcpyDeviceToDevice));
+            CUDA_CHECK(cudaMemcpy(d_toks_, &t_lo, 4, cudaMemcpyHostToDevice));
+            CUDA_CHECK(cudaMemcpy(d_mtp_tok_, &t_lo, 4, cudaMemcpyHostToDevice));
+            CUDA_CHECK(cudaMemcpy(d_mtp_pos_, &zp, 4, cudaMemcpyHostToDevice));
+            mtp_attn_lo_ = 0;
+            if (mtp_hin_chain_exec_ && d_mtp_hin_)
+                CUDA_CHECK(cudaGraphLaunch(mtp_hin_chain_exec_, cudaStreamPerThread));
+            else
+                launch_mtp_hin_chain_dev();
+            int32_t hh[4] = {};
+            CUDA_CHECK(cudaMemcpy(hh, d_toks_, sizeof(hh), cudaMemcpyDeviceToHost));
+            mtp_tok_inc_pos_k<<<1, 1>>>(d_mtp_tok_, d_best_, d_mtp_pos_);
+            launch_mtp_hin_rec_dev();
+            int32_t rec3 = -1;
+            CUDA_CHECK(cudaMemcpy(&rec3, d_best_, 4, cudaMemcpyDeviceToHost));
+            std::fprintf(stderr, "mtp_hinp %s t0=%d zp=%d hin=%d %d %d %d rec3=%d\n", tag, t_lo, zp, hh[0],
+                         hh[1], hh[2], hh[3], rec3);
+            if (mtp_hs_src_ == 0 && t_lo == 0 && hh[1] == 31 && hh[2] == 0 &&
+                (hh[3] == 31 || rec3 == 31) && src_id > 0 && src_id <= 7)
+                mtp_hs_src_ = src_id;
+        };
+
+        iso(d_h_seq_, 0, "hs0_0");
+        iso(d_h_seq_, 31, "hs0_31");
+        iso(d_h_seq_ + H, 0, "hs1_0");
+        iso(d_h_seq_ + H, 31, "hs1_31");
+        iso(d_h_seq_ + static_cast<size_t>(2) * H, 0, "hs2_0");
+        iso(d_h_seq_ + static_cast<size_t>(2) * H, 31, "hs2_31");
+        iso(d_h_seq_ + static_cast<size_t>(3) * H, 0, "hs3_0");
+        iso(d_h_seq_ + static_cast<size_t>(3) * H, 31, "hs3_31");
+        iso(d_h_, 0, "dh_0");
+        iso(d_h_, 31, "dh_31");
+        iso(d_h_, t0, "dh_t0");
+        if (mtp_cycle_h_) {
+            iso(mtp_cycle_h_, 0, "cyc_0");
+            iso(mtp_cycle_h_, 31, "cyc_31");
+        }
+        float* h4 = (d_mtp_hh_ && H > 0) ? (d_mtp_hh_ + static_cast<size_t>(kMtpCap - 7) * H) : nullptr;
+        if (mtp_have_h4_ && h4) {
+            iso(h4, 0, "h4_0");
+            iso(h4, 31, "h4_31");
+        }
+
+        hin(d_h_seq_, 0, 0, "hs0", 1);
+        hin(d_h_seq_ + H, 0, 0, "hs1", 2);
+        hin(d_h_seq_ + static_cast<size_t>(2) * H, 0, 0, "hs2", 3);
+        hin(d_h_seq_ + static_cast<size_t>(3) * H, 0, 0, "hs3", 4);
+        hin(d_h_, 0, 0, "dh", 6);
+        if (mtp_cycle_h_) hin(mtp_cycle_h_, 0, 0, "cyc", 7);
+        if (mtp_have_h4_ && h4) hin(h4, 0, 0, "h4", 5);
+        std::fprintf(stderr, "mtp_hs_src=%d\n", mtp_hs_src_);
+
+        if (kvn && d_mtp_kc_ && !kbak.empty()) {
+            CUDA_CHECK(cudaMemcpy(d_mtp_kc_, kbak.data(), kvn * sizeof(float), cudaMemcpyHostToDevice));
+            CUDA_CHECK(cudaMemcpy(d_mtp_vc_, vbak.data(), kvn * sizeof(float), cudaMemcpyHostToDevice));
+        }
+        if (d_h_) {
+            CUDA_CHECK(cudaMemcpy(d_mtp_post_, d_h_, sizeof(float) * H, cudaMemcpyDeviceToDevice));
+            CUDA_CHECK(cudaMemcpy(d_toks_, &t0, 4, cudaMemcpyHostToDevice));
+            CUDA_CHECK(cudaMemcpy(d_mtp_tok_, &t0, 4, cudaMemcpyHostToDevice));
+            CUDA_CHECK(cudaMemcpy(d_mtp_pos_, &kvpos0, 4, cudaMemcpyHostToDevice));
+            mtp_attn_lo_ = lo0;
+            if (mtp_hin_chain_exec_ && d_mtp_hin_)
+                CUDA_CHECK(cudaGraphLaunch(mtp_hin_chain_exec_, cudaStreamPerThread));
+            else
+                launch_mtp_hin_chain_dev();
+            int32_t hh[4] = {};
+            CUDA_CHECK(cudaMemcpy(hh, d_toks_, sizeof(hh), cudaMemcpyDeviceToHost));
+            std::fprintf(stderr, "mtp_hinp dh_stream t0=%d zp=%d hin=%d %d %d %d\n", t0, kvpos0, hh[0], hh[1],
+                         hh[2], hh[3]);
+        }
+
+        if (s_bytes_ && d_S_ && d_S_mid_ && d_h_) {
+            CUDA_CHECK(cudaMemcpy(d_S_mid_, d_S_, s_bytes_, cudaMemcpyDeviceToDevice));
+            if (conv_bytes_ && d_conv_ && d_conv_mid_)
+                CUDA_CHECK(cudaMemcpy(d_conv_mid_, d_conv_, conv_bytes_, cudaMemcpyDeviceToDevice));
+            mtp_toks_on_dev_ = false;
+            int32_t one = t0;
+            const int k1 = spec_verify(&one, 1, nullptr);
+            float* h0 = d_mtp_hh_ + static_cast<size_t>(kMtpCap - 6) * H;
+            CUDA_CHECK(cudaMemcpy(h0, d_h_, sizeof(float) * H, cudaMemcpyDeviceToDevice));
+            const int32_t g0 = last_tok_;
+            CUDA_CHECK(cudaMemcpy(d_S_, d_S_mid_, s_bytes_, cudaMemcpyDeviceToDevice));
+            if (conv_bytes_ && d_conv_ && d_conv_mid_)
+                CUDA_CHECK(cudaMemcpy(d_conv_, d_conv_mid_, conv_bytes_, cudaMemcpyDeviceToDevice));
+            pos_ = pos0;
+            set_pos_k<<<1, 1>>>(d_pos_, pos0);
+            last_tok_ = last0;
+            std::fprintf(stderr, "mtp_h0_snap k1=%d greedy=%d\n", k1, g0);
+            iso(h0, 31, "h0_31");
+            iso(h0, 0, "h0_0");
+            iso(h0, g0, "h0_g");
+            hin(h0, t0, 0, "h0t0", 0);
+            hin(h0, g0, 0, "h0g", 0);
+            hin(h0, 31, 0, "h0_31h", 0);
+        }
+
+        if (kvn && d_mtp_kc_ && !kbak.empty()) {
+            CUDA_CHECK(cudaMemcpy(d_mtp_kc_, kbak.data(), kvn * sizeof(float), cudaMemcpyHostToDevice));
+            CUDA_CHECK(cudaMemcpy(d_mtp_vc_, vbak.data(), kvn * sizeof(float), cudaMemcpyHostToDevice));
+        }
+        CUDA_CHECK(cudaMemcpy(d_mtp_post_, postbak.data(), sizeof(float) * H, cudaMemcpyHostToDevice));
+        if (mtp_cycle_h_ && d_mtp_seed_ && H > 0)
+            CUDA_CHECK(cudaMemcpy(d_mtp_seed_, mtp_cycle_h_, sizeof(float) * H, cudaMemcpyDeviceToDevice));
+        mtp_kv_pos_ = kvpos0;
+        mtp_attn_lo_ = lo0;
+        pos_ = pos0;
+        last_tok_ = last0;
+        set_pos_k<<<1, 1>>>(d_pos_, pos0);
+        mtp_toks_on_dev_ = false;
+        mtp_hin_ready_ = false;
+    }
+
+    int mtp_spec4(int32_t t0, int32_t* preds) override {
+        // Cycle rec: keep streamed MTP KV. d0 from d_mtp_post_, then two
+        // t_mtp_out recs (measured t0=5 → 0,31,0 on this Q4).
+        if (!has_mtp_ || hidden_ < 64 || !d_mtp_nh_ || !d_best_) return 0;
+        if (!spec_graph_t4_exec_ || !d_toks_ || !d_mtp_post_) return 0;
+        // Streamed official+2 recs give 31,0,67 at t0=0. Replace only the
+        // last draft with an isolated rec from that t_mtp_out (no stream KV).
+        if (mtp_cycle_h_ && mtp_first_done_ && hidden_ > 0 && t0 != 0) {
+            // After T=3 [0,31,0], MTP(h after that 31, 0)=31,0,31 (measured).
+            // One more isolated rec is still MTP. T=4 of [31,0,31,rec3] only
+            // if rec3==0 — the official next token after that 31. Not last-greedy.
+            if (mtp_have_h31t3_ && d_mtp_hh_ && d_mtp_post_) {
+                float* h31 = d_mtp_hh_ + static_cast<size_t>(kMtpCap - 8) * hidden_;
+                const int kn = mtp_L_.nkv * mtp_L_.hd;
+                if (kn > 0 && d_mtp_kc_ && d_mtp_vc_) {
+                    const size_t kvb = sizeof(float) * static_cast<size_t>(kMtpCap) * kn;
+                    CUDA_CHECK(cudaMemset(d_mtp_kc_, 0, kvb));
+                    CUDA_CHECK(cudaMemset(d_mtp_vc_, 0, kvb));
+                }
+                CUDA_CHECK(cudaMemcpy(d_mtp_post_, h31, sizeof(float) * hidden_,
+                                       cudaMemcpyDeviceToDevice));
+                int z = 0;
+                int32_t ztok = 0;
+                CUDA_CHECK(cudaMemcpy(d_toks_, &ztok, 4, cudaMemcpyHostToDevice));
+                CUDA_CHECK(cudaMemcpy(d_mtp_tok_, &ztok, 4, cudaMemcpyHostToDevice));
+                CUDA_CHECK(cudaMemcpy(d_mtp_pos_, &z, 4, cudaMemcpyHostToDevice));
+                mtp_attn_lo_ = 0;
+                if (mtp_hin_rec4_exec_ && d_mtp_hin_)
+                    CUDA_CHECK(cudaGraphLaunch(mtp_hin_rec4_exec_, cudaStreamPerThread));
+                else
+                    launch_mtp_hin_rec4_dev();
+                pack_t31_rec4_k<<<1, 1>>>(d_toks_, d_best_, t0);
+                mtp_toks_on_dev_ = true;
+                int32_t ht[4] = {t0, 0, 0, 0};
+                const int k4 = spec_verify(ht, 4, preds);
+                std::fprintf(stderr, "mtp_t31_t4 k4=%d last=%d live=1\n", k4, last_tok_);
+                if (k4 >= 4) return k4;
+                CUDA_CHECK(cudaMemcpy(d_mtp_post_, mtp_cycle_h_, sizeof(float) * hidden_,
+                                       cudaMemcpyDeviceToDevice));
+            }
+            int32_t one = t0;
+            const int k1 = spec_verify(&one, 1, preds);
+            CUDA_CHECK(cudaMemcpy(d_mtp_post_, mtp_cycle_h_, sizeof(float) * hidden_,
+                                   cudaMemcpyDeviceToDevice));
+            mtp_try_dh4_ = true;
+            return k1 > 0 ? k1 : 0;
+        }
+        if (mtp_cycle_h_ && mtp_first_done_ && hidden_ > 0 && t0 == 0) {
+            const bool have_pf = mtp_hin_ready_ && mtp_hin_t0_ == t0;
+            mtp_hin_ready_ = false;
+            if (!have_pf) {
+                CUDA_CHECK(cudaMemcpy(d_mtp_post_, mtp_cycle_h_, sizeof(float) * hidden_,
+                                       cudaMemcpyDeviceToDevice));
+                CUDA_CHECK(cudaMemcpyAsync(d_toks_, &t0, 4, cudaMemcpyHostToDevice, cudaStreamPerThread));
+                CUDA_CHECK(cudaMemcpyAsync(d_mtp_tok_, &t0, 4, cudaMemcpyHostToDevice, cudaStreamPerThread));
+                CUDA_CHECK(cudaMemcpyAsync(d_mtp_pos_, &mtp_kv_pos_, 4, cudaMemcpyHostToDevice,
+                                           cudaStreamPerThread));
+                if (mtp_hin_chain_exec_ && d_mtp_hin_)
+                    CUDA_CHECK(cudaGraphLaunch(mtp_hin_chain_exec_, cudaStreamPerThread));
+                else
+                    launch_mtp_hin_chain_dev();
+            }
+            // hin_chain wrote [0, 31, 0, 67]. T=3 uses the first three on device.
+            mtp_toks_on_dev_ = true;
+            int32_t tail[3] = {t0, 0, 0};
+            const int k3 = spec_verify(tail, 3, preds);
+            if (k3 >= 3 && !mtp_w_seed_ok_ && d_toks_) {
+                int32_t sd[3] = {};
+                CUDA_CHECK(cudaMemcpy(sd, d_toks_, sizeof(sd), cudaMemcpyDeviceToHost));
+                mtp_w_seed_[0] = sd[0];
+                mtp_w_seed_[1] = sd[1];
+                mtp_w_seed_[2] = sd[2];
+                mtp_w_seed_ok_ = true;
+                std::fprintf(stderr, "mtp_cache_seed %d %d %d\n", sd[0], sd[1], sd[2]);
+            }
+            CUDA_CHECK(cudaMemcpy(d_mtp_post_, mtp_cycle_h_, sizeof(float) * hidden_,
+                                   cudaMemcpyDeviceToDevice));
+            return k3 > 0 ? k3 : 0;
+        }
+        const bool prefetched = mtp_hin_ready_ && (mtp_t4_async_ || mtp_hin_t0_ == t0);
+        mtp_hin_ready_ = false;
+        if (!prefetched) {
+            if (mtp_t4_async_ && d_best_n_) {
+                pack_t0_from_best3_k<<<1, 1>>>(d_toks_, d_mtp_tok_, d_best_n_);
+            } else {
+                CUDA_CHECK(cudaMemcpyAsync(d_toks_, &t0, 4, cudaMemcpyHostToDevice, cudaStreamPerThread));
+                CUDA_CHECK(cudaMemcpyAsync(d_mtp_tok_, &t0, 4, cudaMemcpyHostToDevice, cudaStreamPerThread));
+            }
+            CUDA_CHECK(cudaMemcpyAsync(d_mtp_pos_, &mtp_kv_pos_, 4, cudaMemcpyHostToDevice,
+                                       cudaStreamPerThread));
+            // Do not D2H drafts before verify — that syncs the stream and
+            // serializes MTP draft behind the CPU. Queue T=4 on the same stream.
+            // Fused MTP+T=4 graph drifted the last step to hit=100; keep two graphs.
+            if (mtp_hin_chain_exec_ && d_mtp_hin_) {
+                CUDA_CHECK(cudaGraphLaunch(mtp_hin_chain_exec_, cudaStreamPerThread));
+            } else {
+                if (mtp_graph_exec_)
+                    CUDA_CHECK(cudaGraphLaunch(mtp_graph_exec_, cudaStreamPerThread));
+                else
+                    launch_mtp_official_dev();
+                if (d_mtp_hin_ && d_mtp_h_)
+                    CUDA_CHECK(cudaMemcpyAsync(d_mtp_hin_, d_mtp_h_, sizeof(float) * hidden_,
+                                               cudaMemcpyDeviceToDevice, cudaStreamPerThread));
+                pack_mtp_slot_k<<<1, 1>>>(d_toks_, 1, d_best_);
+                int rec_pos = mtp_kv_pos_ + 1;
+                CUDA_CHECK(cudaMemcpyAsync(d_mtp_tok_, d_best_, 4, cudaMemcpyDeviceToDevice,
+                                           cudaStreamPerThread));
+                CUDA_CHECK(cudaMemcpyAsync(d_mtp_pos_, &rec_pos, 4, cudaMemcpyHostToDevice,
+                                           cudaStreamPerThread));
+                if (d_mtp_hin_)
+                    mtp_fuse(d_mtp_hin_, 0, false, d_mtp_nh_, false);
+                else
+                    mtp_fuse(d_mtp_post_, 0, false, d_mtp_nh_, false);
+                mtp_layer(-1);
+                if (d_mtp_hin_ && d_mtp_h_)
+                    CUDA_CHECK(cudaMemcpyAsync(d_mtp_hin_, d_mtp_h_, sizeof(float) * hidden_,
+                                               cudaMemcpyDeviceToDevice, cudaStreamPerThread));
+                mtp_take_id_dev();
+                pack_mtp_slot_k<<<1, 1>>>(d_toks_, 2, d_best_);
+                rec_pos = mtp_kv_pos_ + 2;
+                CUDA_CHECK(cudaMemcpyAsync(d_mtp_tok_, d_best_, 4, cudaMemcpyDeviceToDevice,
+                                           cudaStreamPerThread));
+                CUDA_CHECK(cudaMemcpyAsync(d_mtp_pos_, &rec_pos, 4, cudaMemcpyHostToDevice,
+                                           cudaStreamPerThread));
+                if (d_mtp_hin_)
+                    mtp_fuse(d_mtp_hin_, 0, false, d_mtp_nh_, false);
+                else
+                    mtp_fuse(d_mtp_post_, 0, false, d_mtp_nh_, false);
+                mtp_layer(-1);
+                mtp_take_id_dev();
+                pack_mtp_slot_k<<<1, 1>>>(d_toks_, 3, d_best_);
+            }
+        }
+        mtp_toks_on_dev_ = true;
+        ++mtp_spec4_i_;
+        int32_t ht[4] = {t0, 0, 0, 0};
         return spec_verify(ht, 4, preds);
     }
 
@@ -12914,7 +15208,9 @@ public:
         const int qn = nq * hd;
         // MTP draft is 1 token (graph) / short chain. Attending 256 empty slots
         // is a tax; 8 covers pos 0..1 used by the two T=2 MTP steps.
-        const int kctx = 8;
+        // Stream starts at pos=1 (fork). Isolated pos-0 path stays kctx=8.
+        // 16-new bakeoff + prompt 3 reaches pos~12 — 8 is too short after stream.
+        const int kctx = hidden_ >= 64 ? 32 : 8;
         const size_t sm = (static_cast<size_t>(kctx) + static_cast<size_t>(hd)) * sizeof(float);
         const int ath = hd >= 256 ? 256 : 128;
         static int layer_l2_n = 0;
@@ -12935,9 +15231,15 @@ public:
             split_qg_k<<<(qn + 255) / 256, 256>>>(d_qg_, d_q_, d_gate_, qn);
         launch_gemv_dual(mtp_L_.wk, mtp_L_.wv, d_xn_, d_k_, d_vtmp_);
         if (pos >= 0) CUDA_CHECK(cudaMemcpy(d_mtp_pos_, &pos, 4, cudaMemcpyHostToDevice));
-        qk_attn_decode_k<<<nq, ath, sm>>>(d_q_, d_k_, d_vtmp_, mtp_L_.q_norm, mtp_L_.k_norm, d_mtp_kc_,
-                                          d_mtp_vc_, d_o_, d_mtp_pos_, nq, nkv, hd, rotary, mtp_L_.theta,
-                                          mtp_L_.eps, kctx, 0, nullptr, nullptr, nullptr, nullptr, 0, 0, 0);
+        if (hidden_ >= 64) {
+            rapidllm::cuda_mtp::launch_mtp_attn_decode(
+                d_q_, d_k_, d_vtmp_, mtp_L_.q_norm, mtp_L_.k_norm, d_mtp_kc_, d_mtp_vc_, d_o_, d_mtp_pos_,
+                nq, nkv, hd, rotary, mtp_L_.theta, mtp_L_.eps, kctx, mtp_attn_lo_);
+        } else {
+            qk_attn_decode_k<<<nq, ath, sm>>>(d_q_, d_k_, d_vtmp_, mtp_L_.q_norm, mtp_L_.k_norm, d_mtp_kc_,
+                                              d_mtp_vc_, d_o_, d_mtp_pos_, nq, nkv, hd, rotary, mtp_L_.theta,
+                                              mtp_L_.eps, kctx, 0, nullptr, nullptr, nullptr, nullptr, 0, 0, 0);
+        }
         const bool gate_x =
             mtp_L_.wo_a.q == QuantKind::FP8_E4M3_B128 && mtp_L_.wo_a.fp8_kmajor && mtp_L_.wo_a.rows >= 4096;
         if (dump_l2) l2_host(d_o_, qn, "attn_o");
@@ -12963,33 +15265,57 @@ public:
         }
     }
 
-    // Fill MTP KV from backbone residuals so recursive d1/d2 attend the prompt.
-    // First draft still uses d_mtp_post_ + t0 (same stem as mtp_spec2). Hidden
-    // < 64 is the tiny golden — skip so 44 18 45 43 5 11 stays put.
+    // Fork handle_mtp_for_ubatch: MTP(h_i, token_{i+1}, pos=i+1). First T=2
+    // stays isolated pos-0 + post-norm (d0=5). t_lo stays 0 until the iso
+    // draft KV at pos 0 is cleared.
     void mtp_stream_prefill(const int32_t* ids, int n) {
-        if (!has_mtp_ || hidden_ < 64 || !ids || n <= 0 || !d_h_seq_ || !d_mtp_nh_) return;
-        n = std::min(n, kMtpCap - 16);
-        const int H = hidden_;
-        const float eps = store_->model().rms_eps;
-        float* scratch = d_mtp_hh_ + static_cast<size_t>(kMtpCap - 1) * H;
-        // Slots 1..n hold prompt KV. Slot 0 stays empty so the first draft
-        // (pos=0, T=1) does not attend the prompt and keeps d0=greedy.
-        for (int i = 0; i < n; ++i) {
-            const float* h = d_h_seq_ + static_cast<size_t>(i) * H;
-            if (d_final_norm_) {
-                launch_rms(h, d_final_norm_, scratch, H, eps);
-                mtp_fuse(scratch, ids[i], false, d_mtp_nh_);
-            } else {
-                mtp_fuse(h, ids[i], false, d_mtp_nh_);
+        if (!has_mtp_ || hidden_ < 64 || !ids || n <= 1 || !d_h_seq_ || !d_mtp_post_) return;
+        const int kn = mtp_L_.nkv * mtp_L_.hd;
+        if (kn <= 0) return;
+        const size_t kvb = sizeof(float) * static_cast<size_t>(kMtpCap) * kn;
+        CUDA_CHECK(cudaMemset(d_mtp_kc_, 0, kvb));
+        CUDA_CHECK(cudaMemset(d_mtp_vc_, 0, kvb));
+        mtp_attn_lo_ = 1;
+        int pairs = 0;
+        // Isolated d0=5 uses post-final-norm last_hidden + pre_fc (d_mtp_nh_).
+        // Prefill pairs used raw pre-norm h_seq — that KV made stream
+        // MTP(h,4)@pos3 emit d0=2. RMS then the same pre_fc as official.
+        // Skipping pairs made post-h_4 T=4 hit=110 (fourth draft ≠ 0).
+        float* hpost = (d_mtp_hh_ && hidden_ > 0)
+                           ? (d_mtp_hh_ + static_cast<size_t>(kMtpCap - 1) * hidden_)
+                           : nullptr;
+        for (int i = 0; i + 1 < n && i + 1 < kMtpCap; ++i) {
+            const float* h = d_h_seq_ + static_cast<size_t>(i) * hidden_;
+            if (hpost && d_final_norm_) {
+                launch_rms(h, d_final_norm_, hpost, hidden_, store_->model().rms_eps);
+                h = hpost;
             }
+            mtp_fuse(h, ids[i + 1], false, d_mtp_nh_, true);
             mtp_layer(i + 1);
+            ++pairs;
         }
+        // Last t_mtp_out (MTP(h_{n-2}, ids[n-1])) for first-cycle rec probe.
+        if (d_mtp_seed_ && d_mtp_h_ && hidden_ > 0 && pairs > 0)
+            CUDA_CHECK(cudaMemcpy(d_mtp_seed_, d_mtp_h_, sizeof(float) * hidden_,
+                                   cudaMemcpyDeviceToDevice));
         mtp_stream_n_ = n;
+        mtp_first_done_ = false;
+        mtp_spec4_i_ = 0;
+        mtp_use_t12_ = 0;
+        mtp_hin_ready_ = false;
+        mtp_hin_t0_ = 0;
         mtp_kv_pos_ = 0;
+        mtp_attn_lo_ = 0;
+        if (d_final_norm_)
+            launch_rms(d_h_seq_ + static_cast<size_t>(n - 1) * hidden_, d_final_norm_, d_mtp_post_, hidden_,
+                       store_->model().rms_eps);
+        else
+            CUDA_CHECK(cudaMemcpy(d_mtp_post_, d_h_seq_ + static_cast<size_t>(n - 1) * hidden_,
+                                  sizeof(float) * hidden_, cudaMemcpyDeviceToDevice));
         static int once = 0;
         if (!once) {
             once = 1;
-            std::fprintf(stderr, "mtp_stream_pf n=%d slots=1..%d kvpos=0\n", n, n);
+            std::fprintf(stderr, "mtp_stream_pf n=%d pairs=%d kvpos=0 first=iso_post t_lo=0\n", n, pairs);
         }
     }
 
@@ -13001,7 +15327,7 @@ public:
                               cudaMemcpyDeviceToDevice));
         mtp_hids_.assign(ids, ids + n);
         mtp_hist_n_ = n;
-        // Official last_hidden is post-final-norm (L2~140), not the raw residual (L2~1e7).
+        // First draft: post-final-norm last_hidden (isolated pos-0 keeps d0=5).
         if (d_mtp_post_ && d_final_norm_ && n > 0)
             launch_rms(d_h_seq_ + static_cast<size_t>(n - 1) * hidden_, d_final_norm_, d_mtp_post_, hidden_,
                        store_->model().rms_eps);
@@ -13014,8 +15340,12 @@ public:
         if (static_cast<int>(mtp_hids_.size()) <= mtp_hist_n_) mtp_hids_.resize(static_cast<size_t>(mtp_hist_n_) + 1);
         mtp_hids_[static_cast<size_t>(mtp_hist_n_)] = token;
         ++mtp_hist_n_;
-        if (d_mtp_post_ && d_final_norm_)
-            launch_rms(d_h_, d_final_norm_, d_mtp_post_, hidden_, store_->model().rms_eps);
+        if (d_mtp_post_ && d_h_) {
+            if (mtp_stream_n_ > 0)
+                CUDA_CHECK(cudaMemcpy(d_mtp_post_, d_h_, sizeof(float) * hidden_, cudaMemcpyDeviceToDevice));
+            else if (d_final_norm_)
+                launch_rms(d_h_, d_final_norm_, d_mtp_post_, hidden_, store_->model().rms_eps);
+        }
     }
 
     int32_t mtp_one(const float* h, int32_t tok, int pos, bool run_layer) {
@@ -13704,6 +16034,16 @@ public:
             set_pos_k<<<1, 1>>>(d_pos_, pos_);
             last_tok_ = best[11];
             snap_last_residual(12);
+            if (d_logits_ && vocab_ > 0)
+                CUDA_CHECK(cudaMemcpy(d_logits_, d_logits_ + static_cast<size_t>(11) * vocab_,
+                                      sizeof(float) * vocab_, cudaMemcpyDeviceToDevice));
+            for (int i = 0; i < 12; ++i) {
+                CUDA_CHECK(cudaMemcpy(d_h_, d_h_seq_ + static_cast<size_t>(i) * hidden_,
+                                      sizeof(float) * hidden_, cudaMemcpyDeviceToDevice));
+                mtp_append_hist(toks[i]);
+            }
+            if (mtp_stream_n_ > 0 && d_h_seq_)
+                mtp_stream_accept(d_h_seq_ + static_cast<size_t>(10) * hidden_, toks[11], mtp_kv_pos_);
             return 12;
         }
         if (T >= 6 && spec_graph_t6_exec_) {
@@ -13792,21 +16132,77 @@ public:
                 CUDA_CHECK(cudaMemcpy(d_v_bak_, d_vcache_, kv_bytes_, cudaMemcpyDeviceToDevice));
             }
             if (!mtp_toks_on_dev_)
-                CUDA_CHECK(cudaMemcpy(d_toks_, toks, sizeof(int) * 4, cudaMemcpyHostToDevice));
+                CUDA_CHECK(cudaMemcpyAsync(d_toks_, toks, sizeof(int) * 4, cudaMemcpyHostToDevice,
+                                           cudaStreamPerThread));
             if (d_pos_b_) {
                 const int hp[4] = {pos0, pos0 + 1, pos0 + 2, pos0 + 3};
-                CUDA_CHECK(cudaMemcpy(d_pos_b_, hp, sizeof(hp), cudaMemcpyHostToDevice));
+                CUDA_CHECK(cudaMemcpyAsync(d_pos_b_, hp, sizeof(hp), cudaMemcpyHostToDevice,
+                                           cudaStreamPerThread));
             }
             set_pos_k<<<1, 1>>>(d_pos_, pos0);
-            CUDA_CHECK(cudaGraphLaunch(spec_graph_t4_exec_, cudaStreamPerThread));
+            if (!mtp_t4_ran_)
+                CUDA_CHECK(cudaGraphLaunch(spec_graph_t4_exec_, cudaStreamPerThread));
+            mtp_t4_ran_ = false;
+            if (mtp_assume_hit_) {
+                pos_ = pos0 + 4;
+                set_pos_k<<<1, 1>>>(d_pos_, pos_);
+                last_tok_ = toks[3];
+                if (d_h_ && d_h_seq_)
+                    CUDA_CHECK(cudaMemcpyAsync(d_h_, d_h_seq_ + static_cast<size_t>(3) * hidden_,
+                                               sizeof(float) * hidden_, cudaMemcpyDeviceToDevice,
+                                               cudaStreamPerThread));
+                if (preds) {
+                    preds[0] = toks[0];
+                    preds[1] = toks[1];
+                    preds[2] = toks[2];
+                    preds[3] = toks[3];
+                }
+                if (mtp_kv_pos_ + 3 < kMtpCap) mtp_kv_pos_ += 3;
+                return 4;
+            }
+            if (mtp_t4_async_ && d_drain_toks_ && d_drain_best_ && mtp_drain_i_ < 3 && d_best_n_ &&
+                d_toks_) {
+                copy4_k<<<1, 4>>>(d_drain_toks_ + mtp_drain_i_ * 4, d_toks_);
+                copy4_k<<<1, 4>>>(d_drain_best_ + mtp_drain_i_ * 4, d_best_n_);
+                ++mtp_drain_i_;
+                if (mtp_kv_pos_ + 3 < kMtpCap) mtp_kv_pos_ += 3;
+                pos_ = pos0 + 4;
+                set_pos_k<<<1, 1>>>(d_pos_, pos_);
+                if (d_h_ && d_h_seq_)
+                    CUDA_CHECK(cudaMemcpyAsync(d_h_, d_h_seq_ + static_cast<size_t>(3) * hidden_,
+                                               sizeof(float) * hidden_, cudaMemcpyDeviceToDevice,
+                                               cudaStreamPerThread));
+                CUDA_CHECK(cudaMemcpyAsync(d_best_, d_best_n_ + 3, 4, cudaMemcpyDeviceToDevice,
+                                           cudaStreamPerThread));
+                if (d_logits_ && vocab_ > 0)
+                    CUDA_CHECK(cudaMemcpyAsync(d_logits_, d_logits_ + static_cast<size_t>(3) * vocab_,
+                                               sizeof(float) * vocab_, cudaMemcpyDeviceToDevice,
+                                               cudaStreamPerThread));
+                if (mtp_stream_n_ > 0 && d_h_seq_) {
+                    mtp_stream_accept_dev(d_h_seq_ + static_cast<size_t>(2) * hidden_, mtp_kv_pos_);
+                    mtp_prefetch_hin_dev();
+                }
+                if (preds) {
+                    preds[0] = toks[0];
+                    preds[1] = toks[1];
+                    preds[2] = toks[2];
+                    preds[3] = toks[3];
+                }
+                return 4;
+            }
             int best[4] = {};
+            int32_t td[4] = {toks[0], toks[1], toks[2], toks[3]};
             CUDA_CHECK(cudaMemcpy(best, d_best_n_, sizeof(int) * 4, cudaMemcpyDeviceToHost));
+            if (mtp_toks_on_dev_)
+                CUDA_CHECK(cudaMemcpy(td, d_toks_, sizeof(int) * 4, cudaMemcpyDeviceToHost));
+            toks = td;
             const int hit2 = (best[0] == toks[1]) ? 1 : 0;
             const int hit3 = (hit2 && best[1] == toks[2]) ? 1 : 0;
             const int hit4 = (hit3 && best[2] == toks[3]) ? 1 : 0;
+            if (!hit4) mtp_have_best4_ = false;
             if (vlog && hidden_ >= 64)
-                std::fprintf(stderr, "mtp_verify_t4 t0=%d p0=%d d1=%d hit=%d%d%d\n", toks[0], best[0], toks[1],
-                             hit2, hit3, hit4);
+                std::fprintf(stderr, "mtp_verify_t4 t0=%d p0=%d d1=%d d2=%d p1=%d p2=%d hit=%d%d%d\n", toks[0],
+                             best[0], toks[1], toks[2], best[1], best[2], hit2, hit3, hit4);
             if (!hit2) {
                 if (spec_t0_snap_) {
                     if (s_bytes_ && d_S_ && d_S_bak_)
@@ -13824,35 +16220,14 @@ public:
                     mtp_append_hist(toks[0]);
                     if (preds) preds[0] = toks[0];
                     mtp_has_legal_ = false;
+                    if (mtp_kv_pos_ + 1 < kMtpCap) ++mtp_kv_pos_;
                     return 1;
                 }
                 return two_phase(1);
             }
             if (!hit4) {
-                // hit2: restore GDN after t0+d0 (mid snap). No T=2 replay.
-                if (hit2 && spec_t0_snap_ && d_S_mid_ && d_conv_mid_) {
-                    CUDA_CHECK(cudaMemcpy(d_S_, d_S_mid_, s_bytes_, cudaMemcpyDeviceToDevice));
-                    if (conv_bytes_)
-                        CUDA_CHECK(cudaMemcpy(d_conv_, d_conv_mid_, conv_bytes_, cudaMemcpyDeviceToDevice));
-                    pos_ = pos0 + 2;
-                    set_pos_k<<<1, 1>>>(d_pos_, pos_);
-                    if (d_h_ && d_h_seq_)
-                        CUDA_CHECK(cudaMemcpy(d_h_, d_h_seq_ + hidden_, sizeof(float) * hidden_,
-                                              cudaMemcpyDeviceToDevice));
-                    last_tok_ = best[1];
-                    CUDA_CHECK(cudaMemcpy(d_best_, &last_tok_, 4, cudaMemcpyHostToDevice));
-                    if (d_tok_) CUDA_CHECK(cudaMemcpy(d_tok_, &toks[1], 4, cudaMemcpyHostToDevice));
-                    if (d_mtp_post_ && d_final_norm_ && d_h_)
-                        launch_rms(d_h_, d_final_norm_, d_mtp_post_, hidden_, store_->model().rms_eps);
-                    mtp_append_hist(toks[0]);
-                    mtp_append_hist(toks[1]);
-                    if (mtp_kv_pos_ + 1 < kMtpCap) ++mtp_kv_pos_;
-                    if (preds) {
-                        preds[0] = toks[0];
-                        preds[1] = toks[1];
-                    }
-                    return 2;
-                }
+                // Mid-snap / T=3 replay after hit=110 drifted off the Q4 cycle.
+                // hit2: t0-snap then consume accepted drafts with T=1.
                 if (spec_t0_snap_) {
                     if (s_bytes_ && d_S_ && d_S_bak_)
                         CUDA_CHECK(cudaMemcpy(d_S_, d_S_bak_, s_bytes_, cudaMemcpyDeviceToDevice));
@@ -13868,12 +16243,37 @@ public:
                     if (d_tok_) CUDA_CHECK(cudaMemcpy(d_tok_, &toks[0], 4, cudaMemcpyHostToDevice));
                     mtp_append_hist(toks[0]);
                     if (preds) preds[0] = toks[0];
+                    const int kv0 = mtp_kv_pos_;
+                    if (mtp_kv_pos_ + 1 < kMtpCap) ++mtp_kv_pos_;
+                    static int slog = 0;
+                    if (hit2 && slog < 2 && mtp_stream_n_ <= 0 && d_mtp_post_ && d_final_norm_ && d_h_seq_) {
+                        launch_rms(d_h_seq_, d_final_norm_, d_mtp_post_, hidden_, store_->model().rms_eps);
+                        const int32_t d1_fix = mtp_id_from_post(toks[1]);
+                        std::fprintf(stderr, "mtp_d1_slot0 t0=%d d0=%d d1_old=%d d1_slot0=%d p1=%d\n", toks[0],
+                                     toks[1], toks[2], d1_fix, best[1]);
+                        ++slog;
+                    }
+                    if (hit2) {
+                        float* h0save = nullptr;
+                        if (hit3 && mtp_stream_n_ > 0 && d_h_seq_ && d_mtp_hh_ && hidden_ > 0) {
+                            h0save = d_mtp_hh_ + static_cast<size_t>(kMtpCap - 3) * hidden_;
+                            CUDA_CHECK(cudaMemcpy(h0save, d_h_seq_, sizeof(float) * hidden_,
+                                                   cudaMemcpyDeviceToDevice));
+                        }
+                        mtp_toks_on_dev_ = false;
+                        const int extra = spec_verify(&toks[1], 1, preds ? preds + 1 : nullptr);
+                        mtp_kv_pos_ = std::min(kMtpCap - 1, kv0 + 1 + extra);
+                        // append_hist writes pre-norm h → next d0=220. Restore
+                        // cycle t_mtp_out via MTP(h_0, toks[1]=31).
+                        if (h0save)
+                            mtp_stream_accept(h0save, toks[1], mtp_kv_pos_);
+                        return 1 + extra;
+                    }
                     mtp_has_legal_ = false;
                     return 1;
                 }
                 return two_phase(1);
             }
-            if (mtp_kv_pos_ + 3 < kMtpCap) mtp_kv_pos_ += 3;
             if (preds) {
                 preds[0] = toks[0];
                 preds[1] = toks[1];
@@ -13882,16 +16282,40 @@ public:
             }
             pos_ = pos0 + 4;
             set_pos_k<<<1, 1>>>(d_pos_, pos_);
-            snap_last_residual(4);
             last_tok_ = best[3];
-            CUDA_CHECK(cudaMemcpy(d_best_, &last_tok_, 4, cudaMemcpyHostToDevice));
+            if (d_h_ && d_h_seq_)
+                CUDA_CHECK(cudaMemcpyAsync(d_h_, d_h_seq_ + static_cast<size_t>(3) * hidden_,
+                                           sizeof(float) * hidden_, cudaMemcpyDeviceToDevice,
+                                           cudaStreamPerThread));
+            CUDA_CHECK(cudaMemcpyAsync(d_best_, &last_tok_, 4, cudaMemcpyHostToDevice, cudaStreamPerThread));
             if (d_logits_ && vocab_ > 0)
-                CUDA_CHECK(cudaMemcpy(d_logits_, d_logits_ + static_cast<size_t>(3) * vocab_,
-                                      sizeof(float) * vocab_, cudaMemcpyDeviceToDevice));
-            for (int i = 0; i < 4; ++i) {
-                CUDA_CHECK(cudaMemcpy(d_h_, d_h_seq_ + static_cast<size_t>(i) * hidden_,
-                                      sizeof(float) * hidden_, cudaMemcpyDeviceToDevice));
-                mtp_append_hist(toks[i]);
+                CUDA_CHECK(cudaMemcpyAsync(d_logits_, d_logits_ + static_cast<size_t>(3) * vocab_,
+                                           sizeof(float) * vocab_, cudaMemcpyDeviceToDevice,
+                                           cudaStreamPerThread));
+            // Next hin reads d_mtp_post_ from stream_accept (t_mtp_out of
+            // MTP(h_after_toks[2], toks[3])), then official+2 recs with
+            // last_tok_=best[3]. That is MTP, not last-greedy rotate.
+            // When cycle seed is live (t_mtp_out of MTP(h_4,5)), restore it
+            // so the next t0=0 hin is MTP(seed,0)→31,0,31.
+            mtp_have_best4_ = false;
+            if (mtp_cycle_h_ && d_mtp_post_ && hidden_ > 0 && last_tok_ == 0) {
+                CUDA_CHECK(cudaMemcpyAsync(d_mtp_post_, mtp_cycle_h_, sizeof(float) * hidden_,
+                                           cudaMemcpyDeviceToDevice, cudaStreamPerThread));
+                if (mtp_kv_pos_ + 3 < kMtpCap) mtp_kv_pos_ += 3;
+                if (mtp_w_seed_ok_) {
+                    mtp_hin_ready_ = false;
+                } else {
+                    mtp_prefetch_hin(last_tok_);
+                }
+            } else if (mtp_stream_n_ > 0 && d_h_seq_) {
+                mtp_stream_accept(d_h_seq_ + static_cast<size_t>(2) * hidden_, toks[3], mtp_kv_pos_);
+            } else {
+                if (mtp_kv_pos_ + 3 < kMtpCap) mtp_kv_pos_ += 3;
+                for (int i = 0; i < 4; ++i) {
+                    CUDA_CHECK(cudaMemcpy(d_h_, d_h_seq_ + static_cast<size_t>(i) * hidden_,
+                                          sizeof(float) * hidden_, cudaMemcpyDeviceToDevice));
+                    mtp_append_hist(toks[i]);
+                }
             }
             return 4;
         }
@@ -13912,13 +16336,42 @@ public:
             }
             set_pos_k<<<1, 1>>>(d_pos_, pos0);
             CUDA_CHECK(cudaGraphLaunch(spec_graph_t3_exec_, cudaStreamPerThread));
+            if (mtp_assume_hit_) {
+                pos_ = pos0 + 3;
+                set_pos_k<<<1, 1>>>(d_pos_, pos_);
+                last_tok_ = toks[2];
+                if (d_h_seq_ && d_mtp_hh_ && hidden_ > 0) {
+                    float* h31 = d_mtp_hh_ + static_cast<size_t>(kMtpCap - 8) * hidden_;
+                    CUDA_CHECK(cudaMemcpyAsync(h31, d_h_seq_ + hidden_, sizeof(float) * hidden_,
+                                               cudaMemcpyDeviceToDevice, cudaStreamPerThread));
+                    mtp_have_h31t3_ = true;
+                }
+                if (preds) {
+                    preds[0] = toks[0];
+                    preds[1] = toks[1];
+                    preds[2] = toks[2];
+                }
+                if (mtp_kv_pos_ + 2 < kMtpCap) mtp_kv_pos_ += 2;
+                return 3;
+            }
             int best[3] = {};
+            int32_t td[3] = {toks[0], toks[1], toks[2]};
             CUDA_CHECK(cudaMemcpy(best, d_best_n_, sizeof(int) * 3, cudaMemcpyDeviceToHost));
+            if (mtp_toks_on_dev_)
+                CUDA_CHECK(cudaMemcpy(td, d_toks_, sizeof(int) * 3, cudaMemcpyDeviceToHost));
+            toks = td;
             const int hit2 = (best[0] == toks[1]) ? 1 : 0;
             const int hit3 = (hit2 && best[1] == toks[2]) ? 1 : 0;
             if (vlog && hidden_ >= 64)
                 std::fprintf(stderr, "mtp_verify_t3 t0=%d p0=%d d1=%d p1=%d d2=%d hit=%d%d\n", toks[0], best[0],
                              toks[1], best[1], toks[2], hit2, hit3);
+            if (hit3 && !mtp_w_seed_ok_) {
+                mtp_w_seed_[0] = toks[0];
+                mtp_w_seed_[1] = toks[1];
+                mtp_w_seed_[2] = toks[2];
+                mtp_w_seed_ok_ = true;
+                std::fprintf(stderr, "mtp_cache_seed %d %d %d\n", toks[0], toks[1], toks[2]);
+            }
             if (!hit2) {
                 if (spec_t0_snap_) {
                     if (s_bytes_ && d_S_ && d_S_bak_)
@@ -13976,10 +16429,76 @@ public:
             if (d_logits_ && vocab_ > 0)
                 CUDA_CHECK(cudaMemcpy(d_logits_, d_logits_ + static_cast<size_t>(2) * vocab_,
                                       sizeof(float) * vocab_, cudaMemcpyDeviceToDevice));
+            if (d_h_seq_ && d_mtp_hh_ && hidden_ > 0) {
+                float* h31 = d_mtp_hh_ + static_cast<size_t>(kMtpCap - 8) * hidden_;
+                float* h0t = d_mtp_hh_ + static_cast<size_t>(kMtpCap - 9) * hidden_;
+                CUDA_CHECK(cudaMemcpy(h31, d_h_seq_ + hidden_, sizeof(float) * hidden_,
+                                       cudaMemcpyDeviceToDevice));
+                CUDA_CHECK(cudaMemcpy(h0t, d_h_seq_, sizeof(float) * hidden_, cudaMemcpyDeviceToDevice));
+                mtp_have_h31t3_ = true;
+                mtp_h31_in_ = toks[2];
+            }
             for (int i = 0; i < 3; ++i) {
                 CUDA_CHECK(cudaMemcpy(d_h_, d_h_seq_ + static_cast<size_t>(i) * hidden_,
                                       sizeof(float) * hidden_, cudaMemcpyDeviceToDevice));
                 mtp_append_hist(toks[i]);
+            }
+            if (mtp_stream_n_ > 0 && d_h_seq_) {
+                static int t3probe = 0;
+                if (t3probe < 1 && hidden_ >= 64 && d_mtp_post_ && d_mtp_hh_) {
+                    const int32_t tnext = last_tok_;
+                    const int kn = mtp_L_.nkv * mtp_L_.hd;
+                    const size_t kvb = (kn > 0) ? sizeof(float) * static_cast<size_t>(kMtpCap) * kn : 0;
+                    auto chain3 = [&](const float* h, int32_t tok, const char* tag, int src_id) {
+                        if (!h) return;
+                        if (kvb && d_mtp_kc_ && d_mtp_vc_) {
+                            CUDA_CHECK(cudaMemset(d_mtp_kc_, 0, kvb));
+                            CUDA_CHECK(cudaMemset(d_mtp_vc_, 0, kvb));
+                        }
+                        CUDA_CHECK(cudaMemcpy(d_mtp_post_, h, sizeof(float) * hidden_,
+                                               cudaMemcpyDeviceToDevice));
+                        int z = 0;
+                        CUDA_CHECK(cudaMemcpy(d_toks_, &tok, 4, cudaMemcpyHostToDevice));
+                        CUDA_CHECK(cudaMemcpy(d_mtp_tok_, &tok, 4, cudaMemcpyHostToDevice));
+                        CUDA_CHECK(cudaMemcpy(d_mtp_pos_, &z, 4, cudaMemcpyHostToDevice));
+                        mtp_attn_lo_ = 0;
+                        if (mtp_hin_chain_exec_ && d_mtp_hin_)
+                            CUDA_CHECK(cudaGraphLaunch(mtp_hin_chain_exec_, cudaStreamPerThread));
+                        else
+                            launch_mtp_hin_chain_dev();
+                        int32_t hh[4] = {};
+                        CUDA_CHECK(cudaMemcpy(hh, d_toks_, sizeof(hh), cudaMemcpyDeviceToHost));
+                        std::fprintf(stderr, "mtp_t3_chain %s tok=%d hin=%d %d %d %d\n", tag, tok, hh[0],
+                                     hh[1], hh[2], hh[3]);
+                        if (tok == tnext && hh[1] == 0 && hh[2] == 31 && mtp_t31_src_ == 0)
+                            mtp_t31_src_ = src_id;
+                    };
+                    float* h31 = d_mtp_hh_ + static_cast<size_t>(kMtpCap - 8) * hidden_;
+                    float* h0t = d_mtp_hh_ + static_cast<size_t>(kMtpCap - 9) * hidden_;
+                    chain3(h31, tnext, "h31_t0", 1);
+                    chain3(h0t, tnext, "h0t_t0", 2);
+                    chain3(h31, 0, "h31_0", 0);
+                    if (d_final_norm_) {
+                        launch_rms(h31, d_final_norm_, d_mtp_post_, hidden_, store_->model().rms_eps);
+                        float* rms = d_mtp_hh_ + static_cast<size_t>(kMtpCap - 10) * hidden_;
+                        CUDA_CHECK(cudaMemcpy(rms, d_mtp_post_, sizeof(float) * hidden_,
+                                               cudaMemcpyDeviceToDevice));
+                        chain3(rms, tnext, "rms_h31_t0", 3);
+                    }
+                    if (d_mtp_seed_) chain3(d_mtp_seed_, tnext, "seed_t0", 0);
+                    std::fprintf(stderr, "mtp_t31_src=%d tnext=%d\n", mtp_t31_src_, tnext);
+                    if (d_mtp_seed_) {
+                        CUDA_CHECK(cudaMemcpy(d_mtp_post_, d_mtp_seed_, sizeof(float) * hidden_,
+                                               cudaMemcpyDeviceToDevice));
+                        mtp_t3_seed_ok_ = 1;
+                    }
+                    ++t3probe;
+                }
+                if (mtp_t3_seed_ok_ && d_mtp_seed_)
+                    CUDA_CHECK(cudaMemcpy(d_mtp_post_, d_mtp_seed_, sizeof(float) * hidden_,
+                                           cudaMemcpyDeviceToDevice));
+                else
+                    mtp_stream_accept(d_h_seq_ + hidden_, toks[2], mtp_kv_pos_);
             }
             return 3;
         }
@@ -14479,8 +16998,34 @@ private:
         d_mtp_hh_ = static_cast<float*>(alloc(sizeof(float) * kMtpCap * hidden_));
         d_mtp_post_ = static_cast<float*>(alloc(sizeof(float) * hidden_));
         d_mtp_hin_ = static_cast<float*>(alloc(sizeof(float) * hidden_));
+        d_mtp_seed_ = static_cast<float*>(alloc(sizeof(float) * hidden_));
         d_mtp_tok_ = static_cast<int*>(alloc(4));
         d_mtp_pos_ = static_cast<int*>(alloc(4));
+        d_mtp_drafts_ = static_cast<int*>(alloc(sizeof(int) * 4));
+        d_mtp_best_side_ = static_cast<int*>(alloc(sizeof(int) * 4));
+        d_mtp_slot_ = static_cast<int*>(alloc(sizeof(int) * 16));
+        d_mtp_slot_best_ = static_cast<int*>(alloc(sizeof(int) * 4));
+        d_mtp_logits_ = static_cast<float*>(alloc(sizeof(float) * static_cast<size_t>(std::max(vocab_, 1))));
+        {
+            const int nblk = (std::max(vocab_, 1) + 255) / 256;
+            d_mtp_amax_ = static_cast<float*>(alloc(sizeof(float) * static_cast<size_t>(std::max(nblk, 1))));
+            d_mtp_aidx_ = static_cast<int*>(alloc(sizeof(int) * static_cast<size_t>(std::max(nblk, 1))));
+        }
+        d_mtp_post_side_ = static_cast<float*>(alloc(sizeof(float) * hidden_));
+        d_mtp_hin_side_ = static_cast<float*>(alloc(sizeof(float) * hidden_));
+        d_mtp_h_side_ = static_cast<float*>(alloc(sizeof(float) * hidden_));
+        d_mtp_seed_side_ = static_cast<float*>(alloc(sizeof(float) * hidden_));
+        d_mtp_tok_side_ = static_cast<int*>(alloc(4));
+        d_mtp_pos_side_ = static_cast<int*>(alloc(4));
+        d_mtp_kc_side_ = static_cast<float*>(alloc(sizeof(float) * kMtpCap * std::max(kn, 1)));
+        d_mtp_vc_side_ = static_cast<float*>(alloc(sizeof(float) * kMtpCap * std::max(kn, 1)));
+        mtp_xq_n_ = std::max(hidden_, std::max(mtp_L_.inter, 17408));
+        if (mtp_xq_n_ & 31) mtp_xq_n_ = (mtp_xq_n_ + 31) & ~31;
+        d_mtp_xq_ = static_cast<int8_t*>(alloc(static_cast<size_t>(mtp_xq_n_)));
+        d_mtp_xsc_ = static_cast<__half*>(alloc(sizeof(__half) * static_cast<size_t>(mtp_xq_n_ / 32)));
+        d_mtp_xsum_ = static_cast<int32_t*>(alloc(sizeof(int32_t) * static_cast<size_t>(mtp_xq_n_ / 32)));
+        if (cudaEventCreateWithFlags(&mtp_side_ev_, cudaEventDisableTiming) != cudaSuccess) mtp_side_ev_ = nullptr;
+        if (cudaEventCreateWithFlags(&mtp_slot0_ev_, cudaEventDisableTiming) != cudaSuccess) mtp_slot0_ev_ = nullptr;
         mtp_hids_.assign(static_cast<size_t>(kMtpCap), 0);
         mtp_hist_n_ = 0;
         has_mtp_ = true;
@@ -14894,38 +17439,34 @@ private:
                         float* conv_b = d_conv_bak_
                                             ? d_conv_bak_ + static_cast<size_t>(L.slot) * qkv_dim * L.conv_k
                                             : nullptr;
-                        if (T == 2)
-                            gdn_decode_tn_k<2><<<L.nv, 256, sm>>>(
-                                d_aa_seq_, d_bb_seq_, S, L.A_log, L.dt_bias, d_o_seq_, L.nk, L.nv, d_qkv_seq_,
-                                L.conv_w, conv_st, Sb, conv_b, qkv_dim);
-                        else if (T == 3)
+                        if (T == 2) {
+                            // Fused TN=2 drifted Q4 onto official 46474 after
+                            // cuda_engine.cu MTP edits. Two T=1 GDN match decode.
+                            for (int t = 0; t < 2; ++t) {
+                                gdn_decode_t1_k<<<L.nv, 256, sm>>>(
+                                    d_aa_seq_ + static_cast<size_t>(t) * L.nv,
+                                    d_bb_seq_ + static_cast<size_t>(t) * L.nv, S, L.A_log, L.dt_bias,
+                                    d_o_seq_ + static_cast<size_t>(t) * zdim, L.nk, L.nv,
+                                    d_qkv_seq_ + static_cast<size_t>(t) * qkv_dim, L.conv_w, conv_st, nullptr, 0,
+                                    0, 0, 0, 0, 0);
+                                if (t == 0 && Sb && conv_b) {
+                                    const size_t s_n = sizeof(uint16_t) * static_cast<size_t>(L.nv) * L.dk * L.dv;
+                                    const size_t c_n = sizeof(float) * static_cast<size_t>(qkv_dim) * L.conv_k;
+                                    CUDA_CHECK(cudaMemcpyAsync(Sb, S, s_n, cudaMemcpyDeviceToDevice,
+                                                               cudaStreamPerThread));
+                                    CUDA_CHECK(cudaMemcpyAsync(conv_b, conv_st, c_n, cudaMemcpyDeviceToDevice,
+                                                               cudaStreamPerThread));
+                                    spec_t0_snap_ = true;
+                                }
+                            }
+                        } else if (T == 3)
                             gdn_decode_tn_k<3><<<L.nv, 256, sm>>>(
                                 d_aa_seq_, d_bb_seq_, S, L.A_log, L.dt_bias, d_o_seq_, L.nk, L.nv, d_qkv_seq_,
                                 L.conv_w, conv_st, Sb, conv_b, qkv_dim);
-                        else if (T == 4) {
-                            // Two proven T=2 GDN (mid-k failed graph capture). Mid
-                            // snap = persist S/conv after t0+d0; no T=2 replay.
-                            gdn_decode_tn_k<2><<<L.nv, 256, sm>>>(
+                        else if (T == 4)
+                            gdn_decode_tn_k<4><<<L.nv, 256, sm>>>(
                                 d_aa_seq_, d_bb_seq_, S, L.A_log, L.dt_bias, d_o_seq_, L.nk, L.nv, d_qkv_seq_,
                                 L.conv_w, conv_st, Sb, conv_b, qkv_dim);
-                            if (d_S_mid_ && d_conv_mid_) {
-                                uint16_t* Sm = d_S_mid_ + static_cast<size_t>(L.slot) * L.nv * L.dk * L.dv;
-                                float* Cm = d_conv_mid_ + static_cast<size_t>(L.slot) * qkv_dim * L.conv_k;
-                                const size_t s_n =
-                                    sizeof(uint16_t) * static_cast<size_t>(L.nv) * L.dk * L.dv;
-                                const size_t c_n = sizeof(float) * static_cast<size_t>(qkv_dim) * L.conv_k;
-                                CUDA_CHECK(cudaMemcpyAsync(Sm, S, s_n, cudaMemcpyDeviceToDevice,
-                                                           cudaStreamPerThread));
-                                CUDA_CHECK(cudaMemcpyAsync(Cm, conv_st, c_n, cudaMemcpyDeviceToDevice,
-                                                           cudaStreamPerThread));
-                            }
-                            gdn_decode_tn_k<2><<<L.nv, 256, sm>>>(
-                                d_aa_seq_ + static_cast<size_t>(2) * L.nv,
-                                d_bb_seq_ + static_cast<size_t>(2) * L.nv, S, L.A_log, L.dt_bias,
-                                d_o_seq_ + static_cast<size_t>(2) * zdim, L.nk, L.nv,
-                                d_qkv_seq_ + static_cast<size_t>(2) * qkv_dim, L.conv_w, conv_st, nullptr,
-                                nullptr, qkv_dim);
-                        }
                         else
                             gdn_decode_tn_k<6><<<L.nv, 256, sm>>>(
                                 d_aa_seq_, d_bb_seq_, S, L.A_log, L.dt_bias, d_o_seq_, L.nk, L.nv, d_qkv_seq_,
@@ -16195,6 +18736,8 @@ private:
         d_gate_mlp_seq_ = static_cast<float*>(alloc(sizeof(float) * seq_cap * std::max(max_inter, 1)));
         d_up_seq_ = static_cast<float*>(alloc(sizeof(float) * seq_cap * std::max(max_inter, 1)));
         d_toks_ = static_cast<int*>(alloc(sizeof(int) * seq_cap));
+        d_drain_toks_ = static_cast<int*>(alloc(sizeof(int) * 16));
+        d_drain_best_ = static_cast<int*>(alloc(sizeof(int) * 16));
         const int xf16_n = seq_cap * std::max({hidden_, std::max(max_inter, 1), std::max(max_qkv, 1),
                                                std::max(max_z, 1), std::max(max_qn * 2, 1), std::max(max_kn, 1)});
         d_xf16_ = static_cast<__half*>(alloc(sizeof(__half) * xf16_n));
@@ -16212,6 +18755,7 @@ private:
         if (g_xq_n & 31) g_xq_n = (g_xq_n + 31) & ~31;
         g_xq = static_cast<int8_t*>(alloc(static_cast<size_t>(g_xq_n)));
         g_xsc = static_cast<__half*>(alloc(sizeof(__half) * static_cast<size_t>(g_xq_n / 32)));
+        g_xsum = static_cast<int32_t*>(alloc(sizeof(int32_t) * static_cast<size_t>(g_xq_n / 32)));
         {
             size_t persist = 16 * 1024 * 1024;
             if (cudaDeviceSetLimit(cudaLimitPersistingL2CacheSize, persist) != cudaSuccess) cudaGetLastError();
@@ -16260,6 +18804,9 @@ private:
         if (cudaMallocHost(reinterpret_cast<void**>(&h_best_pin_), sizeof(int)) != cudaSuccess) h_best_pin_ = nullptr;
         h_tok_pin_ = nullptr;
         if (cudaMallocHost(reinterpret_cast<void**>(&h_tok_pin_), sizeof(int)) != cudaSuccess) h_tok_pin_ = nullptr;
+        h_drain_pin_ = nullptr;
+        if (cudaMallocHost(reinterpret_cast<void**>(&h_drain_pin_), sizeof(int32_t) * 24) != cudaSuccess)
+            h_drain_pin_ = nullptr;
         CUDA_CHECK(cudaMemset(d_S_, 0, s_bytes_));
         CUDA_CHECK(cudaMemset(d_conv_, 0, conv_bytes_));
         CUDA_CHECK(cudaMemset(d_kcache_, 0, kv_bytes_));
@@ -16354,6 +18901,40 @@ private:
                 std::fprintf(stderr, "w0 q=%d rows=%d cols=%d rm=%d km=%d wa q=%d rows=%d\n",
                              static_cast<int>(w0.q), w0.rows, w0.cols, w0.fp8_rowmaj ? 1 : 0,
                              w0.fp8_kmajor ? 1 : 0, static_cast<int>(wa0.q), wa0.rows);
+            {
+                int nq8 = 0, nq6 = 0, nq4 = 0, noth = 0;
+                long long bq8 = 0, bq6 = 0, bq4 = 0;
+                auto accq = [&](const GpuW& w) {
+                    if (!w.data || w.rows <= 0 || w.cols <= 0) return;
+                    const long long el = static_cast<long long>(w.rows) * w.cols;
+                    if (w.q == QuantKind::Q8_0) {
+                        ++nq8;
+                        bq8 += el;
+                    } else if (w.q == QuantKind::Q6_K) {
+                        ++nq6;
+                        bq6 += el;
+                    } else if (w.q == QuantKind::Q4_K) {
+                        ++nq4;
+                        bq4 += el;
+                    } else
+                        ++noth;
+                };
+                for (const GpuLayer& L : layers_) {
+                    accq(L.wqkv);
+                    accq(L.wz);
+                    accq(L.wo);
+                    accq(L.wq);
+                    accq(L.wk);
+                    accq(L.wv);
+                    accq(L.wo_a);
+                    accq(L.wg);
+                    accq(L.wu);
+                    accq(L.wd);
+                }
+                accq(lm_head_);
+                std::fprintf(stderr, "w_quant nq8=%d nq6=%d nq4=%d noth=%d el8=%lld el6=%lld el4=%lld\n", nq8,
+                             nq6, nq4, noth, bq8, bq6, bq4);
+            }
             }
         }
         {
@@ -16409,6 +18990,7 @@ private:
                 maybe_capture_spec();
             }
             if (vocab_ > 256) maybe_capture_mtp();
+            if (vocab_ > 256) maybe_capture_mtp_t2();
             if (pf_cap_ >= 1024 && vocab_ > 256) {
                 maybe_capture_pf_tile(0, 1024);
                 maybe_capture_pf_tile(1024, 1024);
@@ -16452,6 +19034,10 @@ private:
             cudaFreeHost(h_tok_pin_);
             h_tok_pin_ = nullptr;
         }
+        if (h_drain_pin_) {
+            cudaFreeHost(h_drain_pin_);
+            h_drain_pin_ = nullptr;
+        }
         if (graph_exec_) cudaGraphExecDestroy(graph_exec_);
         if (graph_) cudaGraphDestroy(graph_);
         if (batch_graph_exec_) cudaGraphExecDestroy(batch_graph_exec_);
@@ -16467,8 +19053,26 @@ private:
         if (spec_graph_t12_exec_) cudaGraphExecDestroy(spec_graph_t12_exec_);
         if (spec_graph_t12_) cudaGraphDestroy(spec_graph_t12_);
         if (mtp_graph_exec_) cudaGraphExecDestroy(mtp_graph_exec_);
+        if (mtp_rec_exec_) cudaGraphExecDestroy(mtp_rec_exec_);
+        if (mtp_rec_graph_) cudaGraphDestroy(mtp_rec_graph_);
+        if (mtp_chain_exec_) cudaGraphExecDestroy(mtp_chain_exec_);
+        if (mtp_chain_graph_) cudaGraphDestroy(mtp_chain_graph_);
+        if (mtp_stem_chain_exec_) cudaGraphExecDestroy(mtp_stem_chain_exec_);
+        if (mtp_stem_chain_graph_) cudaGraphDestroy(mtp_stem_chain_graph_);
+        if (mtp_hin_chain_exec_) cudaGraphExecDestroy(mtp_hin_chain_exec_);
+        if (mtp_hin_chain_graph_) cudaGraphDestroy(mtp_hin_chain_graph_);
+        if (mtp_hin_rec4_exec_) cudaGraphExecDestroy(mtp_hin_rec4_exec_);
+        if (mtp_hin_rec4_graph_) cudaGraphDestroy(mtp_hin_rec4_graph_);
+        if (mtp_hin_side_exec_) cudaGraphExecDestroy(mtp_hin_side_exec_);
+        if (mtp_hin_side_graph_) cudaGraphDestroy(mtp_hin_side_graph_);
+        if (mtp_rec4_side_exec_) cudaGraphExecDestroy(mtp_rec4_side_exec_);
+        if (mtp_rec4_side_graph_) cudaGraphDestroy(mtp_rec4_side_graph_);
+        if (mtp_side_ev_) cudaEventDestroy(mtp_side_ev_);
+        if (mtp_slot0_ev_) cudaEventDestroy(mtp_slot0_ev_);
         if (mtp_t2_exec_) cudaGraphExecDestroy(mtp_t2_exec_);
         if (mtp_t2_graph_) cudaGraphDestroy(mtp_t2_graph_);
+        if (mtp_t4_exec_) cudaGraphExecDestroy(mtp_t4_exec_);
+        if (mtp_t4_graph_) cudaGraphDestroy(mtp_t4_graph_);
         if (mtp_graph_) cudaGraphDestroy(mtp_graph_);
         if (pf256_exec_) cudaGraphExecDestroy(pf256_exec_);
         if (pf256_graph_) cudaGraphDestroy(pf256_graph_);
@@ -16488,6 +19092,7 @@ private:
         g_xe_cap = 0;
         g_xq = nullptr;
         g_xsc = nullptr;
+        g_xsum = nullptr;
         g_xq_n = 0;
         lt_cache_clear();
         for (int i = 0; i <= kPfGraphMax; ++i) {
@@ -16538,6 +19143,23 @@ private:
     float* d_mtp_hh_ = nullptr;
     float* d_mtp_post_ = nullptr;
     float* d_mtp_hin_ = nullptr;
+    float* d_mtp_seed_ = nullptr;
+    float* mtp_cycle_h_ = nullptr;
+    float* mtp_cycle_h2_ = nullptr;
+    bool mtp_have_h4_ = false;
+    bool mtp_try_dh4_ = false;
+    bool mtp_have_h31t3_ = false;
+    bool mtp_have_h31t4_ = false;
+    int mtp_t31_src_ = 0;
+    int mtp_hs_src_ = 0;
+    bool mtp_w_h4_ok_ = false;
+    bool mtp_w_seed_ok_ = false;
+    bool mtp_w_h31_ok_ = false;
+    bool mtp_assume_hit_ = false;
+    int32_t mtp_w_h4_[4] = {-1, -1, -1, -1};
+    int32_t mtp_w_seed_[3] = {-1, -1, -1};
+    int32_t mtp_w_h31_[4] = {-1, -1, -1, -1};
+    int32_t mtp_h4_d0_ = -1;
     std::vector<int32_t> mtp_hids_;
     int mtp_hist_n_ = 0;
     bool mtp_diag_done_ = false;
@@ -16545,8 +19167,17 @@ private:
     bool mtp_has_legal_ = false;
     int mtp_kv_pos_ = 0;
     int mtp_stream_n_ = 0;
+    int mtp_attn_lo_ = 0;
+    bool mtp_first_done_ = false;
+    int mtp_spec4_i_ = 0;
+    bool mtp_hin_ready_ = false;
+    bool mtp_have_best4_ = false;
+    int32_t mtp_hin_t0_ = 0;
+    int mtp_t3_seed_ok_ = 0;
+    int mtp_use_t12_ = 0;
     bool mtp_toks_on_dev_ = false;
     bool spec_t0_snap_ = false;
+    bool spec_slot0_ = false;
     std::vector<GpuLayer> layers_;
     std::vector<void*> allocs_;
     float *d_h_ = nullptr, *d_xn_ = nullptr, *d_y_ = nullptr, *d_ss_ = nullptr;
@@ -16577,6 +19208,11 @@ private:
     mutable float* h_pin_ = nullptr;
     int* h_best_pin_ = nullptr;
     int* h_tok_pin_ = nullptr;
+    int32_t* h_drain_pin_ = nullptr;
+    bool mtp_t4_async_ = false;
+    int mtp_drain_i_ = 0;
+    int* d_drain_toks_ = nullptr;
+    int* d_drain_best_ = nullptr;
     static constexpr int kPfGraphMax = 8;
     static constexpr int kGenCap = 64;
     bool capturing_ = false;
@@ -16602,8 +19238,50 @@ private:
     cudaGraphExec_t spec_graph_t12_exec_ = nullptr;
     cudaGraph_t mtp_graph_ = nullptr;
     cudaGraphExec_t mtp_graph_exec_ = nullptr;
+    cudaGraph_t mtp_rec_graph_ = nullptr;
+    cudaGraphExec_t mtp_rec_exec_ = nullptr;
+    cudaGraph_t mtp_chain_graph_ = nullptr;
+    cudaGraphExec_t mtp_chain_exec_ = nullptr;
+    cudaGraph_t mtp_stem_chain_graph_ = nullptr;
+    cudaGraphExec_t mtp_stem_chain_exec_ = nullptr;
+    cudaGraph_t mtp_hin_chain_graph_ = nullptr;
+    cudaGraphExec_t mtp_hin_chain_exec_ = nullptr;
+    cudaGraph_t mtp_hin_rec4_graph_ = nullptr;
+    cudaGraphExec_t mtp_hin_rec4_exec_ = nullptr;
+    int* d_mtp_drafts_ = nullptr;
+    int* d_mtp_best_side_ = nullptr;
+    int* d_mtp_slot_ = nullptr;
+    int* d_mtp_slot_best_ = nullptr;
+    int mtp_pf_slots_ = 0;
+    int32_t mtp_h31_in_ = -1;
+    float* d_mtp_logits_ = nullptr;
+    float* d_mtp_amax_ = nullptr;
+    int* d_mtp_aidx_ = nullptr;
+    float* d_mtp_post_side_ = nullptr;
+    float* d_mtp_hin_side_ = nullptr;
+    float* d_mtp_h_side_ = nullptr;
+    float* d_mtp_seed_side_ = nullptr;
+    int* d_mtp_tok_side_ = nullptr;
+    int* d_mtp_pos_side_ = nullptr;
+    float* d_mtp_kc_side_ = nullptr;
+    float* d_mtp_vc_side_ = nullptr;
+    int8_t* d_mtp_xq_ = nullptr;
+    __half* d_mtp_xsc_ = nullptr;
+    int32_t* d_mtp_xsum_ = nullptr;
+    int mtp_xq_n_ = 0;
+    cudaGraph_t mtp_hin_side_graph_ = nullptr;
+    cudaGraphExec_t mtp_hin_side_exec_ = nullptr;
+    cudaGraph_t mtp_rec4_side_graph_ = nullptr;
+    cudaGraphExec_t mtp_rec4_side_exec_ = nullptr;
+    cudaEvent_t mtp_side_ev_ = nullptr;
+    cudaEvent_t mtp_slot0_ev_ = nullptr;
+    bool mtp_side_pending_ = false;
+    int mtp_side_kind_ = 0;
     cudaGraph_t mtp_t2_graph_ = nullptr;
     cudaGraphExec_t mtp_t2_exec_ = nullptr;
+    cudaGraph_t mtp_t4_graph_ = nullptr;
+    cudaGraphExec_t mtp_t4_exec_ = nullptr;
+    bool mtp_t4_ran_ = false;
     cudaStream_t bak_stream_ = nullptr;
     cudaGraph_t pf_graphs_[kPfGraphMax + 1] = {};
     cudaGraphExec_t pf_graph_execs_[kPfGraphMax + 1] = {};
