@@ -1,6 +1,7 @@
 #include "rapidllm/backend/device.h"
 #include "rapidllm/frontend/weight_store.h"
 #include "rapidllm/runtime/cuda_engine.h"
+#include "rapidllm/runtime/mtp_live_draft.h"
 #include "rapidllm/runtime/session.h"
 
 #include "frontend/json_mini.h"
@@ -26,6 +27,14 @@ static std::string slurp(const std::filesystem::path& p) {
 
 int main() {
     using namespace rapidllm;
+    if (live_draft_count(0) != 0 || live_draft_count(1) != 1 || live_draft_count(2) != 2) {
+        std::fprintf(stderr, "live_draft_count slots!=launches\n");
+        return 1;
+    }
+    if (live_draft_count(2) == 4) {
+        std::fprintf(stderr, "live_draft_count memcpy-pad of 2 launches to 4 slots\n");
+        return 1;
+    }
     const std::filesystem::path root = RAPIDLLM_FIXTURE_DIR;
     const Json g = parse_json(slurp(root / "tiny_hybrid" / "golden.json"));
     std::vector<int32_t> prompt, want, mtp_gold;

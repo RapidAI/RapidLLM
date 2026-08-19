@@ -111,6 +111,11 @@ if(RAPIDLLM_WITH_CUDA)
     src/kernels/cuda/mtp_attn_decode.cu
     src/kernels/cuda/gemv_q6_t12.cu
     src/kernels/cuda/gemv_q6_t12_1row.cu
+    src/kernels/cuda/gemv_q6_t12_smemx.cu
+    src/kernels/cuda/gemv_q4_t12_pipe.cu
+    src/kernels/cuda/gemv_q4_t12_2row_pipe.cu
+    src/kernels/cuda/gemv_q4_t16_pipe.cu
+    src/kernels/cuda/gemv_q6_t16_1row.cu
     src/kernels/cuda/gemv_q4_t12_dual.cu
     src/kernels/cuda/gdn_t12.cu
     src/kernels/cuda/cuda_engine.cu

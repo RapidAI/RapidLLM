@@ -1,4 +1,5 @@
-// Isolated T=1 Q6 2-row GEMV for large lm_head. cp.async W, ldg x, no smem tile.
+// Isolated T=1 Q6 2-row GEMV for large lm_head / MTP. 3-stage cp.async W.
+// X via __ldg (same as T=2 1-row) — no block X tile, no __syncthreads.
 #include "rapidllm/kernels/gemv_q6_t1_2row.h"
 
 #include <cuda_fp16.h>
@@ -40,6 +41,13 @@ __device__ __forceinline__ void cp_async_wait1() {
 #endif
 }
 
+__device__ __forceinline__ void cp_async_wait2() {
+#if __CUDA_ARCH__ >= 800
+    asm volatile("cp.async.wait_group 2;\n");
+#endif
+}
+
+// Same dequant + fmaf order as the smem-x kernel; x is the K-block base in global.
 __device__ __forceinline__ void acc_q6_blk(const uint8_t* blk, int lane, int is, const float* x, float& acc) {
     const __half* ds = reinterpret_cast<const __half*>(blk);
     const uint8_t* ql = blk + 32;
@@ -57,11 +65,11 @@ __device__ __forceinline__ void acc_q6_blk(const uint8_t* blk, int lane, int is,
         const float s2 = __half2float(ds[is + 2]) * static_cast<float>(q2);
         const float s3 = __half2float(ds[is + 4]) * static_cast<float>(q3);
         const float s4 = __half2float(ds[is + 6]) * static_cast<float>(q4);
-        const int base = n128 * 128;
-        acc = fmaf(s1, __ldg(x + base + lane), acc);
-        acc = fmaf(s2, __ldg(x + base + 32 + lane), acc);
-        acc = fmaf(s3, __ldg(x + base + 64 + lane), acc);
-        acc = fmaf(s4, __ldg(x + base + 96 + lane), acc);
+        const float* p = x + n128 * 128;
+        acc = fmaf(s1, __ldg(p + lane), acc);
+        acc = fmaf(s2, __ldg(p + 32 + lane), acc);
+        acc = fmaf(s3, __ldg(p + 64 + lane), acc);
+        acc = fmaf(s4, __ldg(p + 96 + lane), acc);
         ql += 64;
         qh += 32;
         ds += 8;
@@ -79,7 +87,7 @@ __global__ void __launch_bounds__(256, 4) gemv_q6k_soa_f32_t1_2row_k(const uint8
     const int is = lane / 16;
     const int warp = threadIdx.x / 32;
     extern __shared__ uint8_t smem_w[];
-    uint8_t* wsm = smem_w + static_cast<size_t>(warp) * 4 * kQ6KSoaBsz;
+    uint8_t* wsm = smem_w + static_cast<size_t>(warp) * 6 * kQ6KSoaBsz;
     float a0 = 0.f, a1 = 0.f;
     const uint8_t* r0 =
         (row0 < m && nb > 0) ? (W + static_cast<size_t>(row0) * static_cast<size_t>(nb) * kQ6KSoaBsz) : nullptr;
@@ -94,10 +102,13 @@ __global__ void __launch_bounds__(256, 4) gemv_q6k_soa_f32_t1_2row_k(const uint8
         cp_async_commit();
     };
     if (nb > 0) load_stage(0, 0);
+    if (nb > 1) load_stage(1, 1);
     int stage = 0;
     for (int b = 0; b < nb; ++b) {
-        if (b + 1 < nb) {
-            load_stage(1 - stage, b + 1);
+        if (b + 2 < nb) {
+            load_stage((stage + 2) % 3, b + 2);
+            cp_async_wait2();
+        } else if (b + 1 < nb) {
             cp_async_wait1();
         } else {
             cp_async_wait0();
@@ -107,7 +118,7 @@ __global__ void __launch_bounds__(256, 4) gemv_q6k_soa_f32_t1_2row_k(const uint8
         const uint8_t* s0 = wsm + stage * 2 * kQ6KSoaBsz;
         if (r0) acc_q6_blk(s0, lane, is, xb, a0);
         if (r1) acc_q6_blk(s0 + kQ6KSoaBsz, lane, is, xb, a1);
-        stage ^= 1;
+        stage = (stage + 1) % 3;
     }
     a0 = warp_sum(a0);
     a1 = warp_sum(a1);
@@ -132,7 +143,7 @@ void launch_q6k_f32_t1_2row(const uint8_t* W, const float* x, float* y, int m, i
     const int tw = th / 32;
     const int pairs = (m + 1) / 2;
     const int pb = (pairs + tw - 1) / tw;
-    const size_t smem = static_cast<size_t>(tw) * 4 * kQ6KSoaBsz;
+    const size_t smem = static_cast<size_t>(tw) * 6 * kQ6KSoaBsz;
     gemv_q6k_soa_f32_t1_2row_k<<<pb, th, smem>>>(W, x, y, m, n, add);
 }
 
